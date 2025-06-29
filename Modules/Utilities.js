@@ -852,8 +852,15 @@ const Utilities = (function() {
         },
         
         parseBoolean(str) {
-            const normalized = str.toLowerCase().trim();
-            return ['true', 'yes', '1', 'on', 'enabled'].includes(normalized);
+            // Handle actual boolean values
+            if (str === true) return true;
+            if (str === false) return false;
+            if (str == null) return false;
+            
+            const normalized = String(str).toLowerCase().trim();
+            
+            // Include common abbreviations
+            return ['true', 't', 'yes', 'y', '1', 'on', 'enabled', 'enable'].includes(normalized);
         }
     };
     
