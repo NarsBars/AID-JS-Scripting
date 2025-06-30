@@ -1023,28 +1023,7 @@ const Utilities = (function() {
                     continue;
                 }
                 
-                // Two-character operators
-                const twoChar = peek() + peek(1);
-                const twoCharOps = {
-                    '&&': this.TokenType.AND,
-                    '||': this.TokenType.OR,
-                    '==': this.TokenType.EQUALS,
-                    '!=': this.TokenType.NOT_EQUALS,
-                    '===': this.TokenType.STRICT_EQUALS,
-                    '!==': this.TokenType.STRICT_NOT_EQUALS,
-                    '<=': this.TokenType.LESS_THAN_EQUALS,
-                    '>=': this.TokenType.GREATER_THAN_EQUALS,
-                    '=>': this.TokenType.ARROW
-                };
-                
-                if (twoCharOps[twoChar]) {
-                    tokens.push({ type: twoCharOps[twoChar] });
-                    advance(2);
-                    continue;
-                }
-                
-                // Three-character operators
-                const threeChar = twoChar + peek(2);
+                const threeChar = peek() + peek(1) + peek(2);
                 if (threeChar === '===' || threeChar === '!==') {
                     tokens.push({ 
                         type: threeChar === '===' ? 
@@ -1054,8 +1033,24 @@ const Utilities = (function() {
                     advance(3);
                     continue;
                 }
-                
-                // Single character operators
+
+                const twoChar = peek() + peek(1);
+                const twoCharOps = {
+                    '&&': this.TokenType.AND,
+                    '||': this.TokenType.OR,
+                    '==': this.TokenType.EQUALS,
+                    '!=': this.TokenType.NOT_EQUALS,
+                    '<=': this.TokenType.LESS_THAN_EQUALS,
+                    '>=': this.TokenType.GREATER_THAN_EQUALS,
+                    '=>': this.TokenType.ARROW
+                };
+
+                if (twoCharOps[twoChar]) {
+                    tokens.push({ type: twoCharOps[twoChar] });
+                    advance(2);
+                    continue;
+                }
+
                 const singleCharOps = {
                     '+': this.TokenType.PLUS,
                     '-': this.TokenType.MINUS,
@@ -1518,17 +1513,17 @@ const Utilities = (function() {
                         if (context === 'object' && evalContext._object) {
                             return evalContext._object[node.name];
                         }
-                        
+
                         // Check for builtin functions
                         if (self.builtinFunctions[node.name]) {
                             return self.builtinFunctions[node.name].bind(self.builtinFunctions);
                         }
-                        
+
                         // Check context (state, info, etc.)
                         if (evalContext.hasOwnProperty(node.name)) {
                             return evalContext[node.name];
                         }
-                        
+
                         // Check global objects
                         if (node.name === 'state' && typeof state !== 'undefined') {
                             return state;
@@ -1536,8 +1531,10 @@ const Utilities = (function() {
                         if (node.name === 'info' && typeof info !== 'undefined') {
                             return info;
                         }
-                        
-                        return undefined;
+
+                        if (typeof global !== 'undefined' && global[node.name] !== undefined) {
+                            return global[node.name];
+                        }
                         
                     case 'MemberExpression':
                         const obj = evaluate(node.object, evalContext);
@@ -2309,7 +2306,128 @@ const Utilities = (function() {
             return str.replace(/\${(\w+)}/g, (match, key) => {
                 return data.hasOwnProperty(key) ? String(data[key]) : match;
             });
+        },
+
+        splitBySentences(text) {
+            const sentencePattern = /[.!?]+(?:\s+|$)/g;
+            const sentences = [];
+            let lastIndex = 0;
+            let match;
+        
+            while ((match = sentencePattern.exec(text)) !== null) {
+                const sentence = text.substring(lastIndex, match.index + match[0].length);
+                if (sentence.trim()) {
+                    sentences.push(sentence);
+                }
+                lastIndex = match.index + match[0].length;
+            }
+        
+            if (lastIndex < text.length) {
+                const remaining = text.substring(lastIndex).trim();
+                if (remaining) {
+                    sentences.push(remaining);
+                }
+            }
+        
+            return sentences;
+        },
+        };
+    
+    const ContextUtils = {
+        extractPlotEssentials(context) {
+            // Everything from start to World Lore or Recent Story
+            const worldLoreMatch = context.match(/World\s*Lore\s*:\s*/i);
+            const recentStoryMatch = context.match(/Recent\s*Story\s*:\s*/i);
+            
+            let endIndex;
+            if (worldLoreMatch) {
+                endIndex = worldLoreMatch.index;
+            } else if (recentStoryMatch) {
+                endIndex = recentStoryMatch.index;
+            } else {
+                return context; // No sections found, entire text is plot essentials
+            }
+            
+            return context.substring(0, endIndex).trim();
+        },
+
+        extractWorldLore(context) {
+            // Everything from World Lore: to Recent Story:
+            const worldLoreMatch = context.match(/World\s*Lore\s*:\s*/i);
+            if (!worldLoreMatch) return '';
+            
+            const recentStoryMatch = context.match(/Recent\s*Story\s*:\s*/i);
+            const startIndex = worldLoreMatch.index + worldLoreMatch[0].length;
+            const endIndex = recentStoryMatch ? recentStoryMatch.index : context.length;
+            
+            return context.substring(startIndex, endIndex).trim();
+        },
+        
+        extractAuthorsNotes(context) {
+            // All [Author's note: ...] content
+            const notes = [];
+            const notePattern = /\[Author['']s\s*note:\s*([^\]]*)\]/gi;
+            let match;
+            
+            while ((match = notePattern.exec(context)) !== null) {
+                notes.push(match[1].trim());
+            }
+            
+            return notes;
+        },
+        
+        removeAuthorsNotes(context) {
+            // Remove all author's notes from text
+            return context.replace(/\[Author['']s\s*note:[^\]]*\]/gi, '').trim();
+        },
+        
+        extractRecentStory(context, removeAuthorNotes = false) {
+            const recentStoryPattern = /Recent\s*Story\s*:\s*([\s\S]*?)(?=%@GEN@%|%@COM@%|$)/i;
+            const match = context.match(recentStoryPattern);
+            
+            if (!match) return '';
+            
+            const storyText = match[1].trim();
+            
+            // Only remove author's notes if explicitly requested
+            return removeAuthorNotes ? this.removeAuthorsNotes(storyText) : storyText;
+        },
+
+        replaceRecentStory(context, newStoryText) {
+        const recentStoryPattern = /Recent\s*Story\s*:\s*([\s\S]*?)(%@GEN@%|%@COM@%|\s\[\s*Author's\s*note\s*:|$)/i;
+        const match = context.match(recentStoryPattern);
+        
+        if (!match) return context;
+        
+        return context.replace(recentStoryPattern, `Recent Story:\n${newStoryText}${match[2]}`);
+        },
+
+            insertIntoWorldLore(context, insertText) {
+        if (!insertText || insertText.trim().length === 0) {
+            return context;
         }
+        
+        const worldLoreMatch = context.match(/World\s*Lore\s*:\s*/i);
+        if (worldLoreMatch) {
+            const index = worldLoreMatch.index + worldLoreMatch[0].length;
+            const beforeInsert = context.slice(0, index);
+            const afterInsert = context.slice(index);
+            
+            const hasNewline = afterInsert.startsWith('\n');
+            const prefix = hasNewline ? "" : "\n";
+            
+            return beforeInsert + prefix + insertText + "\n" + afterInsert;
+        } else {
+            const recentStoryMatch = context.match(/Recent\s*Story\s*:/i);
+            if (recentStoryMatch) {
+                return context.slice(0, recentStoryMatch.index) + 
+                    "World Lore:\n" + insertText + "\n" +
+                    context.slice(recentStoryMatch.index);
+            } else {
+                return "World Lore:\n" + insertText + "\n" + context;
+            }
+        }
+    }
     };
     
     // =====================================
@@ -3548,6 +3666,7 @@ const Utilities = (function() {
         expression: ExpressionParser,
         plainText: PlainTextParser,
         string: StringUtils,
+        context: ContextUtils,
         math: MathUtils,
         collection: CollectionUtils,
         validation: ValidationUtils,

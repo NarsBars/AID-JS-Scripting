@@ -3697,2278 +3697,821 @@ const Utilities = (function() {
     });
 })();
 
-
-function Calendar(hook, text) {
-    'use strict';
-    
-    // Usage in Scripting Sandbox:
-    // Input Modifier: 
-    //   text = Calendar("input", text);
-    // Context Modifier: 
-    //   Calendar("context");
-    //
-    // Configuration Cards:
-    //   [CALENDAR] Time Configuration - Main time system settings
-    //   [CALENDAR] Event Days - Holiday and event definitions
-    //   [CALENDAR] Event Days 2, 3... - Additional event cards. Probably unnecessary bc I extended to description but oh well.
-    //
-    // API Methods:
-    // Time Methods:
-    //   Calendar.getCurrentTime() - Returns current time as HH:MM
-    //   Calendar.getFormattedTime() - Returns time with AM/PM
-    //   Calendar.getTimeOfDay() - Returns time period name (e.g., "Morning", "Evening")
-    //   Calendar.getDayProgress() - Returns progress through day (0.0-1.0)
-    //
-    // Date Methods:
-    //   Calendar.getCurrentDate() - Returns full formatted date string
-    //   Calendar.getDayOfWeek() - Returns day name (e.g., "Monday")
-    //   Calendar.getDayOfMonth() - Returns day number in month (1-31)
-    //   Calendar.getMonth() - Returns month name (e.g., "January")
-    //   Calendar.getYear() - Returns current year number
-    //   Calendar.getDayNumber() - Returns current day number (e.g., day 457)
-    //   Calendar.getDayOfYear() - Returns day within current year (e.g., Feb 14 = day 45)
-    //
-    // Season Methods:
-    //   Calendar.getCurrentSeason() - Returns current season name
-    //   Calendar.getYearProgress() - Returns year completion (0.0-1.0)
-    //
-    // Event Methods:
-    //   Calendar.getTodayEvents() - Returns array of today's events
-    //   Calendar.getUpcomingEvents(days) - Returns events in next N days
-    //   Calendar.getAllEvents() - Returns all configured events
-    //   Calendar.isEventDay() - Returns true if today has events
-    //   Calendar.getMonthWeekdays(offset) - Returns weekday map for a month
-    //     Returns: {month: "November", year: 2023, weekdays: {Monday: [6,13,20,27], ...}}
-    //   Calendar.clearEventCache() - Force reload of event configuration
-    //
-    // Core Methods:
-    //   Calendar.getState() - Returns full time state
-    //   Calendar.getConfig() - Returns configuration
-    //   Calendar.events - Array of time events this turn
-    //     Event types: 'dayChanged', 'seasonChanged', 'eventDay', 'timeReversed', 'timeOfDayChanged'
-    //     Event data includes:
-    //       - dayChanged: {previousDay, currentDay, state}
-    //       - seasonChanged: {previousSeason, currentSeason, state}
-    //       - eventDay: {events, date, state}
-    //       - timeReversed: {state, reversed: true}
-    //       - timeOfDayChanged: {previousPeriod, currentPeriod, state}
-    //     State object contains:
-    //       - day: Current day number (can be negative, 0, 200, etc.)
-    //       - progress: Actions completed in current day (0 to actionsPerDay-1)
-    //       - lastProcessedAction: Last action count processed
-    //
-    // Time Manipulation Methods:
-    //   Calendar.advanceTime(timeSpec) - Skip forward/backward in time (e.g., "3d", "-2h"), returns true on success
-    //   Calendar.setTime(hour, minute) - Set time on current day, returns true on success
-    //   Calendar.setDay(day) - Jump to specific day number, returns true on success
-    //   Calendar.setActionsPerDay(number) - Update actions per day config, returns true on success
-    //   Calendar.setHoursPerDay(number) - Update hours per day config, returns true on success
-    //
-    // Time State card is the single source of truth
-    // Day number in state can be any value (negative, 0, 200, etc.)
-    // Progress in state determines time of day (0 to actionsPerDay-1)
-    // All configuration must come from [CALENDAR] cards
-    //
-    // Example Usage:
-    //   const time = Calendar.getCurrentTime();        // "14:30"
-    //   const time12 = Calendar.getFormattedTime();    // "2:30 PM"
-    //   const period = Calendar.getTimeOfDay();        // "Afternoon"
-    //   const day = Calendar.getDayOfWeek();           // "Tuesday"
-    //   const month = Calendar.getMonth();             // "July"
-    //   const dayNum = Calendar.getDayOfMonth();       // 15
-    //   const dayOfYear = Calendar.getDayOfYear();     // 196 (July 15 = 196th day)
-    //   const totalDays = Calendar.getDayNumber();     // 621 (current day number)
-    //   const season = Calendar.getCurrentSeason();    // "Summer"
-    //   const events = Calendar.getTodayEvents();      // [{name: "Festival", ...}]
-    //   const upcoming = Calendar.getUpcomingEvents(7); // Events in next week
-    //   const monthMap = Calendar.getMonthWeekdays(0); // Current month's weekday map
-    //   const fullDate = Calendar.getCurrentDate();    // "Tuesday, July 15, 2023"
-    //
-    // Time Manipulation Examples:
-    //   Calendar.advanceTime("3h");                     // Skip forward 3 hours
-    //   Calendar.advanceTime("2d");                     // Skip forward 2 days
-    //   Calendar.advanceTime("-4h");                    // Go back 4 hours
-    //   Calendar.advanceTime("2d, 3h, 30m");            // Skip 2 days, 3 hours, 30 minutes
-    //   Calendar.advanceTime("2h30m");                  // Skip 2 hours 30 minutes
-    //   Calendar.setTime(14, 30);                       // Set time to 14:30
-    //   Calendar.setDay(200);                           // Jump to day 200
-    //   Calendar.setDay(-30);                           // Jump to 30 days before start
-    //   Calendar.setActionsPerDay(300);                 // Change to 300 actions per day
-    //   Calendar.setHoursPerDay(20);                    // Change to 20-hour days
-    //
-    // Event Configuration Examples:
-    //   - Fixed Annual: "Christmas: 12/25"
-    //   - Relative Annual: "Thanksgiving: 4th Thursday of November"
-    //   - Periodic: "Olympics: 7/1/2024 every 4 years"
-    //   - One-time: "Solar Eclipse: 4/8/2024 once"
-    //   - Relative Periodic: "Mages Meeting: 1st Monday of January 2024 every 3 years"
-    
-    // Module constants
+    // estimate AI Instructions and then subtract from info.maxChars if pattern detected so everyone below can be happy
+function AINFaker(text) {
     const debug = false;
-    const MODULE_NAME = 'Time';
-    const CONFIG_CARD = '[CALENDAR] Time Configuration';
-    const STATE_CARD = '[CALENDAR] Time State';
-    const EVENT_CARD_PREFIX = '[CALENDAR] Event Days';
-    
-    // Module-level cache for events (valid for this turn only)
-    let eventCache = null;
-    
-    // Configuration Management
-    function loadConfiguration() {
-        const configCard = Utilities.storyCard.get(CONFIG_CARD);
-        if (!configCard) {
-            if (debug) console.log('[Time] No configuration found, creating default');
-            createDefaultConfiguration();
-            
-            // Also create default event days card
-            if (!Utilities.storyCard.exists(EVENT_CARD_PREFIX)) {
-                createDefaultEventDays();
+
+    function getStoryCard(title) {
+        for (const card of storyCards) {
+            if (card && card.title === title) {
+                return card;
             }
-            
-            return loadConfiguration();
         }
+        return null;
+    }
+    
+    function parseConfig(description) {
+        const config = {
+            estimate: 0,  // Start with 0 - no estimate until we're confident
+            manualChars: 1000,
+            autoMode: true,
+            enabled: true,
+            maxSamples: 40,
+            safetyBuffer: 100,
+            samples: [],
+            debugMode: false,
+            hasStableEstimate: false
+        };
         
-        // Ensure command documentation is present
-        if (!configCard.description || !configCard.description.includes('TIME SYSTEM COMMANDS')) {
-            Utilities.storyCard.update(CONFIG_CARD, {
-                description: getCommandDocumentation()
-            });
-        }
+        if (!description) return config;
         
-        const configText = configCard.entry || configCard.value || '';
-        if (!configText) {
-            if (debug) console.log('[Time] ERROR: Configuration card is empty. Time system requires configuration.');
-            return null;
-        }
-        
-        const lines = configText.split('\n');
-        const config = {};
-        let hasRequiredFields = true;
-        
-        // Parse basic configuration values
+        const lines = description.split('\n');
         for (const line of lines) {
-            if (line.includes('Actions Per Day:')) {
-                config.actionsPerDay = parseInt(line.split(':')[1].trim());
-            } else if (line.includes('Start Date:')) {
-                config.startDate = line.split(':')[1].trim();
-            } else if (line.includes('Hours Per Day:')) {
-                config.hoursPerDay = parseInt(line.split(':')[1].trim());
+            if (line.trim().startsWith('#')) continue;
+            
+            const match = line.match(/^([^:]+):\s*(.+)$/);
+            if (!match) continue;
+            
+            const key = match[1].trim();
+            const value = match[2].trim();
+            
+            switch (key) {
+                case 'Enabled':
+                    config.enabled = value.toLowerCase() === 'true';
+                    break;
+                case 'Manual Chars':
+                    config.manualChars = parseInt(value) || 1000;
+                    break;
+                case 'Auto Mode':
+                    config.autoMode = value.toLowerCase() === 'true';
+                    break;
+                case 'Max Samples':
+                    config.maxSamples = parseInt(value) || 40;
+                    break;
+                case 'Safety Buffer':
+                    config.safetyBuffer = parseInt(value) || 150;
+                    break;
+                case 'Debug Mode':
+                    config.debugMode = value.toLowerCase() === 'true';
+                    break;
+                case 'Has Stable Estimate':
+                    config.hasStableEstimate = value.toLowerCase() === 'true';
+                    break;
+                case 'Estimate':
+                    config.estimate = parseInt(value) || 0;
+                    break;
+                case 'Samples':
+                    try {
+                        config.samples = JSON.parse(value) || [];
+                    } catch (e) {
+                        config.samples = [];
+                    }
+                    break;
             }
-        }
-        
-        // Validate required fields
-        if (!config.actionsPerDay || !config.startDate || !config.hoursPerDay) {
-            if (debug) console.log('[Time] ERROR: Missing required configuration fields');
-            return null;
-        }
-        
-        const sections = Utilities.plainText.parseSections(configText);
-        
-        // Parse sections - Utilities.plainText.parseSections returns snake_case keys
-        const daysSection = sections.days_of_week;
-        const monthsSection = sections.months;
-        const periodsSection = sections.time_periods;
-        const seasonsSection = sections.seasons;
-        const leapSection = sections.leap_year;
-        
-        // Time Periods - required
-        config.timePeriods = parseTimePeriods(periodsSection);
-        if (!config.timePeriods || Object.keys(config.timePeriods).length === 0) {
-            if (debug) console.log('[Time] ERROR: No time periods defined in configuration');
-            return null;
-        }
-        
-        // Seasons - optional
-        config.seasons = parseSeasons(seasonsSection);
-        
-        // Days of Week - required
-        config.daysOfWeek = parseDaysOfWeek(daysSection);
-        if (!config.daysOfWeek || config.daysOfWeek.length === 0) {
-            if (debug) console.log('[Time] ERROR: No days of week defined in configuration');
-            return null;
-        }
-        
-        // Months - required
-        const monthData = parseMonths(monthsSection);
-        if (!monthData || monthData.names.length === 0) {
-            if (debug) console.log('[Time] ERROR: No months defined in configuration');
-            return null;
-        }
-        config.months = monthData.names;
-        config.daysPerMonth = monthData.days;
-        
-        // Leap Year - optional but fully defined if present
-        if (leapSection) {
-            config.leapYear = parseLeapYear(leapSection, config.months);
         }
         
         return config;
     }
     
-    function parseTimePeriods(periodsData) {
-        if (!periodsData) return null;
+    function saveConfig(config) {
+        const statusText = config.hasStableEstimate ? 
+            `Reserving ${config.estimate} chars` :
+            config.samples.length < 8 ? 
+                `Gathering samples (${config.samples.length}/8 minimum)` :
+                `Analyzing pattern...`;
         
-        const periods = {};
+        const helpText = (
+            `# AIN Detector State\n`+
+            `Mode: ${config.autoMode ? 'AUTO' : 'MANUAL'}\n`+
+            `Status: ${statusText}\n`+
+            `${config.autoMode ? 
+                `Samples: ${config.samples.length}/${config.maxSamples}\n` :
+                `Manual Setting: ${config.manualChars} characters\n`
+            }`+
+            `===Alter Config Below===`
+        );
         
-        // If it's an array from Utilities.plainText.parseList
-        if (Array.isArray(periodsData)) {
-            periodsData.forEach(item => {
-                const itemStr = typeof item === 'string' ? item : String(item);
-                const match = itemStr.match(/^(.+?):\s*([\d.]+)-([\d.]+)$/);
-                if (match) {
-                    const name = match[1].trim();
-                    const start = parseFloat(match[2]);
-                    const end = parseFloat(match[3]);
-                    const key = Utilities.string.toCamelCase(name);
-                    
-                    periods[key] = {
-                        name: name,
-                        start: start,
-                        end: end
-                    };
-                    
-                    if (start > end) {
-                        periods[key].wrapsAround = true;
-                    }
-                }
-            });
-        } else {
-            if (debug) console.log('[Time] Warning: Time periods data not in expected array format');
-            return null;
-        }
-        
-        return Object.keys(periods).length > 0 ? periods : null;
-    }
-    
-    function parseSeasons(seasonsData) {
-        if (!seasonsData) return null;
-        
-        const seasons = {};
-        
-        // If it's an array from Utilities.plainText.parseList
-        if (Array.isArray(seasonsData)) {
-            seasonsData.forEach(item => {
-                const itemStr = typeof item === 'string' ? item : String(item);
-                const match = itemStr.match(/^(.+?):\s*([\d.]+)-([\d.]+)$/);
-                if (match) {
-                    const name = match[1].trim();
-                    const start = parseFloat(match[2]);
-                    const end = parseFloat(match[3]);
-                    const key = Utilities.string.toCamelCase(name);
-                    
-                    seasons[key] = {
-                        name: name,
-                        start: start,
-                        end: end
-                    };
-                    
-                    // Check for wraparound (like Winter 0.95-0.2)
-                    if (start > end) {
-                        seasons[key].wrapsAround = true;
-                    }
-                }
-            });
-        } else {
-            if (debug) console.log('[Time] Warning: Seasons data not in expected array format');
-            return null;
-        }
-        
-        return Object.keys(seasons).length > 0 ? seasons : null;
-    }
-    
-    function parseDaysOfWeek(daysData) {
-        if (!daysData) return null;
-        
-        // If already an array (from Utilities.plainText.parseList), just return it
-        if (Array.isArray(daysData)) {
-            return daysData.length > 0 ? daysData : null;
-        }
-        
-        // Shouldn't reach here with proper utilities parsing, but keep as fallback
-        if (debug) console.log('[Time] Warning: Days data not in expected array format');
-        return null;
-    }
-    
-    function parseMonths(monthsData) {
-        if (!monthsData) return null;
-        
-        const names = [];
-        const days = [];
-        
-        // If it's an array from Utilities.plainText.parseList
-        if (Array.isArray(monthsData)) {
-            monthsData.forEach(item => {
-                // Utilities.parseListItem returns the item as-is if no special format
-                const itemStr = typeof item === 'string' ? item : String(item);
-                const match = itemStr.match(/^(.+?)(?:\s*:\s*(\d+))?$/);
-                if (match) {
-                    const monthName = match[1].trim();
-                    const monthDays = match[2] ? parseInt(match[2]) : 30;
-                    if (monthName) {
-                        names.push(monthName);
-                        days.push(monthDays);
-                    }
-                }
-            });
-        } else {
-            if (debug) console.log('[Time] Warning: Months data not in expected array format');
-            return null;
-        }
-        
-        if (names.length === 0) return null;
-        
-        return { names, days };
-    }
-    
-    function parseLeapYear(leapData, monthNames) {
-        if (!leapData || !monthNames) return null;
-        
-        const leap = {};
-        
-        // leapData should be an object from Utilities.plainText.parseKeyValues
-        if (typeof leapData === 'object' && !Array.isArray(leapData)) {
-            // Utilities converts to snake_case and parses values
-            leap.enabled = leapData.enabled === true;
-            
-            // Common fields
-            if (leapData.frequency) leap.frequency = leapData.frequency;
-            if (leapData.skip_frequency !== undefined) leap.skipFrequency = leapData.skip_frequency;
-            if (leapData.skip_exception !== undefined) leap.skipExceptionFrequency = leapData.skip_exception;
-            if (leapData.start_year !== undefined) leap.startYear = leapData.start_year;
-            
-            // Initialize adjustments object
-            leap.adjustments = {};
-            
-            // Check for adjustments list
-            if (leapData.adjustments && Array.isArray(leapData.adjustments)) {
-                for (const adjustment of leapData.adjustments) {
-                    if (typeof adjustment === 'string') {
-                        // Parse "Month: +/-X" format
-                        const match = adjustment.match(/^(.+?):\s*([+-]?\d+)$/);
-                        if (match) {
-                            const monthName = match[1].trim();
-                            const dayAdjustment = parseInt(match[2]);
-                            
-                            const monthIndex = monthNames.findIndex(m => 
-                                m.toLowerCase() === monthName.toLowerCase()
-                            );
-                            
-                            if (monthIndex !== -1) {
-                                leap.adjustments[monthIndex] = dayAdjustment;
-                            } else {
-                                if (debug) console.log(`[Time] WARNING: Unknown month in leap adjustment: ${monthName}`);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            // Backwards compatibility: Check for old "Month: name" format
-            if (leapData.month && Object.keys(leap.adjustments).length === 0) {
-                const monthName = String(leapData.month);
-                const monthIndex = monthNames.findIndex(m => 
-                    m.toLowerCase() === monthName.toLowerCase()
-                );
-                
-                if (monthIndex !== -1) {
-                    // Default to +1 day for backwards compatibility
-                    leap.adjustments[monthIndex] = 1;
-                    if (debug) console.log(`[Time] Converting legacy leap year format to new format: ${monthName} +1`);
-                } else {
-                    if (debug) console.log(`[Time] WARNING: Unknown month in legacy leap year: ${monthName}`);
-                }
-            }
-            
-            // Must have at least one adjustment
-            if (Object.keys(leap.adjustments).length === 0) {
-                if (debug) console.log('[Time] WARNING: No leap year adjustments defined');
-                return null;
-            }
-        } else {
-            if (debug) console.log('[Time] Warning: Leap year data not in expected object format');
-            return null;
-        }
-        
-        // Validate leap year configuration if enabled
-        if (leap.enabled && (!leap.adjustments || !leap.frequency)) {
-            if (debug) console.log('[Time] WARNING: Leap year enabled but configuration incomplete');
-            return null;
-        }
-        
-        // Set defaults for optional fields
-        if (leap.skipFrequency === undefined) leap.skipFrequency = 0;
-        if (leap.skipExceptionFrequency === undefined) leap.skipExceptionFrequency = 0;
-        if (leap.startYear === undefined) leap.startYear = 0;
-        
-        return leap;
-    }
-    
-    function loadEventDays() {
-        // Return cached events if available
-        if (eventCache !== null) {
-            return eventCache;
-        }
-        
-        try {
-            const eventsList = [];
-            
-            // Check for multiple event cards
-            let cardNumber = 1;
-            let cardTitle = EVENT_CARD_PREFIX;
-            
-            while (true) {
-                // Build card title
-                if (cardNumber > 1) {
-                    cardTitle = `${EVENT_CARD_PREFIX} ${cardNumber}`;
-                }
-                
-                const eventCard = Utilities.storyCard.get(cardTitle);
-                if (!eventCard) break;
-                
-                // Parse events from both entry and description
-                const entryEvents = parseEventList(eventCard.entry || '');
-                const descEvents = parseEventList(eventCard.description || '');
-                
-                eventsList.push(...entryEvents, ...descEvents);
-                
-                cardNumber++;
-                if (cardNumber > 10) break; // Safety limit
-            }
-            
-            // Remove duplicates and sort by date
-            const uniqueEvents = removeDuplicateEvents(eventsList);
-            
-            // Cache the result
-            eventCache = uniqueEvents;
-            
-            return uniqueEvents;
-        } catch (error) {
-            if (debug) console.log('[Time] Error loading event days:', error.message);
-            eventCache = [];
-            return [];
-        }
-    }
-    
-    function parseEventList(text) {
-        if (!text || typeof text !== 'string') return [];
-        
-        const eventsList = [];
-        const lines = text.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            
-            // Skip empty lines and comments
-            if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
-            
-            // Skip section headers
-            if (trimmed.startsWith('##')) continue;
-            
-            // Parse event line
-            const event = parseEventLine(trimmed);
-            if (event) eventsList.push(event);
-        }
-        
-        return eventsList;
-    }
-    
-    function parseEventLine(line) {
-        // Remove bullet points if present
-        const cleaned = line.replace(/^[-•*]\s*/, '').trim();
-        if (!cleaned) return null;
-        
-        // First check for nth weekday format: "Event: 4th Thursday of November"
-        const nthWeekdayMatch = cleaned.match(/^(.+?):\s*(1st|2nd|3rd|4th|5th|last)\s+(\w+)\s+of\s+(\w+)\s*(.*)$/i);
-        if (nthWeekdayMatch) {
-            const name = nthWeekdayMatch[1].trim();
-            const nth = nthWeekdayMatch[2].toLowerCase();
-            const weekday = nthWeekdayMatch[3];
-            const monthName = nthWeekdayMatch[4];
-            const modifiers = nthWeekdayMatch[5].trim().toLowerCase();
-            
-            // Find month index
-            const config = loadConfiguration();
-            if (!config) return null;
-            
-            const monthIndex = config.months.findIndex(m => 
-                m.toLowerCase() === monthName.toLowerCase()
-            );
-            if (monthIndex === -1) {
-                if (debug) console.log(`[Time] Invalid month in event: ${name} (${monthName})`);
-                return null;
-            }
-            
-            // Find weekday index
-            const weekdayIndex = config.daysOfWeek.findIndex(d => 
-                d.toLowerCase() === weekday.toLowerCase()
-            );
-            if (weekdayIndex === -1) {
-                if (debug) console.log(`[Time] Invalid weekday in event: ${name} (${weekday})`);
-                return null;
-            }
-            
-            // Convert nth string to number
-            let nthNum;
-            if (nth === 'last') {
-                nthNum = -1;
-            } else {
-                nthNum = parseInt(nth.replace(/[^\d]/g, ''));
-                if (isNaN(nthNum) || nthNum < 1 || nthNum > 5) {
-                    if (debug) console.log(`[Time] Invalid nth value in event: ${name} (${nth})`);
-                    return null;
-                }
-            }
-            
-            const event = {
-                name: name,
-                month: monthIndex,
-                type: 'relative',
-                nth: nthNum,
-                weekday: weekdayIndex
-            };
-            
-            // Check for year constraints
-            if (modifiers) {
-                const yearMatch = modifiers.match(/(\d{4})/);
-                if (yearMatch) {
-                    event.startYear = parseInt(yearMatch[1]);
-                    
-                    if (modifiers.includes('once') || modifiers.includes('only')) {
-                        event.onlyYear = event.startYear;
-                        delete event.startYear;
-                    } else if (modifiers.includes('every')) {
-                        const everyMatch = modifiers.match(/every\s+(\d+)\s+years?/);
-                        if (everyMatch) {
-                            event.frequency = parseInt(everyMatch[1]);
-                        }
-                    }
-                }
-            }
-            
-            return event;
-        }
-        
-        // Original date format: "Event Name: MM/DD/YYYY every N years" or "Event Name: MM/DD" etc.
-        const match = cleaned.match(/^(.+?):\s*(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?\s*(.*)$/);
-        if (!match) return null;
-        
-        const name = match[1].trim();
-        const month = parseInt(match[2]) - 1; // 0-indexed
-        const day = parseInt(match[3]);
-        const year = match[4] ? parseInt(match[4]) : null;
-        const modifiers = match[5].trim().toLowerCase();
-        
-        // Get configuration to validate month/day
-        const config = loadConfiguration();
-        if (!config) return null;
-        
-        // Validate month
-        if (month < 0 || month >= config.months.length) {
-            if (debug) console.log(`[Time] Invalid month in event: ${name} (${match[2]})`);
-            return null;
-        }
-        
-        // Validate day (but allow days that might only exist in leap years)
-        const maxDaysInMonth = config.daysPerMonth[month];
-        let leapMonthDays = maxDaysInMonth;
-        
-        // Check if this month could have extra days in leap years
-        if (config.leapYear && config.leapYear.enabled && config.leapYear.adjustments) {
-            const adjustment = config.leapYear.adjustments[month];
-            if (adjustment && adjustment > 0) {
-                leapMonthDays = maxDaysInMonth + adjustment;
-            }
-        }
-                              
-        if (day < 1 || day > leapMonthDays) {
-            if (debug) console.log(`[Time] Invalid day in event: ${name} (${match[3]} in ${config.months[month]})`);
-            return null;
-        }
-        
-        const event = {
-            name: name,
-            month: month,
-            day: day,
-            type: 'annual' // default
-        };
-        
-        // Parse modifiers
-        if (year) {
-            event.year = year;
-            
-            if (modifiers.includes('once') || modifiers.includes('one-off') || modifiers.includes('only')) {
-                event.type = 'once';
-            } else if (modifiers.includes('every')) {
-                const everyMatch = modifiers.match(/every\s+(\d+)\s+years?/);
-                if (everyMatch) {
-                    event.type = 'periodic';
-                    event.frequency = parseInt(everyMatch[1]);
-                }
-            } else {
-                // If year is specified but no modifier, assume once
-                event.type = 'once';
-            }
-        }
-        
-        // Parse additional modifiers
-        if (modifiers.includes('annual') || modifiers.includes('yearly')) {
-            event.type = 'annual';
-            delete event.year; // Annual events don't need a year
-        }
-        
-        return event;
-    }
-    
-    function removeDuplicateEvents(eventsList) {
-        const seen = new Set();
-        const unique = [];
-        
-        for (const event of eventsList) {
-            let key;
-            if (event.type === 'relative') {
-                key = `${event.name}:${event.month}:${event.nth}:${event.weekday}:relative:${event.onlyYear || ''}:${event.frequency || ''}`;
-            } else {
-                key = `${event.name}:${event.month}:${event.day}:${event.type}:${event.year || ''}`;
-            }
-            
-            if (!seen.has(key)) {
-                seen.add(key);
-                unique.push(event);
-            }
-        }
-        
-        return unique;
-    }
-    
-    function checkEventDay(month, day, year, eventsList, config = null) {
-        const todayEvents = [];
-        
-        try {
-            // Get configuration if not provided
-            if (!config) {
-                config = loadConfiguration();
-                if (!config) return todayEvents;
-            }
-            
-            // Check if this day exists in this month/year (handles leap days)
-            const daysInMonth = getDaysInMonth(month, year, config);
-            if (day > daysInMonth) {
-                return todayEvents; // This day doesn't exist (e.g., Feb 30)
-            }
-            
-            for (const event of eventsList) {
-                // Handle relative date events (nth weekday of month)
-                if (event.type === 'relative') {
-                    if (event.month !== month) continue;
-                    
-                    // Check year constraints
-                    if (event.onlyYear && event.onlyYear !== year) continue;
-                    if (event.startYear && event.frequency) {
-                        const yearsSince = year - event.startYear;
-                        if (yearsSince < 0 || yearsSince % event.frequency !== 0) continue;
-                    }
-                    
-                    // Calculate the actual day for this event
-                    const eventDay = calculateNthWeekdayOfMonth(event.nth, event.weekday, month, year, config);
-                    
-                    if (eventDay === day) {
-                        todayEvents.push(event);
-                    }
-                    continue;
-                }
-                
-                // Handle fixed date events
-                if (event.month !== month || event.day !== day) continue;
-                
-                // For events on days that don't always exist (like Feb 29)
-                // They'll only trigger when the day actually exists
-                
-                switch (event.type) {
-                    case 'annual':
-                        // Happens every year (when the date exists)
-                        todayEvents.push(event);
-                        break;
-                        
-                    case 'once':
-                        // Only happens on specific year
-                        if (event.year === year) {
-                            todayEvents.push(event);
-                        }
-                        break;
-                        
-                    case 'periodic':
-                        // Happens every N years from start year
-                        if (event.year && event.frequency) {
-                            const yearsSince = year - event.year;
-                            if (yearsSince >= 0 && yearsSince % event.frequency === 0) {
-                                todayEvents.push(event);
-                            }
-                        }
-                        break;
-                }
-            }
-        } catch (error) {
-            if (debug) console.log('[Time] Error checking events:', error.message);
-        }
-        
-        return todayEvents;
-    }
-    
-    function calculateNthWeekdayOfMonth(nth, weekday, month, year, config) {
-        // Calculate what day the nth weekday of the month falls on
-        // nth: 1-5 for 1st-5th, -1 for last
-        // weekday: 0-6 (index in daysOfWeek array)
-        
-        // Get what weekday the 1st of the month is
-        const firstDayWeekday = getDayOfWeekForDate(month, 1, year, config);
-        
-        // Calculate offset to first occurrence of target weekday
-        let daysUntilFirst = weekday - firstDayWeekday;
-        if (daysUntilFirst < 0) daysUntilFirst += config.daysOfWeek.length;
-        
-        if (nth === -1) {
-            // Last occurrence - work backwards from end of month
-            const daysInMonth = getDaysInMonth(month, year, config);
-            const lastDayWeekday = getDayOfWeekForDate(month, daysInMonth, year, config);
-            
-            let daysFromLast = lastDayWeekday - weekday;
-            if (daysFromLast < 0) daysFromLast += config.daysOfWeek.length;
-            
-            return daysInMonth - daysFromLast;
-        } else {
-            // Nth occurrence
-            const targetDay = 1 + daysUntilFirst + (nth - 1) * config.daysOfWeek.length;
-            
-            // Check if this day exists in the month
-            const daysInMonth = getDaysInMonth(month, year, config);
-            if (targetDay > daysInMonth) {
-                return null; // No nth occurrence this month
-            }
-            
-            return targetDay;
-        }
-    }
-    
-    function getDayOfWeekForDate(month, day, year, config) {
-        // Calculate day of week for a specific date
-        // We need to count total days from start date to this date
-        
-        const startParts = config.startDate.split('/');
-        const startMonth = parseInt(startParts[0]) - 1;
-        const startDay = parseInt(startParts[1]);
-        const startYear = parseInt(startParts[2]);
-        
-        // Calculate how many days from start to target date
-        const targetInfo = { month, day, year };
-        const startInfo = { month: startMonth, day: startDay, year: startYear };
-        
-        // Get the number of days between dates
-        const daysBetween = calculateDaysBetweenDates(startInfo, targetInfo, config);
-        
-        // Calculate day of week
-        const dayOfWeekIndex = ((daysBetween % config.daysOfWeek.length) + config.daysOfWeek.length) % config.daysOfWeek.length;
-        return dayOfWeekIndex;
-    }
-    
-    function calculateDaysBetweenDates(startDate, endDate, config) {
-        let totalDays = 0;
-        
-        // If end date is before start date, return negative
-        if (endDate.year < startDate.year ||
-            (endDate.year === startDate.year && endDate.month < startDate.month) ||
-            (endDate.year === startDate.year && endDate.month === startDate.month && endDate.day < startDate.day)) {
-            return -calculateDaysBetweenDates(endDate, startDate, config);
-        }
-        
-        // Same date
-        if (endDate.year === startDate.year && endDate.month === startDate.month && endDate.day === startDate.day) {
-            return 0;
-        }
-        
-        // Count days
-        let currentYear = startDate.year;
-        let currentMonth = startDate.month;
-        let currentDay = startDate.day;
-        
-        while (currentYear < endDate.year || currentMonth < endDate.month || currentDay < endDate.day) {
-            currentDay++;
-            totalDays++;
-            
-            const daysInMonth = getDaysInMonth(currentMonth, currentYear, config);
-            if (currentDay > daysInMonth) {
-                currentDay = 1;
-                currentMonth++;
-                
-                if (currentMonth >= config.months.length) {
-                    currentMonth = 0;
-                    currentYear++;
-                }
-            }
-        }
-        
-        return totalDays;
-    }
-    
-    function createDefaultConfiguration() {
         const configText = (
-            `# Time Configuration` +
-            `\nActions Per Day: 200` +
-            `\nStart Date: 11/06/2022` +
-            `\nHours Per Day: 24` +
-            `\n` +
-            `\n## Time Periods` +
-            `\n- Late Night: 0.92-0.21` +
-            `\n- Dawn: 0.21-0.29` +
-            `\n- Morning: 0.29-0.42` +
-            `\n- Midday: 0.42-0.58` +
-            `\n- Afternoon: 0.58-0.71` +
-            `\n- Evening: 0.71-0.79` +
-            `\n- Night: 0.79-0.92` +
-            `\n` +
-            `\n## Seasons` +
-            `\n// Based on year progress (0.0 = Jan 1, 1.0 = Dec 31)` +
-            `\n// Supports wraparound (e.g., Winter: 0.92-0.25 for Dec-Mar)` +
-            `\n// Northern Hemisphere example:` +
-            `\n- Winter: 0.92-0.25` +
-            `\n- Spring: 0.25-0.5` +
-            `\n- Summer: 0.5-0.75` +
-            `\n- Autumn: 0.75-0.92` +
-            `\n// Alternative examples:` +
-            `\n// Tropical: Wet 0.4-0.9, Dry 0.9-0.4` +
-            `\n// Fantasy: Frostfall 0.85-0.15, Renewal 0.15-0.45, Highsun 0.45-0.7, Harvest 0.7-0.85` +
-            `\n` +
-            `\n## Days of Week` +
-            `\n// First entry = Start Date's day of week` +
-            `\n- Sunday` +
-            `\n- Monday` +
-            `\n- Tuesday` +
-            `\n- Wednesday` +
-            `\n- Thursday` +
-            `\n- Friday` +
-            `\n- Saturday` +
-            `\n` +
-            `\n## Months` +
-            `\n- January: 31` +
-            `\n- February: 28` +
-            `\n- March: 31` +
-            `\n- April: 30` +
-            `\n- May: 31` +
-            `\n- June: 30` +
-            `\n- July: 31` +
-            `\n- August: 31` +
-            `\n- September: 30` +
-            `\n- October: 31` +
-            `\n- November: 30` +
-            `\n- December: 31` +
-            `\n` +
-            `\n## Leap Year` +
-            `\n// Adjusts month lengths in leap years` +
-            `\n// Example: Every 4 years, skip every 100, except every 400` +
-            `\n// Invalid dates will not trigger` +
-            `\nEnabled: true` +
-            `\nFrequency: 4` +
-            `\nSkip Frequency: 100` +
-            `\nSkip Exception: 400` +
-            `\nStart Year: 0` +
-            `\nAdjustments:` +
-            `\n- February: +1` +
-            `\n` +
-            `\n// Examples:` +
-            `\n// Standard Earth:` +
-            `\n// - February: +1` +
-            `\n// Multiple months:` +
-            `\n// - February: +1` +
-            `\n// - June: +1` +
-            `\n// Variable days:` +
-            `\n// - Spiritmonth: +7` +
-            `\n// - Voidmonth: -3` +
-            `\n// Complex:` +
-            `\n// - Firstmonth: +2` +
-            `\n// - Thirdmonth: -1` +
-            `\n// - Lastmonth: +1`
+            `Enabled: ${config.enabled}\n`+
+            `Manual Chars: ${config.manualChars}\n`+
+            `Auto Mode: ${config.autoMode}\n`+
+            `Max Samples: ${config.maxSamples}\n`+
+            `Safety Buffer: ${config.safetyBuffer}\n`+
+            `Debug Mode: ${config.debugMode}\n`+
+            `=================================\n` +
+            `Estimate: ${config.estimate}\n`+
+            `Has Stable Estimate: ${config.hasStableEstimate}\n`+
+            `Samples: ${JSON.stringify(config.samples)}`
         );
         
-        const description = getCommandDocumentation();
+        const existingCard = getStoryCard("[AIN] Detector Configuration");
         
-        const card = Utilities.storyCard.add({
-            title: CONFIG_CARD,
-            entry: configText,
-            description: description
-        });
-        
-        if (!card) {
-            if (debug) console.log('[Time] Failed to create configuration card');
-        }
-    }
-    
-    function createDefaultEventDays() {
-        const eventText = (
-            `# Event Days Configuration` +
-            `\n// Format: Event Name: MM/DD [modifiers]` +
-            `\n// Format: Event Name: Nth Weekday of Month` +
-            `\n// Modifiers: annual, once, every N years` +
-            `\n// Works with custom day/month names` +
-            `\n// Example: "Harvest Moon: 3rd Seventhday of Ninthmonth"` +
-            `\n// Example: "Council: last Firstday of Firstmonth"` +
-            `\n` +
-            `\n## Annual Events` +
-            `\n- New Year: 1/1` +
-            `\n- Valentine's Day: 2/14` +
-            `\n- Independence Day: 7/4` +
-            `\n- Halloween: 10/31` +
-            `\n- Christmas: 12/25` +
-            `\n` +
-            `\n## Relative Date Events` +
-            `\n- Martin Luther King Jr Day: 3rd Monday of January` +
-            `\n- Presidents Day: 3rd Monday of February` +
-            `\n- Mother's Day: 2nd Sunday of May` +
-            `\n- Memorial Day: last Monday of May` +
-            `\n- Father's Day: 3rd Sunday of June` +
-            `\n- Labor Day: 1st Monday of September` +
-            `\n- Columbus Day: 2nd Monday of October` +
-            `\n- Thanksgiving: 4th Thursday of November` +
-            `\n` +
-            `\n## Periodic Events` +
-            `\n- Summer Olympics: 7/15/2024 every 4 years` +
-            `\n- Winter Olympics: 2/1/2026 every 4 years` +
-            `\n- World Cup: 6/1/2026 every 4 years` +
-            `\n- Leap Day: 2/29 annual` +
-            `\n// Invalid dates will not trigger` +
-            `\n` +
-            `\n## One-Time Events` +
-            `\n- Solar Eclipse: 4/8/2024 once`
-        );
-        
-        const description = `// You can continue in the description.`;
-        
-        const card = Utilities.storyCard.add({
-            title: EVENT_CARD_PREFIX,
-            entry: eventText,
-            description: description
-        });
-        
-        if (!card) {
-            if (debug) console.log('[Time] Failed to create event days card');
-        }
-    }
-    
-    function getCommandDocumentation() {
-        return (
-            `TIME SYSTEM COMMANDS` +
-            `\n=====================================` +
-            `\n/settime [hour]:[minute] [am/pm]` +
-            `\n  Set the current time` +
-            `\n  Examples: /settime 14:30, /settime 6:30pm, /settime 6pm` +
-            `\n  Note: AM/PM based on Hours Per Day / 2` +
-            `\n` +
-            `\n/wait [number] [minutes/hours/days]` +
-            `\n/skip [number] [minutes/hours/days]` +
-            `\n/advance [number] [minutes/hours/days]` +
-            `\n  Skip forward in time` +
-            `\n  Examples: /skip 30 minutes, /wait 3 hours, /skip 2 days` +
-            `\n  Short forms: /skip 30m, /wait 3h, /skip 2d` +
-            `\n  Combined: /skip 1h30m, /wait 1.5h` +
-            `\n` +
-            `\n/rewind [number] [minutes/hours/days]` +
-            `\n  Go back in time` +
-            `\n  Examples: /rewind 2 hours, /rewind 1 day` +
-            `\n  Short forms: /rewind 2h, /rewind 1d` +
-            `\n` +
-            `\n/time` +
-            `\n/currenttime` +
-            `\n  Display the current time and date`
-        );
-    }
-    
-    // Helper Functions for State and Command Processing
-    function formatSeasonForState(day, config) {
-        if (!config.seasons) return '';
-        
-        const yearInfo = getDayOfYear(day, config.startDate, config);
-        const yearProgress = calculateYearProgress(yearInfo.dayOfYear, yearInfo.year, config);
-        const currentSeason = calculateSeason(yearProgress, config.seasons);
-        
-        return currentSeason !== 'Unknown' ? `\nSeason: [${currentSeason}]` : '';
-    }
-    
-    function formatEventsForState(day, config) {
-        const eventsList = loadEventDays();
-        if (eventsList.length === 0) return '';
-        
-        const dateInfo = calculateDateInfo(day, config.startDate, config);
-        const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-        
-        if (todayEvents.length > 0) {
-            const eventNames = todayEvents.map(e => e.name).join(', ');
-            return `\nEvents: [${eventNames}]`;
-        }
-        
-        return '';
-    }
-    
-    function getCurrentSeasonInfo(day, config) {
-        if (!config.seasons) return '';
-        
-        const yearInfo = getDayOfYear(day, config.startDate, config);
-        const yearProgress = calculateYearProgress(yearInfo.dayOfYear, yearInfo.year, config);
-        const currentSeason = calculateSeason(yearProgress, config.seasons);
-        
-        return currentSeason !== 'Unknown' ? `, ${currentSeason}` : '';
-    }
-    
-    function getCurrentEventInfo(day, config) {
-        const eventsList = loadEventDays();
-        if (eventsList.length === 0) return '';
-        
-        const dateInfo = calculateDateInfo(day, config.startDate, config);
-        const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-        
-        if (todayEvents.length > 0) {
-            const eventNames = todayEvents.map(e => e.name).join(', ');
-            return ` [${eventNames}]`;
-        }
-        
-        return '';
-    }
-    
-    function getSeasonChangeInfo(previousDay, currentDay, config) {
-        if (!config.seasons || currentDay === previousDay) return '';
-        
-        const prevYearInfo = getDayOfYear(previousDay, config.startDate, config);
-        const currYearInfo = getDayOfYear(currentDay, config.startDate, config);
-        
-        const prevYearProgress = calculateYearProgress(prevYearInfo.dayOfYear, prevYearInfo.year, config);
-        const currYearProgress = calculateYearProgress(currYearInfo.dayOfYear, currYearInfo.year, config);
-        
-        const prevSeason = calculateSeason(prevYearProgress, config.seasons);
-        const currSeason = calculateSeason(currYearProgress, config.seasons);
-        
-        return prevSeason !== currSeason ? ` (entered ${currSeason})` : '';
-    }
-    
-    // State Management
-    function loadTimeState() {
-        const config = loadConfiguration();
-        if (!config) {
-            if (debug) console.log('[Time] Cannot load state without configuration');
-            return null;
-        }
-        
-        const stateCard = Utilities.storyCard.get(STATE_CARD);
-        if (!stateCard) {
-            if (debug) console.log('[Time] No state found, creating initial state');
-            return createInitialState();
-        }
-        
-        const lines = stateCard.entry.split('\n');
-        const state = {
-            day: 0,
-            progress: 0,
-            lastProcessedAction: -1
-        };
-        
-        for (const line of lines) {
-            if (line.startsWith('Day:')) {
-                const displayedDay = parseInt(line.split(':')[1].trim());
-                if (!isNaN(displayedDay)) {
-                    state.day = displayedDay;
-                }
-            } else if (line.startsWith('Progress:')) {
-                const match = line.match(/Progress:\s*(\d+)/);
-                if (match) state.progress = parseInt(match[1]);
-            } else if (line.startsWith('Last Processed Action:')) {
-                state.lastProcessedAction = parseInt(line.split(':')[1].trim());
-            }
-        }
-        
-        return state;
-    }
-    
-    function createInitialState() {
-        const config = loadConfiguration();
-        if (!config) {
-            if (debug) console.log('[Time] Cannot create initial state without configuration');
-            return null;
-        }
-        
-        // Check if a state card already exists with manual edits
-        const existingCard = Utilities.storyCard.get(STATE_CARD);
-        if (existingCard && existingCard.entry) {
-            // Try to parse existing values
-            const lines = existingCard.entry.split('\n');
-            let day = 0;
-            let progress = 0;
-            
-            for (const line of lines) {
-                if (line.startsWith('Day:')) {
-                    const parsedDay = parseInt(line.split(':')[1].trim());
-                    if (!isNaN(parsedDay)) day = parsedDay;
-                } else if (line.startsWith('Progress:')) {
-                    const match = line.match(/Progress:\s*(\d+)/);
-                    if (match) progress = parseInt(match[1]);
-                }
-            }
-            
-            const state = {
-                day: day,
-                progress: progress,
-                lastProcessedAction: -1
-            };
-            
-            // Re-save to ensure proper formatting
-            saveTimeState(state);
-            return state;
-        }
-        
-        // Create new state with defaults
-        const state = {
-            day: 0,  // Day number - can be any value including negative
-            progress: 0,  // Progress - can be any value from 0 to actionsPerDay-1
-            lastProcessedAction: -1
-        };
-        
-        saveTimeState(state);
-        return state;
-    }
-    
-    function saveTimeState(state) {
-        if (!state) return;
-        
-        const config = loadConfiguration();
-        if (!config) {
-            if (debug) console.log('[Time] Cannot save state without configuration');
-            return;
-        }
-        
-        const dayProgress = state.progress / config.actionsPerDay;
-        const timeInfo = calculateTimeOfDay(dayProgress, config.timePeriods, config.hoursPerDay);
-        const timeStr = progressToTime(dayProgress, config.hoursPerDay);
-        
-        // Calculate date from day number
-        const calculatedDate = calculateDate(state.day, config.startDate, config);
-        
-        // Use helper functions for season and event strings
-        const seasonStr = formatSeasonForState(state.day, config);
-        const eventStr = formatEventsForState(state.day, config);
-        
-        const entry = (
-            `# Time State` +
-            `\nProgress: ${state.progress}/[${config.actionsPerDay}]` +
-            `\nTime: [${timeStr} ${timeInfo.period}]` +
-            `\nDay: ${state.day}` +
-            `\nDate: [${calculatedDate}]` +
-            seasonStr +
-            eventStr +
-            `\n` +
-            `\nLast Processed Action: ${state.lastProcessedAction}`
-        );
-        
-        Utilities.storyCard.upsert({
-            title: STATE_CARD,
-            entry: entry
-        });
-    }
-    
-    // Time Calculations
-    function calculateTimeOfDay(dayProgress, timePeriods, hoursPerDay = 24) {
-        let currentPeriod = 'Unknown';
-        
-        for (const [key, period] of Object.entries(timePeriods)) {
-            if (period.wrapsAround) {
-                if (dayProgress >= period.start || dayProgress < period.end) {
-                    currentPeriod = period.name;
+        if (existingCard) {
+            // Update existing card
+            for (let i = 0; i < storyCards.length; i++) {
+                if (storyCards[i] && storyCards[i].title === "[AIN] Detector Configuration") {
+                    const card = storyCards[i];
+                    card.entry = helpText;
+                    card.description = configText;
+                    updateStoryCard(i, "", helpText, card.type || "system", configText);
                     break;
-                }
-            } else {
-                if (dayProgress >= period.start && dayProgress < period.end) {
-                    currentPeriod = period.name;
-                    break;
-                }
-            }
-        }
-        
-        return {
-            period: currentPeriod
-        };
-    }
-    
-    function calculateYearProgress(daysSinceStartOfYear, year, config) {
-        // Calculate total days in this year
-        let totalDaysInYear = 0;
-        for (let month = 0; month < config.months.length; month++) {
-            totalDaysInYear += getDaysInMonth(month, year, config);
-        }
-        
-        // Return progress as 0.0 to 1.0
-        // daysSinceStartOfYear is 0-based (0 = Jan 1)
-        // Last day of year will have progress very close to but not exactly 1.0
-        return daysSinceStartOfYear / totalDaysInYear;
-    }
-    
-    function calculateSeason(yearProgress, seasons) {
-        if (!seasons) return 'Unknown';
-        
-        let currentSeason = 'Unknown';
-        
-        // Find the season that contains this progress value
-        for (const [key, season] of Object.entries(seasons)) {
-            if (season.wrapsAround) {
-                // Handle wraparound (e.g., Winter: 0.95-0.2)
-                if (yearProgress >= season.start || yearProgress < season.end) {
-                    currentSeason = season.name;
-                    break;
-                }
-            } else {
-                // Handle normal ranges
-                if (yearProgress >= season.start && yearProgress < season.end) {
-                    currentSeason = season.name;
-                    break;
-                }
-                // Handle the last season that goes up to 1.0
-                if (season.end === 1.0 && yearProgress >= season.start) {
-                    currentSeason = season.name;
-                    break;
-                }
-            }
-        }
-        
-        return currentSeason;
-    }
-    
-    function getDayOfYear(totalDays, startDateStr, config) {
-        // Get the current date info
-        const dateInfo = calculateDateInfo(totalDays, startDateStr, config);
-        
-        // Calculate day of year (0-based)
-        let dayOfYear = 0;
-        
-        // Add days from all previous months in the current year
-        for (let m = 0; m < dateInfo.month; m++) {
-            dayOfYear += getDaysInMonth(m, dateInfo.year, config);
-        }
-        
-        // Add current day (convert to 0-based)
-        dayOfYear += dateInfo.day - 1;
-        
-        return { 
-            dayOfYear: dayOfYear,
-            year: dateInfo.year 
-        };
-    }
-    
-    function parseTimeToProgress(timeStr, hoursPerDay) {
-        const parts = timeStr.split(':');
-        if (parts.length !== 2) return 0;
-        
-        const hours = parseInt(parts[0]) || 0;
-        const minutes = parseInt(parts[1]) || 0;
-        
-        return (hours + minutes / 60) / hoursPerDay;
-    }
-    
-    function progressToTime(progress, hoursPerDay) {
-        // Ensure progress is within 0-1 range
-        progress = Math.max(0, Math.min(1, progress));
-        
-        const totalMinutes = Math.floor(progress * hoursPerDay * 60);
-        const hour = Math.floor(totalMinutes / 60) % hoursPerDay;
-        const minute = totalMinutes % 60;
-        
-        return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
-    }
-    
-    function isLeapYear(year, leapConfig) {
-        if (!leapConfig || !leapConfig.enabled) return false;
-        
-        const yearsSinceStart = year - leapConfig.startYear;
-        
-        // Check if it's a leap year based on frequency
-        if (yearsSinceStart % leapConfig.frequency !== 0) {
-            return false;
-        }
-        
-        // Check skip rules
-        if (leapConfig.skipFrequency > 0) {
-            if (yearsSinceStart % leapConfig.skipFrequency === 0) {
-                // It would normally be skipped, but check for exception
-                if (leapConfig.skipExceptionFrequency > 0 && 
-                    yearsSinceStart % leapConfig.skipExceptionFrequency === 0) {
-                    return true; // Exception to the skip rule
-                }
-                return false; // Skip this leap year
-            }
-        }
-        
-        return true; // It's a leap year
-    }
-    
-    function getDaysInMonth(monthIndex, year, config) {
-        // Ensure monthIndex is valid
-        if (monthIndex >= config.daysPerMonth.length) {
-            monthIndex = monthIndex % config.daysPerMonth.length;
-        }
-        
-        let days = config.daysPerMonth[monthIndex];
-        
-        // Apply leap year adjustments if applicable
-        if (config.leapYear && 
-            config.leapYear.enabled && 
-            config.leapYear.adjustments &&
-            isLeapYear(year, config.leapYear)) {
-            
-            // Check if this month has an adjustment
-            const adjustment = config.leapYear.adjustments[monthIndex];
-            if (adjustment !== undefined) {
-                days += adjustment; // Can be positive or negative
-                
-                // Ensure days never goes below 1
-                if (days < 1) {
-                    if (debug) console.log(`[Time] WARNING: Leap adjustment would make ${config.months[monthIndex]} have ${days} days. Setting to 1.`);
-                    days = 1;
-                }
-            }
-        }
-        
-        return days;
-    }
-    
-    function calculateDateInfo(totalDays, startDateStr, config) {
-        // Parse start date
-        const parts = startDateStr.split('/');
-        let currentMonth = parseInt(parts[0]) - 1; // 0-indexed
-        let currentDay = parseInt(parts[1]);
-        let currentYear = parseInt(parts[2]);
-        
-        // Handle negative days (going back in time)
-        if (totalDays < 0) {
-            let remainingDays = Math.abs(totalDays);
-            
-            while (remainingDays > 0) {
-                if (remainingDays >= currentDay) {
-                    // Need to go to previous month
-                    remainingDays -= currentDay;
-                    currentMonth--;
-                    
-                    // Handle year underflow
-                    if (currentMonth < 0) {
-                        currentMonth = config.months.length - 1;
-                        currentYear--;
-                    }
-                    
-                    // Set to last day of new month
-                    currentDay = getDaysInMonth(currentMonth, currentYear, config);
-                } else {
-                    // Stay in current month
-                    currentDay -= remainingDays;
-                    remainingDays = 0;
                 }
             }
         } else {
-            // Handle positive days (normal case)
-            let remainingDays = totalDays;
+            addStoryCard("%@%");
             
-            while (remainingDays > 0) {
-                const daysInCurrentMonth = getDaysInMonth(currentMonth, currentYear, config);
-                const daysLeftInMonth = daysInCurrentMonth - currentDay + 1;
-                
-                if (remainingDays >= daysLeftInMonth) {
-                    // Move to next month
-                    remainingDays -= daysLeftInMonth;
-                    currentDay = 1;
-                    currentMonth++;
-                    
-                    // Handle year overflow
-                    if (currentMonth >= config.months.length) {
-                        currentMonth = 0;
-                        currentYear++;
-                    }
-                } else {
-                    // Stay in current month
-                    currentDay += remainingDays;
-                    remainingDays = 0;
+            for (let i = storyCards.length - 1; i >= 0; i--) {
+                const card = storyCards[i];
+                if (card && card.title === "%@%") {
+                    card.type = "system";
+                    card.title = "[AIN] Detector Configuration";
+                    card.keys = "";
+                    card.entry = helpText;
+                    card.description = configText;
+                    return;
                 }
             }
         }
+    }
+    
+    function average(numbers) {
+        if (!numbers || numbers.length === 0) return 0;
+        return numbers.reduce((a, b) => a + b, 0) / numbers.length;
+    }
+    
+    function standardDeviation(numbers) {
+        if (numbers.length < 2) return 0;
+        const avg = average(numbers);
+        const squareDiffs = numbers.map(value => Math.pow(value - avg, 2));
+        return Math.sqrt(average(squareDiffs));
+    }
+    
+    function calculateTrend(samples) {
+        if (samples.length < 3) return { slope: 0, strength: 0 };
+        
+        const recentSamples = samples.slice(-10);
+        const n = recentSamples.length;
+        
+        let sumX = 0, sumY = 0, sumXY = 0, sumX2 = 0;
+        
+        recentSamples.forEach((sample, index) => {
+            sumX += index;
+            sumY += sample.gap;
+            sumXY += index * sample.gap;
+            sumX2 += index * index;
+        });
+        
+        const slope = (n * sumXY - sumX * sumY) / (n * sumX2 - sumX * sumX);
+        
+        // Calculate R-squared for trend strength
+        const meanY = sumY / n;
+        let ssTotal = 0, ssResidual = 0;
+        
+        recentSamples.forEach((sample, index) => {
+            const predicted = (sumY / n) + slope * (index - sumX / n);
+            ssTotal += Math.pow(sample.gap - meanY, 2);
+            ssResidual += Math.pow(sample.gap - predicted, 2);
+        });
+        
+        const rSquared = 1 - (ssResidual / ssTotal);
         
         return {
-            month: currentMonth,
-            day: currentDay,
-            year: currentYear
+            slope: slope,
+            strength: rSquared || 0
         };
     }
     
-    function calculateDate(totalDays, startDateStr, config) {
-        // Get date components
-        const dateInfo = calculateDateInfo(totalDays, startDateStr, config);
+    function detectStability(samples) {
+        if (samples.length < 8) return { isStable: false, reason: "Insufficient samples" };
         
-        // Calculate day of week
-        // First day in daysOfWeek array corresponds to start date's day of week
-        const dayOfWeekIndex = ((totalDays % config.daysOfWeek.length) + config.daysOfWeek.length) % config.daysOfWeek.length;
-        const dayOfWeek = config.daysOfWeek[dayOfWeekIndex];
+        const recentSamples = samples.slice(-8);
+        const gaps = recentSamples.map(s => s.gap);
         
-        // Get month name
-        const monthName = config.months[dateInfo.month % config.months.length];
+        const avg = average(gaps);
+        const stdDev = standardDeviation(gaps);
+        const coefficientOfVariation = stdDev / avg;
         
-        return `${dayOfWeek}, ${monthName} ${dateInfo.day}, ${dateInfo.year}`;
-    }
-    
-    // Action Processing
-    function processCurrentAction() {
-        const actionCount = getActionCount();
-        if (actionCount === null) return null;
+        const trend = calculateTrend(recentSamples);
         
-        const state = loadTimeState();
-        const config = loadConfiguration();
-        
-        if (!state || !config) {
-            if (debug) console.log('[Time] Cannot process actions without state and configuration');
-            return null;
-        }
-        
-        if (actionCount === state.lastProcessedAction) {
-            return null;
-        }
-        
-        const actionsToProcess = actionCount - state.lastProcessedAction;
-        
-        if (actionsToProcess < 0) {
-            return handleTimeReversal(actionCount, state, config);
-        }
-        
-        // Process forward
-        let newProgress = state.progress + actionsToProcess;
-        let newDay = state.day;
-        
-        // Handle day overflow
-        while (newProgress >= config.actionsPerDay) {
-            newProgress -= config.actionsPerDay;
-            newDay++;
-        }
-        
-        const newState = {
-            day: newDay,
-            progress: newProgress,
-            lastProcessedAction: actionCount
+        // Stability criteria
+        const criteria = {
+            lowVariation: coefficientOfVariation < 0.2,  // Less than 20% variation
+            smallSlope: Math.abs(trend.slope) < 600,      // Less than 600 chars/turn change
+            notStrongTrend: trend.strength < 0.8,          // Not a strong linear trend
+            consistentRange: Math.max(...gaps) - Math.min(...gaps) < avg * 0.3  // Range within 30% of average
         };
         
-        saveTimeState(newState);
+        const isStable = criteria.lowVariation && 
+                        criteria.smallSlope && 
+                        (criteria.notStrongTrend || criteria.smallSlope);
         
         return {
-            state: newState,
-            dayChanged: newDay !== state.day
+            isStable: isStable,
+            avg: avg,
+            stdDev: stdDev,
+            cv: coefficientOfVariation,
+            trend: trend,
+            criteria: criteria,
+            reason: !isStable ? 
+                !criteria.lowVariation ? "High variation in gaps" :
+                !criteria.smallSlope ? `Strong trend: ${Math.round(trend.slope)} chars/turn` :
+                !criteria.notStrongTrend ? "Pattern too linear" :
+                "Range too wide" : "Stable pattern detected"
         };
     }
     
-    function handleTimeReversal(targetAction, currentState, config) {
-        if (!config) return null;
-        
-        targetAction = Math.max(0, targetAction);
-        
-        // Calculate total days from target action
-        const totalDays = Math.floor(targetAction / config.actionsPerDay);
-        const progress = targetAction % config.actionsPerDay;
-        
-        const newState = {
-            day: totalDays,
-            progress: progress,
-            lastProcessedAction: targetAction
-        };
-        
-        saveTimeState(newState);
-        
-        return {
-            state: newState,
-            reversed: true
-        };
+    // Main Detection Logic
+    // ensure config card exists
+    const configCard = getStoryCard("[AIN] Detector Configuration");
+    const config = parseConfig(configCard ? configCard.description : null);
+    if (!configCard) {
+        if (debug || config.debugMode) console.log("AIN Detector: Creating initial config card");
+        saveConfig(config);
     }
     
-    function getActionCount() {
-        if (typeof state !== 'undefined' && state.actionCount !== undefined) {
-            return state.actionCount;
-        }
-        
-        if (typeof info !== 'undefined' && info.actionCount !== undefined) {
-            return info.actionCount;
-        }
-        
-        return null;
+    const useDebug = debug || config.debugMode;
+    
+    // Early return if disabled
+    if (!config.enabled) {
+        if (useDebug) console.log("AIN Detector: Disabled");
+        return;
     }
-    
-    // Event Dispatching
-    const eventDispatcher = {
-        events: [],
-        dispatchedDays: new Set(), // Track which days had events dispatched this turn
-        
-        dispatch(eventType, data) {
-            this.events.push({
-                type: eventType,
-                data: data
-            });
-            
-            // Track eventDay dispatches to avoid duplicates
-            if (eventType === 'eventDay' && data.state) {
-                this.dispatchedDays.add(data.state.day);
-            }
-        },
-        
-        hasDispatchedForDay(day) {
-            return this.dispatchedDays.has(day);
-        },
-        
-        getEvents() {
-            const currentEvents = [...this.events];
-            this.events = [];
-            this.dispatchedDays.clear();
-            return currentEvents;
+
+    const originalMaxChars = info.maxChars;
+
+    // Handle manual mode
+    if (!config.autoMode) {
+        info.maxChars = originalMaxChars - config.manualChars;
+        if (useDebug) {
+            console.log((
+                `AIN Detector: Manual mode\n`+
+                `  Original maxChars: ${originalMaxChars}\n`+
+                `  AIN reservation: ${config.manualChars}\n`+
+                `  Adjusted maxChars: ${info.maxChars}`
+            ));
         }
-    };
-    
-    // Command Processing
-    function parseTimeCommand(inputText) {
-        if (!inputText) return null;
-        
-        const config = loadConfiguration();
-        if (!config) {
-            if (debug) console.log('[Time] Cannot parse commands without configuration');
-            return null;
-        }
-        
-        const hoursPerDay = config.hoursPerDay;
-        
-        const lines = inputText.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            
-            if (!trimmed.startsWith('/')) continue;
-            
-            const setTimeMatch = trimmed.match(/^\/settime\s+(?:to\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i) ||
-                               trimmed.match(/^\/settime\s+(\d{1,2})(am|pm)$/i);
-            
-            if (setTimeMatch) {
-                let hour = parseInt(setTimeMatch[1]);
-                const minute = setTimeMatch[2] ? parseInt(setTimeMatch[2]) : 0;
-                const meridiem = (setTimeMatch[3] || setTimeMatch[2])?.toLowerCase();
-                
-                if (meridiem && hoursPerDay % 2 === 0) {
-                    // For even-hour days, use half-day system
-                    const halfDay = hoursPerDay / 2;
-                    if (meridiem === 'pm' && hour < halfDay) hour += halfDay;
-                    if (meridiem === 'am' && hour === halfDay) hour = 0;
-                }
-                
-                if (hour >= 0 && hour < hoursPerDay && minute >= 0 && minute < 60) {
-                    return { 
-                        type: 'setTime', 
-                        hour, 
-                        minute,
-                        originalText: trimmed
-                    };
-                }
-            }
-            
-            const skipMatch = trimmed.match(/^\/(?:skip|wait|advance)\s+(?:for\s+)?(.+)$/i);
-            
-            if (skipMatch) {
-                const timeSpec = skipMatch[1].trim();
-                const parsed = parseTimeSpecification(timeSpec, hoursPerDay);
-                
-                if (parsed && parsed.hours > 0) {
-                    return {
-                        type: 'skipTime',
-                        hours: parsed.hours,
-                        originalText: trimmed
-                    };
-                }
-            }
-            
-            const rewindMatch = trimmed.match(/^\/rewind\s+(?:for\s+)?(.+)$/i);
-            
-            if (rewindMatch) {
-                const timeSpec = rewindMatch[1].trim();
-                const parsed = parseTimeSpecification(timeSpec, hoursPerDay);
-                
-                if (parsed && parsed.hours > 0) {
-                    return {
-                        type: 'rewindTime',
-                        hours: parsed.hours,
-                        originalText: trimmed
-                    };
-                }
-            }
-            
-            if (trimmed.match(/^\/(?:current)?time$/i)) {
-                return { 
-                    type: 'queryTime',
-                    originalText: trimmed
-                };
-            }
-        }
-        
-        return null;
+        return;
     }
-    
-    function parseTimeSpecification(spec, hoursPerDay) {
-        let match;
-        
-        match = spec.match(/^(\d+(?:\.\d+)?)\s*(minutes?|mins?|hours?|hrs?|days?)$/i);
-        if (match) {
-            const amount = parseFloat(match[1]);
-            const unit = match[2].toLowerCase();
-            
-            let hours = amount;
-            
-            if (unit.startsWith('m')) {
-                hours = amount / 60;
-            } else if (unit.startsWith('d')) {
-                hours = amount * hoursPerDay;
-            }
-            
-            return { hours };
-        }
-        
-        match = spec.match(/^(\d+(?:\.\d+)?)(m|h|d)$/i);
-        if (match) {
-            const amount = parseFloat(match[1]);
-            const unit = match[2].toLowerCase();
-            
-            let hours = amount;
-            
-            if (unit === 'm') {
-                hours = amount / 60;
-            } else if (unit === 'd') {
-                hours = amount * hoursPerDay;
-            }
-            
-            return { hours };
-        }
-        
-        match = spec.match(/^(\d+)h(\d+)m$/i);
-        if (match) {
-            const h = parseInt(match[1]);
-            const m = parseInt(match[2]);
-            const hours = h + (m / 60);
-            
-            return { hours };
-        }
-        
-        return null;
-    }
-    
-    function processTimeCommand(command) {
-        if (!command) return;
-        
-        const state = loadTimeState();
-        const config = loadConfiguration();
-        
-        if (!state || !config) {
-            if (debug) console.log('[Time] Cannot process commands without state and configuration');
-            return;
-        }
-        
-        switch (command.type) {
-            case 'setTime':
-                // Calculate progress from new time
-                const targetProgress = parseTimeToProgress(
-                    `${String(command.hour).padStart(2, '0')}:${String(command.minute).padStart(2, '0')}`,
-                    config.hoursPerDay
-                );
-                const newProgress = Math.floor(targetProgress * config.actionsPerDay);
-                
-                // Set time on current day (allows rewinding within the day)
-                const newState = {
-                    day: state.day,
-                    progress: newProgress,
-                    lastProcessedAction: state.lastProcessedAction
-                };
-                
-                saveTimeState(newState);
-                if (debug) console.log(`[Time] Set time to ${String(command.hour).padStart(2, '0')}:${String(command.minute).padStart(2, '0')}, Day ${state.day}`);
-                break;
-                
-            case 'skipTime':
-                // Add time to current
-                const hoursToAdd = command.hours;
-                const progressToAdd = hoursToAdd / config.hoursPerDay;
-                const actionsToAdd = Math.round(progressToAdd * config.actionsPerDay);
-                
-                let skipProgress = state.progress + actionsToAdd;
-                let skipDay = state.day;
-                
-                // Handle day overflow
-                while (skipProgress >= config.actionsPerDay) {
-                    skipProgress -= config.actionsPerDay;
-                    skipDay++;
-                }
-                
-                const skipState = {
-                    day: skipDay,
-                    progress: skipProgress,
-                    lastProcessedAction: state.lastProcessedAction
-                };
-                
-                saveTimeState(skipState);
-                
-                // Check if we changed seasons and get event info
-                const seasonChangeInfo = getSeasonChangeInfo(state.day, skipDay, config);
-                const eventInfoSkip = skipDay !== state.day ? getCurrentEventInfo(skipDay, config) : '';
-                
-                if (debug) console.log(`[Time] Skipped ${command.hours} hours to Day ${skipDay}${seasonChangeInfo}${eventInfoSkip}`);
-                break;
-                
-            case 'rewindTime':
-                // Subtract time from current
-                const hoursToSubtract = command.hours;
-                const progressToSubtract = hoursToSubtract / config.hoursPerDay;
-                const actionsToSubtract = Math.round(progressToSubtract * config.actionsPerDay);
-                
-                let rewindProgress = state.progress - actionsToSubtract;
-                let rewindDay = state.day;
-                
-                // Handle day underflow
-                while (rewindProgress < 0) {
-                    rewindProgress += config.actionsPerDay;
-                    rewindDay--;
-                }
-                
-                const rewindState = {
-                    day: rewindDay,
-                    progress: rewindProgress,
-                    lastProcessedAction: state.lastProcessedAction
-                };
-                
-                saveTimeState(rewindState);
-                
-                // Check if we changed seasons and get event info
-                const rewindSeasonInfo = getSeasonChangeInfo(state.day, rewindDay, config);
-                const rewindEventInfo = rewindDay !== state.day ? getCurrentEventInfo(rewindDay, config) : '';
-                
-                if (debug) console.log(`[Time] Rewound ${command.hours} hours to Day ${rewindDay}${rewindSeasonInfo}${rewindEventInfo}`);
-                break;
-                
-            case 'queryTime':
-                // Calculate current time from progress
-                const dayProgress = state.progress / config.actionsPerDay;
-                const currentTime = progressToTime(dayProgress, config.hoursPerDay);
-                const currentDate = calculateDate(state.day, config.startDate, config);
-                
-                // Get season and event info
-                const seasonInfo = getCurrentSeasonInfo(state.day, config);
-                const eventInfoQuery = getCurrentEventInfo(state.day, config);
-                
-                if (debug) console.log(`[Time] Current: ${currentTime}, ${currentDate}${seasonInfo}, Day ${state.day}${eventInfoQuery}`);
-                break;
-        }
-    }
-    
-    // INPUT HOOK: Only remove commands from text
-    if (hook === 'input') {
-        const command = parseTimeCommand(text);
-        
-        if (command) {
-            processTimeCommand(command);
-            return '\u200B';
-        }
-        
-        return text;
-    }
-    
-    // CONTEXT HOOK: Process time progression
-    if (hook === 'context') {
-        const config = loadConfiguration();
-        if (!config) {
-            if (debug) console.log('[Time] Time system requires configuration to function');
-            return;
-        }
-        
-        // Get previous time of day before processing
-        const previousState = loadTimeState();
-        const prevDayProgress = previousState ? previousState.progress / config.actionsPerDay : 0;
-        const prevTimeOfDay = calculateTimeOfDay(prevDayProgress, config.timePeriods, config.hoursPerDay).period;
-        
-        const actionResult = processCurrentAction();
-        
-        // Dispatch events
-        if (actionResult) {
-            if (actionResult.reversed) {
-                eventDispatcher.dispatch('timeReversed', actionResult);
-            } else {
-                // Check for time of day change (can happen without day change)
-                const currDayProgress = actionResult.state.progress / config.actionsPerDay;
-                const currTimeOfDay = calculateTimeOfDay(currDayProgress, config.timePeriods, config.hoursPerDay).period;
-                
-                if (prevTimeOfDay !== currTimeOfDay && prevTimeOfDay !== 'Unknown' && currTimeOfDay !== 'Unknown') {
-                    eventDispatcher.dispatch('timeOfDayChanged', {
-                        previousPeriod: prevTimeOfDay,
-                        currentPeriod: currTimeOfDay,
-                        state: actionResult.state
-                    });
-                }
-                
-                if (actionResult.dayChanged) {
-                    eventDispatcher.dispatch('dayChanged', {
-                        previousDay: previousState.day,
-                        currentDay: actionResult.state.day,
-                        state: actionResult.state
-                    });
-                    
-                    // Check for season change on day change
-                    if (config.seasons) {
-                        const state = actionResult.state;
-                        const prevYearInfo = getDayOfYear(state.day - 1, config.startDate, config);
-                        const currYearInfo = getDayOfYear(state.day, config.startDate, config);
-                        
-                        const prevYearProgress = calculateYearProgress(prevYearInfo.dayOfYear, prevYearInfo.year, config);
-                        const currYearProgress = calculateYearProgress(currYearInfo.dayOfYear, currYearInfo.year, config);
-                        
-                        const prevSeason = calculateSeason(prevYearProgress, config.seasons);
-                        const currSeason = calculateSeason(currYearProgress, config.seasons);
-                        
-                        if (prevSeason !== currSeason) {
-                            eventDispatcher.dispatch('seasonChanged', {
-                                previousSeason: prevSeason,
-                                currentSeason: currSeason,
-                                state: actionResult.state
-                            });
-                        }
-                    }
-                }
-            }
-        }
-        
-        // Always check for events on current day (catches manual edits and time skips)
-        const currentState = loadTimeState();
-        if (currentState && !eventDispatcher.hasDispatchedForDay(currentState.day)) {
-            const eventsList = loadEventDays();
-            if (eventsList.length > 0) {
-                const dateInfo = calculateDateInfo(currentState.day, config.startDate, config);
-                const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-                
-                if (todayEvents.length > 0) {
-                    eventDispatcher.dispatch('eventDay', {
-                        events: todayEvents,
-                        date: calculateDate(currentState.day, config.startDate, config),
-                        state: currentState
-                    });
-                }
-            }
-        }
-        
-        // Store API methods
-        Calendar.events = eventDispatcher.getEvents();
-        
-        // Time Methods
-        Calendar.getCurrentTime = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dayProgress = state.progress / config.actionsPerDay;
-            return progressToTime(dayProgress, config.hoursPerDay);
-        };
-        
-        Calendar.getFormattedTime = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            
-            const dayProgress = state.progress / config.actionsPerDay;
-            const timeStr = progressToTime(dayProgress, config.hoursPerDay);
-            
-            if (config.hoursPerDay % 2 !== 0) {
-                return timeStr;
-            }
-            
-            // Add AM/PM for even-hour days
-            const [hourStr, minuteStr] = timeStr.split(':');
-            let hour = parseInt(hourStr);
-            const halfDay = config.hoursPerDay / 2;
-            
-            const isPM = hour >= halfDay;
-            if (isPM && hour > halfDay) hour -= halfDay;
-            if (hour === 0) hour = halfDay;
-            
-            return `${hour}:${minuteStr} ${isPM ? 'PM' : 'AM'}`;
-        };
-        
-        Calendar.getTimeOfDay = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dayProgress = state.progress / config.actionsPerDay;
-            const timeInfo = calculateTimeOfDay(dayProgress, config.timePeriods, config.hoursPerDay);
-            return timeInfo.period;
-        };
-        
-        Calendar.getDayProgress = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            return state.progress / config.actionsPerDay;
-        };
-        
-        // Date-based methods
-        Calendar.getCurrentDate = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            return calculateDate(state.day, config.startDate, config);
-        };
-        
-        Calendar.getDayOfWeek = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dayOfWeekIndex = ((state.day % config.daysOfWeek.length) + config.daysOfWeek.length) % config.daysOfWeek.length;
-            return config.daysOfWeek[dayOfWeekIndex];
-        };
-        
-        Calendar.getDayOfMonth = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
-            return dateInfo.day;
-        };
-        
-        Calendar.getMonth = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
-            return config.months[dateInfo.month];
-        };
-        
-        Calendar.getYear = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
-            return dateInfo.year;
-        };
-        
-        Calendar.getDayNumber = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            return state.day;
-        };
-        
-        // Season-based methods
-        Calendar.getCurrentSeason = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config || !config.seasons) return null;
-            
-            const yearInfo = getDayOfYear(state.day, config.startDate, config);
-            const yearProgress = calculateYearProgress(yearInfo.dayOfYear, yearInfo.year, config);
-            return calculateSeason(yearProgress, config.seasons);
-        };
-        
-        Calendar.getYearProgress = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            
-            const yearInfo = getDayOfYear(state.day, config.startDate, config);
-            return calculateYearProgress(yearInfo.dayOfYear, yearInfo.year, config);
-        };
-        
-        Calendar.getDayOfYear = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            
-            const yearInfo = getDayOfYear(state.day, config.startDate, config);
-            return yearInfo.dayOfYear + 1; // Convert from 0-based to 1-based for user
-        };
-        
-        // Event methods
-        Calendar.getTodayEvents = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return [];
-            
-            const eventsList = loadEventDays();
-            if (eventsList.length === 0) return [];
-            
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
-            return checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-        };
-        
-        Calendar.getUpcomingEvents = (daysAhead = 30) => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return [];
-            
-            const eventsList = loadEventDays();
-            if (eventsList.length === 0) return [];
-            
-            const upcoming = [];
-            
-            for (let i = 1; i <= daysAhead; i++) {
-                const futureDay = state.day + i;
-                const dateInfo = calculateDateInfo(futureDay, config.startDate, config);
-                
-                // Check all events for this date, including relative date events
-                const dayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-                
-                if (dayEvents.length > 0) {
-                    upcoming.push({
-                        daysUntil: i,
-                        date: calculateDate(futureDay, config.startDate, config),
-                        events: dayEvents
-                    });
-                }
-            }
-            
-            return upcoming;
-        };
-        
-        Calendar.getAllEvents = () => {
-            return loadEventDays();
-        };
-        
-        Calendar.isEventDay = () => {
-            return Calendar.getTodayEvents().length > 0;
-        };
-        
-        Calendar.getMonthWeekdays = (monthOffset = 0) => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            
-            // Get target month/year
-            const currentDate = calculateDateInfo(state.day, config.startDate, config);
-            let targetMonth = currentDate.month + monthOffset;
-            let targetYear = currentDate.year;
-            
-            // Handle month overflow/underflow
-            while (targetMonth >= config.months.length) {
-                targetMonth -= config.months.length;
-                targetYear++;
-            }
-            while (targetMonth < 0) {
-                targetMonth += config.months.length;
-                targetYear--;
-            }
-            
-            const monthName = config.months[targetMonth];
-            const daysInMonth = getDaysInMonth(targetMonth, targetYear, config);
-            const weekdayMap = {};
-            
-            // Initialize arrays for each weekday
-            config.daysOfWeek.forEach(day => {
-                weekdayMap[day] = [];
-            });
-            
-            // Map each day to its weekday
-            for (let day = 1; day <= daysInMonth; day++) {
-                const weekdayIndex = getDayOfWeekForDate(targetMonth, day, targetYear, config);
-                const weekdayName = config.daysOfWeek[weekdayIndex];
-                weekdayMap[weekdayName].push(day);
-            }
-            
-            return {
-                month: monthName,
-                year: targetYear,
-                weekdays: weekdayMap
-            };
-        };
-        
-        Calendar.clearEventCache = () => {
-            eventCache = null;
-            return true;
-        };
-        
-        // Core methods
-        Calendar.getState = () => loadTimeState();
-        Calendar.getConfig = () => loadConfiguration();
-        
-        // Time manipulation methods
-        Calendar.advanceTime = (timeSpec) => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config || typeof timeSpec !== 'string') return false;
-            
-            // Parse time specification like "3d", "-2h30m", "1d, 4h, 30m"
-            let totalHours = 0;
-            
-            // Split by commas for multiple parts
-            const parts = timeSpec.split(',').map(p => p.trim());
-            
-            for (const part of parts) {
-                // First try combined format like "2h30m" or "-2h30m"
-                const combinedMatch = part.match(/^(-?\d+)h(\d+)m$/i);
-                if (combinedMatch) {
-                    const hours = parseInt(combinedMatch[1]);
-                    const minutes = parseInt(combinedMatch[2]);
-                    // For negative hours, minutes should also subtract
-                    totalHours += hours + (hours < 0 ? -minutes/60 : minutes/60);
-                    continue;
-                }
-                
-                // Then try single unit format like "3d", "-2.5h", "30m"
-                const singleMatch = part.match(/^(-?\d+(?:\.\d+)?)\s*([dhm])$/i);
-                if (!singleMatch) return false;
-                
-                const amount = parseFloat(singleMatch[1]);
-                const unit = singleMatch[2].toLowerCase();
-                
-                switch (unit) {
-                    case 'd':
-                        totalHours += amount * config.hoursPerDay;
-                        break;
-                    case 'h':
-                        totalHours += amount;
-                        break;
-                    case 'm':
-                        totalHours += amount / 60;
-                        break;
-                }
-            }
-            
-            if (totalHours === 0) return false;
-            
-            const progressToAdd = totalHours / config.hoursPerDay;
-            const actionsToAdd = Math.round(progressToAdd * config.actionsPerDay);
-            
-            let newProgress = state.progress + actionsToAdd;
-            let newDay = state.day;
-            
-            // Handle day overflow/underflow
-            while (newProgress >= config.actionsPerDay) {
-                newProgress -= config.actionsPerDay;
-                newDay++;
-            }
-            while (newProgress < 0) {
-                newProgress += config.actionsPerDay;
-                newDay--;
-            }
-            
-            const newState = {
-                day: newDay,
-                progress: newProgress,
-                lastProcessedAction: state.lastProcessedAction
-            };
-            
-            saveTimeState(newState);
-            return true;
-        };
-        
-        Calendar.setTime = (hour, minute = 0) => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return false;
-            
-            // Validate input
-            if (typeof hour !== 'number' || hour < 0 || hour >= config.hoursPerDay) return false;
-            if (typeof minute !== 'number' || minute < 0 || minute >= 60) return false;
-            
-            const targetProgress = parseTimeToProgress(
-                `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`,
-                config.hoursPerDay
-            );
-            const newProgress = Math.floor(targetProgress * config.actionsPerDay);
-            
-            const newState = {
-                day: state.day,
-                progress: newProgress,
-                lastProcessedAction: state.lastProcessedAction
-            };
-            
-            saveTimeState(newState);
-            return true;
-        };
-        
-        Calendar.setActionsPerDay = (newActionsPerDay) => {
-            const config = loadConfiguration();
-            const state = loadTimeState();
-            if (!config || !state) return false;
-            
-            // Validate input
-            if (typeof newActionsPerDay !== 'number' || newActionsPerDay < 1) return false;
-            
-            // Calculate current time progress
-            const currentProgress = state.progress / config.actionsPerDay;
-            
-            // Update configuration
-            const configCard = Utilities.storyCard.get(CONFIG_CARD);
-            if (!configCard) return false;
-            
-            let configText = configCard.entry || '';
-            configText = configText.replace(
-                /Actions Per Day:\s*\d+/,
-                `Actions Per Day: ${Math.floor(newActionsPerDay)}`
-            );
-            
-            Utilities.storyCard.update(CONFIG_CARD, { entry: configText });
-            
-            // Adjust current progress to maintain same time
-            const newProgress = Math.floor(currentProgress * newActionsPerDay);
-            
-            const newState = {
-                day: state.day,
-                progress: newProgress,
-                lastProcessedAction: state.lastProcessedAction
-            };
-            
-            saveTimeState(newState);
-            return true;
-        };
-        
-        Calendar.setHoursPerDay = (newHoursPerDay) => {
-            const config = loadConfiguration();
-            const state = loadTimeState();
-            if (!config || !state) return false;
-            
-            // Validate input
-            if (typeof newHoursPerDay !== 'number' || newHoursPerDay < 1) return false;
-            
-            // Calculate current progress through the day (0.0 to 1.0)
-            const dayProgress = state.progress / config.actionsPerDay;
-            
-            // Update configuration
-            const configCard = Utilities.storyCard.get(CONFIG_CARD);
-            if (!configCard) return false;
-            
-            let configText = configCard.entry || '';
-            configText = configText.replace(
-                /Hours Per Day:\s*\d+/,
-                `Hours Per Day: ${Math.floor(newHoursPerDay)}`
-            );
-            
-            Utilities.storyCard.update(CONFIG_CARD, { entry: configText });
-            
-            // Maintain same progress through the day
-            // No need to adjust progress since it's already percentage-based
-            // The time display will automatically adjust based on new hours per day
-            
-            saveTimeState(state);
-            return true;
-        };
-        
-        Calendar.setDay = (newDay) => {
-            const state = loadTimeState();
-            if (!state) return false;
-            
-            // Validate input
-            if (typeof newDay !== 'number') return false;
-            
-            const newState = {
-                day: Math.floor(newDay),
-                progress: state.progress,
-                lastProcessedAction: state.lastProcessedAction
-            };
-            
-            saveTimeState(newState);
-            return true;
-        };
-        
-        // Context hook doesn't need to return anything
+
+    // Early return if context be tiny
+    if (text.length < info.maxChars * 0.5) {
+        if (useDebug) console.log("AIN Detector: Context too small for detection");
         return;
     }
     
-    // Default return for other hooks
-    return text;
+    // Mind the gap
+    const currentLength = text.length;
+    const observedGap = originalMaxChars - currentLength;
+    const actionCount = info.actionCount;
+    
+    if (typeof observedGap !== 'number' || isNaN(observedGap)) {
+        if (useDebug) console.log("AIN Detector: Invalid gap calculation");
+        // If we had a stable estimate, keep using it
+        if (config.hasStableEstimate && config.estimate > 0) {
+            info.maxChars = originalMaxChars - config.estimate;
+        }
+        return;
+    }
+    
+    if (useDebug) {
+        console.log((
+            `AIN Detector: Turn ${actionCount}\n`+
+            `  Context: ${currentLength}/${originalMaxChars} chars\n`+
+            `  Observed gap: ${observedGap} chars${observedGap < 0 ? ' (OVERFLOW!)' : ''}`
+        ));
+    }
+    
+    // Sampling
+    let samples = config.samples || [];
+    
+    samples = samples.filter(s => typeof s.gap === 'number' && !isNaN(s.gap));
+    samples = samples.filter(s => s.action !== actionCount);
+    samples.push({ action: actionCount, gap: observedGap });
+    samples.sort((a, b) => a.action - b.action);
+    
+    if (samples.length > config.maxSamples) {
+        samples = samples.slice(-config.maxSamples);
+    }
+    
+    config.samples = samples;
+    
+    if (useDebug) {
+        console.log((
+            `AIN Detector: Added sample ${samples.length}/${config.maxSamples}\n`+
+            `  Gap: ${observedGap} chars`
+        ));
+    }
+
+    if (samples.length >= 10) {
+        const recentAvg = average(samples.slice(-5).map(s => s.gap));
+        const olderAvg = average(samples.slice(-10, -5).map(s => s.gap));
+        
+        if (Math.abs(recentAvg - olderAvg) > 1600) {
+            if (useDebug) {
+                console.log((
+                    `AIN Detector: Sudden change detected!\n`+
+                    `  Recent avg: ${Math.round(recentAvg)}\n`+
+                    `  Older avg: ${Math.round(olderAvg)}\n`+
+                    `  Keeping only recent samples`
+                ));
+            }
+            samples = samples.slice(-8);
+            config.samples = samples;
+            config.hasStableEstimate = false;
+            config.estimate = 0;
+        }
+    }
+
+    const stability = detectStability(samples);
+    
+    if (useDebug) {
+        console.log((
+            `AIN Detector: Stability Analysis\n`+
+            `  Status: ${stability.reason}\n`+
+            `  Average gap: ${Math.round(stability.avg || 0)}\n`+
+            `  Std deviation: ${Math.round(stability.stdDev || 0)}\n`+
+            `  CV: ${((stability.cv || 0) * 100).toFixed(1)}%\n`+
+            `  Trend slope: ${Math.round(stability.trend?.slope || 0)} chars/turn`
+        ));
+    }
+    
+    if (stability.isStable) {
+        const newEstimate = Math.round(stability.avg + config.safetyBuffer);
+        
+        if (!config.hasStableEstimate || Math.abs(newEstimate - config.estimate) > 100) {
+            config.estimate = newEstimate;
+            config.hasStableEstimate = true;
+            
+            if (useDebug) {
+                console.log((
+                    `AIN Detector: Stable boundary detected!\n`+
+                    `  Average gap: ${Math.round(stability.avg)}\n`+
+                    `  Estimate: ${config.estimate} (includes ${config.safetyBuffer} buffer)`
+                ));
+            }
+        }
+    }
+    // update SC
+    saveConfig(config);
+    
+    // Apply if stable
+    if (config.hasStableEstimate && config.estimate > 0) {
+        info.maxChars = originalMaxChars - config.estimate;
+        
+        if (useDebug) {
+            console.log((
+                `AIN Detector: Applied stable estimate\n`+
+                `  Original maxChars: ${originalMaxChars}\n`+
+                `  AIN estimate: ${config.estimate}\n`+
+                `  Adjusted maxChars: ${info.maxChars}`
+            ));
+        }
+    } else {
+        // No stable estimate yet - don't modify maxChars
+        if (useDebug) {
+            console.log((
+                `AIN Detector: No stable estimate yet\n`+
+                `  Using original maxChars: ${originalMaxChars}`
+            ));
+        }
+    }
+}
+
+function ASCQ(text) {
+    const debug = false;
+
+    if (!info || !info.maxChars) {
+        if (debug) console.log("ASCQ: ERROR - info.maxChars is missing!");
+        return text;
+    }
+    
+    const maxChars = info.maxChars;
+
+    // Configuration Management
+    function parseConfigDescription(description) {
+        const config = {
+            nonStoryAllocation: 0.6,     // 60% for all non-story content
+            debugLogging: false,
+            clearDebugCards: false,
+        };
+        
+        if (!description) return config;
+        
+        const parsed = Utilities.plainText.parseKeyValues(description, true);
+        
+        // Map parsed values to config
+        if (parsed.non_story_allocation !== undefined) {
+            let value = parsed.non_story_allocation;
+            
+            // Handle "60%" format
+            if (typeof value === 'string' && value.includes('%')) {
+                value = parseFloat(value.replace('%', ''));
+            } else {
+                value = parseFloat(value);
+            }
+            
+            if (!isNaN(value)) {
+                // If value is > 1, it's a percentage (60), convert to decimal (0.6)
+                config.nonStoryAllocation = value > 1 ? value / 100 : value;
+            }
+        }
+        
+        config.debugLogging = Utilities.string.parseBoolean(parsed.debug_logging || 'false');
+        config.clearDebugCards = Utilities.string.parseBoolean(parsed.clear_debug_cards || 'false');
+        
+        return config;
+    }
+    
+    function loadConfig() {
+        const systemCard = Utilities.storyCard.get("[ASCQ] Help & Configuration");
+        return systemCard ? parseConfigDescription(systemCard.description) : parseConfigDescription(null);
+    }
+    
+    function saveConfig(config) {
+        const helpEntry = (
+            `# ASCQ - Advanced Story Card Query System\n`+
+            `## Overview\n`+
+            `ASCQ triggers story cards based on query expressions.\n`+
+            `Prefix triggers with $Q: to create a query trigger.\n`+
+            `Can place complex triggers in description if encapsulated like {$Q: Expression}\n` +
+            `\n`+
+            `### Text Pattern Functions\n`+
+            `near("word1", "word2", distance) - Words within N characters\n`+
+            `Example: $Q:near("sword", "broken", 50)\n`+
+            `\n`+
+            `sequence("word1", "word2", ...) or seq(...) - Words in order\n`+
+            `Example: $Q:seq("opened", "gate")\n`+
+            `\n`+
+            `count("word") >= number - Word frequency\n`+
+            `Example: $Q:count("Beetlejuice") >= 3\n`+
+            `\n`+
+            `### Fuzzy Matching\n`+
+            `fuzzy("word") - Fuzzy match any word in text\n`+
+            `fuzzy("word", 0.7) - With custom threshold\n`+
+            `fuzzyFind("word") - Find best matching word\n`+
+            `fuzzyAny(["word1", "word2"]) - Match any word\n`+
+            `// Use this sparingly \n\n`+
+            `### State/Info Access\n`+
+            `Access state, info, and other scripting properties:\n`+
+            `info.actionCount - Turn counter\n`+
+            `state.propertyName - State properties\n`+
+            `state.array.includes("value") - Array methods\n`+
+            `\n`+
+            `Examples:\n`+
+            `$Q:info.actionCount > 50\n`+
+            `$Q:state.level >= 10 && state.class == "warrior"\n`+
+            `$Q:state.inventory.includes("sword")\n`+
+            `$Q:!state.questCompleted.includes("tutorial")\n`+
+            `$Q:Calendar.getDayOfWeek() === "Sunday"\n` +
+            `\n`+
+            `### Boolean Functions\n`+
+            `any("word1", "word2") - At least one word present\n`+
+            `all("word1", "word2") - All words present\n`+
+            `none("word1", "word2") - No words present\n`+
+            `\n`+
+            `### Boolean Operators\n`+
+            `&& or AND - Both conditions true\n`+
+            `|| or OR - Either condition true\n`+
+            `! or NOT - Negates condition\n`+
+            `( ) - Groups expressions\n`+
+            `\n`+
+            `### RegEx Support\n`+
+            `~pattern~flags - Regular expression matching\n`+
+            `Example: $Q:~(crystal|gem|jewel)\\s+(glows?|shines?|pulses?)~i\n`+
+            `\n`+
+            `### Complex Examples\n`+
+            `$Q:(info.actionCount > 100) && near("dragon", "slain", 50)\n`+
+            `$Q:state.hp < 20 || state.status.includes("poisoned")\n`+
+            `$Q:all("quest", "complete") && state.level >= 5\n`+
+            `$Q:(info.actionCount > 50) && near("portal", "opened", 75) && state.keyFragments >= 3\n`+
+            `\n`+
+            `## Priority System\n`+
+            `Add $priority: N to card description (default: 0).\n`+
+            `Higher values trigger first when space is limited.\n`+
+            `\n`+
+            `## Configuration\n`+
+            `Settings stored in this card's description field:\n`+
+            `Non-Story Allocation: % of context for all non-story content (default: 60%)`
+        );
+        
+        const configText = Utilities.format.formatList([
+            `Non-Story Allocation: ${Math.round((config.nonStoryAllocation || 0.6) * 100)}%`,
+            `Debug Logging: ${config.debugLogging}`,
+            `Clear Debug Cards: ${config.clearDebugCards}`
+        ], '');
+        
+        Utilities.storyCard.upsert({
+            title: "[ASCQ] Help & Configuration",
+            entry: helpEntry,
+            type: "ASCQ",
+            keys: "",
+            description: configText
+        });
+    }
+    
+    const config = loadConfig();
+    
+    // Diagnostic logging
+    if (debug) {
+        console.log((
+            `ASCQ: Configuration loaded:\n`+
+            `  debugLogging: ${config.debugLogging}\n`+
+            `  clearDebugCards: ${config.clearDebugCards}\n`+
+            `  nonStoryAllocation: ${config.nonStoryAllocation}\n`+
+            `  Local debug flag: ${debug}`
+        ));
+        
+        // Also check if the config card exists
+        const configCard = Utilities.storyCard.get("[ASCQ] Help & Configuration");
+        if (configCard) {
+            console.log(`ASCQ: Config card description: "${configCard.description}"`);
+        } else {
+            console.log(`ASCQ: Config card not found!`);
+        }
+    }
+
+    // Clear debug cards if requested
+    if (config.clearDebugCards) {
+        const removed = Utilities.storyCard.remove(
+            card => card.title && card.title.startsWith("[DEBUG] ASCQ"), 
+            true
+        );
+        
+        config.clearDebugCards = false;
+        saveConfig(config);
+        
+        if (config.debugLogging) {
+            console.log(`ASCQ: Cleared ${removed} debug cards`);
+        }
+    }
+    
+    ensureSystemCards();
+    
+    function calculateASCQAllocation(context = text) {
+        const plotEssentials = Utilities.context.extractPlotEssentials(context);
+        const worldLore = Utilities.context.extractWorldLore(context);
+        
+        const nonStoryAllocation = Math.floor(maxChars * (config.nonStoryAllocation || 0.6));
+        
+        const nonStoryUsed = plotEssentials.length + worldLore.length;
+        
+        const ascqAllocation = Math.max(0, nonStoryAllocation - nonStoryUsed);
+        
+        if (config.debugLogging || debug) {
+            console.log((
+                `ASCQ: Allocation calculation:\n`+
+                `  Total context: ${maxChars}\n`+
+                `  Non-story allocation: ${nonStoryAllocation} (${Math.round(config.nonStoryAllocation * 100)}%)\n`+
+                `  Plot essentials: ${plotEssentials.length}\n`+
+                `  World lore: ${worldLore.length}\n`+
+                `  ASCQ Available: ${ascqAllocation}`
+            ));
+        }
+        
+        return ascqAllocation;
+    }
+    
+    function saveDebugInfo(triggeredCards, finalContext, spaceUsed, allocation) {
+        if (!config.debugLogging) return;
+        
+        const actionCount = (info && info.actionCount) || 0;
+        const debugTitle = `[DEBUG] ASCQ Turn ${actionCount}`;
+        
+        let debugEntry = `# ASCQ Debug - Turn ${actionCount}\n\n`;
+        
+        debugEntry += `## Triggered Cards (${triggeredCards.length} total)\n`;
+        if (triggeredCards.length > 0) {
+            triggeredCards.forEach((data, index) => {
+                debugEntry += `${index + 1}. ${data.card.title}\n`;
+                debugEntry += `   Query: ${data.query}\n`;
+                debugEntry += `   Priority: ${data.priority}\n`;
+            });
+        } else {
+            debugEntry += "No cards triggered this turn.\n";
+        }
+        
+        debugEntry += `\n## Space Usage\n`;
+        debugEntry += `ASCQ Used: ${spaceUsed} / ${allocation} chars `;
+        debugEntry += `(${Math.round((spaceUsed / allocation) * 100)}%)\n`;
+        
+        const actualGap = maxChars - finalContext.length;
+        
+        debugEntry += `\n## Context Distribution\n`;
+        debugEntry += `Total Context Limit: ${maxChars} chars\n`;
+        debugEntry += `Visible Context: ${finalContext.length} chars\n`;
+        debugEntry += `Actual Gap: ${actualGap} chars`;
+        
+        Utilities.storyCard.upsert({
+            title: debugTitle,
+            entry: debugEntry,
+            type: "ASCQ",
+            keys: "",
+            description: finalContext.replace(/\{title:[^}]+\}/g, '%ACtitleDebugOnly%')
+        });
+    }
+    
+    function processQueryCards() {
+        const recentStory = Utilities.context.extractRecentStory(text, true);
+        const triggeredCards = [];
+        
+        // Find all cards that have $Q: in either keys or description
+        const queryCards = Utilities.storyCard.find(
+            card => (card.keys && card.keys.startsWith('$Q:')) || 
+                    (card.description && card.description.includes('$Q:')) ||
+                    (card.description && card.description.includes('{$Q:')),
+            true
+        );
+        
+        // Process each query card
+        for (const card of queryCards) {
+            let query = null;
+            
+            // Check keys first (primary location)
+            if (card.keys && card.keys.startsWith('$Q:')) {
+                query = card.keys.substring(3).trim();
+            } 
+            // Otherwise check description
+            else if (card.description) {
+                // First try the new delimited format {$Q: expression}
+                const delimitedMatch = card.description.match(/\{\$Q:\s*([^}]+)\}/);
+                if (delimitedMatch) {
+                    query = delimitedMatch[1].trim();
+                } else {
+                    // Fall back to old format for backwards compatibility
+                    const match = card.description.match(/\$Q:\s*([^\n]+)/);
+                    if (match) {
+                        query = match[1].trim();
+                    }
+                }
+            }
+            
+            if (!query) continue;
+            
+            // Check if query is cached
+            let evaluator = Utilities.cache.get('ascq_queries', query);
+            if (!evaluator) {
+                // Parse and cache the query
+                evaluator = Utilities.expression.parse(query);
+                if (evaluator) {
+                    Utilities.cache.set('ascq_queries', query, evaluator);
+                }
+            }
+            
+            if (evaluator && evaluator(recentStory)) {
+                let priority = 0;
+                if (card.description) {
+                    const priorityMatch = card.description.match(/\$priority:\s*(-?\d+)/i);
+                    if (priorityMatch) {
+                        priority = parseInt(priorityMatch[1]);
+                    }
+                }
+                
+                triggeredCards.push({
+                    card: card,
+                    query: query,
+                    priority: priority
+                });
+            }
+        }
+        
+        // Calculate allocation for debug purposes
+        const ascqAllocation = calculateASCQAllocation();
+        
+        // Handle no triggered cards - but save debug info FIRST
+        if (triggeredCards.length === 0) {
+            if (config.debugLogging || debug) {
+                saveDebugInfo([], text, 0, ascqAllocation);
+                console.log("ASCQ: No cards triggered, returning original text");
+            }
+            return text;
+        }
+        
+        // Sort by priority
+        triggeredCards.sort((a, b) => b.priority - a.priority);
+        
+        // Insert cards
+        const result = insertCardsWithSmartTruncation(text, triggeredCards, ascqAllocation);
+        
+        if (config.debugLogging || debug) {
+            const spaceUsed = Math.max(0, result.length - text.length);
+            saveDebugInfo(triggeredCards, result, spaceUsed, ascqAllocation);
+        }
+        
+        return result;
+    }
+    
+    function insertCardsWithSmartTruncation(context, cardData, ascqAllocation) {
+        if (!cardData || cardData.length === 0 || ascqAllocation <= 0) {
+            return context;
+        }
+        
+        let workingContext = context;
+        let insertText = "";
+        let spaceUsed = 0;
+        
+        const storyAllocation = Math.floor(maxChars * (1 - (config.nonStoryAllocation || 0.6)));
+        
+        for (let i = 0; i < cardData.length; i++) {
+            const separator = i > 0 ? "\n\n" : "";
+            const cardText = separator + cardData[i].card.entry;
+            const cardSize = cardText.length;
+            
+            if (spaceUsed + cardSize > ascqAllocation) {
+                if (config.debugLogging || debug) {
+                    console.log(`ASCQ: Card ${i + 1} would exceed allocation. Checking story truncation...`);
+                }
+                
+                // Get current story length directly
+                const recentStory = Utilities.context.extractRecentStory(workingContext, false);
+                const storyOverage = Math.max(0, recentStory.length - storyAllocation);
+                
+                if (storyOverage > 0) {
+                    const spaceNeeded = (spaceUsed + cardSize) - ascqAllocation;
+                    const canTruncate = Math.min(storyOverage, spaceNeeded);
+                    
+                    if (canTruncate > 0) {
+                        workingContext = truncateRecentStory(workingContext, canTruncate);
+                        
+                        // Recalculate allocation with new context
+                        const newAllocation = calculateASCQAllocation(workingContext);
+                        if (spaceUsed + cardSize <= newAllocation) {
+                            insertText += cardText;
+                            spaceUsed += cardSize;
+                            continue;
+                        }
+                    }
+                }
+                
+                if (config.debugLogging || debug) {
+                    console.log(`ASCQ: Cannot fit card ${i + 1} without exceeding allocations`);
+                }
+                break;
+            }
+            
+            insertText += cardText;
+            spaceUsed += cardSize;
+        }
+        
+        if (insertText.trim().length === 0) {
+            return context;
+        }
+        
+        return Utilities.context.insertIntoWorldLore(workingContext, insertText);
+    }
+    
+    function truncateRecentStory(context, spaceNeeded) {
+        const recentStory = Utilities.context.extractRecentStory(context, false);
+        if (!recentStory) return context;
+        
+        const sentences = Utilities.string.splitBySentences(recentStory);
+        
+        const storyAllocation = Math.floor(maxChars * (1 - (config.nonStoryAllocation || 0.6)));
+        const avgCharsPerSentence = Math.max(1, recentStory.length) / Math.max(1, sentences.length);
+        const sentencesMinimum = Math.max(5, Math.ceil(storyAllocation * 0.5 / avgCharsPerSentence));
+        
+        if (sentences.length <= sentencesMinimum) {
+            if (config.debugLogging || debug) {
+                console.log(`ASCQ: Already at minimum sentences (${sentencesMinimum}), cannot truncate`);
+            }
+            return context;
+        }
+        
+        let removedChars = 0;
+        let sentencesToRemove = 0;
+        
+        for (let i = 0; i < sentences.length - sentencesMinimum; i++) {
+            removedChars += sentences[i].length;
+            sentencesToRemove++;
+            
+            if (removedChars >= spaceNeeded) {
+                break;
+            }
+        }
+        
+        if (sentencesToRemove === 0) {
+            return context;
+        }
+        
+        const remainingSentences = sentences.slice(sentencesToRemove);
+        const newRecentStory = remainingSentences.join("");
+        
+        if (config.debugLogging || debug) {
+            console.log(`ASCQ: Truncated ${sentencesToRemove} sentences (${removedChars} chars)`);
+        }
+        
+        return Utilities.context.replaceRecentStory(context, newRecentStory);
+    }
+    
+    function ensureSystemCards() {
+        if (!Utilities.storyCard.exists("[ASCQ] Help & Configuration")) {
+            const defaultConfig = {
+                nonStoryAllocation: 0.6,
+                debugLogging: false,
+                clearDebugCards: false
+            };
+            saveConfig(defaultConfig);
+        }
+    }
+    
+    return processQueryCards();
 }
