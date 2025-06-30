@@ -5,10 +5,83 @@ const Utilities = (function() {
     // const data = Utilities.plainText.parseEncapsulated(text);
     // const hash = Utilities.math.hash(input);
     // const card = Utilities.storyCard.get(title);
+    // const cmd = Utilities.command.parseCommand('/give sword --enchanted');
+    // const turnsSince = Utilities.turn.elapsed('last_save');
+    
+    // Note: Some utilities enhance native JS functions rather than duplicate them:
+    // - pad() uses native padStart/padEnd when possible, falls back for multi-char padding
+    // - flatten() uses native Array.flat() (ES2019+)
+    // - round() adds decimal place support to Math.round()
+    // - modulo() provides true modulo (not remainder like %)
+    // - deepClone() used since structuredClone() may not be in isolated-vm
     
     // =====================================
     // API DOCUMENTATION
     // =====================================
+    
+    /**
+     * EXPRESSION PARSER API
+     * =====================
+     * General-purpose expression parser for evaluating string expressions
+     * with state/info access, text matching, regex, and fuzzy matching.
+     * 
+     * DOCUMENTATION CORRECTIONS FOR AI DUNGEON:
+     * - Promises work asynchronously via microtask queue (standard JS behavior)
+     * - No true parallelism - single threaded with event loop
+     * - No timer APIs (setTimeout, setInterval) or Worker threads
+     * - Use info.actionCount for turn count (state.actionCount is not native)
+     * 
+     * parse(expression: string) -> Function|null
+     *   Parses expression and returns evaluator function
+     *   Example: const eval = Utilities.expression.parse('state.health > 50')
+     *   Returns: Function that takes optional text parameter
+     *   
+     * evaluate(expression: string, text?: string) -> any
+     *   One-step parse and evaluate
+     *   Example: Utilities.expression.evaluate('count("gold") >= 3', recentStory)
+     *   
+     * compile(expression: string) -> Function
+     *   Compiles expression for repeated use
+     *   Example: const healthCheck = Utilities.expression.compile('state.health < 20')
+     *   
+     * EXPRESSION SYNTAX:
+     * 
+     * Basic Operations:
+     *   state.health > 50
+     *   info.actionCount >= 100
+     *   state.name == "Alice" || state.class == "Warrior"
+     *   
+     * Boolean Functions:
+     *   any("sword", "blade", "weapon")  // True if any word appears
+     *   all("quest", "complete")         // True if all words appear
+     *   none("fail", "death", "game over") // True if no words appear
+     *   
+     * Text Matching:
+     *   count("gold") >= 3           // Count occurrences
+     *   near("sword", "broken", 50)  // Words within distance
+     *   sequence("opened", "door")   // Words in order
+     *   
+     * Fuzzy Matching:
+     *   fuzzy("swrod")               // Finds if any word in text fuzzy matches "swrod"
+     *   fuzzy("swrod", 0.7)          // With custom threshold (0-1)
+     *   fuzzyFind("attck")           // Returns best matching word or null
+     *   fuzzyAny(["attck", "defnd"]) // True if any candidate fuzzy matches
+     *   
+     * RegEx (with ~ syntax):
+     *   ~dragon\s+slain~             // Tests regex against text
+     *   ~\b(gold|silver)\s+coins?\b~i // With flags
+     *   regex("pattern", "flags")    // Explicit function syntax
+     *   
+     * Array/Object Operations:
+     *   state.inventory.includes("key")
+     *   state.items.filter(i => i.type == "weapon").length > 0
+     *   state.quests.some(q => q.active && q.level <= state.level)
+     *   
+     * Story Card Key Examples:
+     *   $E:state.health < 20
+     *   $E:near("boss", "defeated", 100) && state.level >= 10
+     *   $E:fuzzy(state.lastWord, "attack") || fuzzy(state.lastWord, "fight")
+     */
     
     /**
      * PLAIN TEXT PARSER API
@@ -105,6 +178,35 @@ const Utilities = (function() {
      * parseBoolean(str: string) -> boolean
      *   Converts string to boolean ('true', 'yes', '1', 'on', 'enabled' = true)
      *   Example: Utilities.string.parseBoolean('yes') // true
+     *   
+     * levenshteinDistance(str1: string, str2: string) -> number
+     *   Calculates edit distance between two strings
+     *   Example: Utilities.string.levenshteinDistance('kitten', 'sitting') // 3
+     *   
+     * similarity(str1: string, str2: string) -> number
+     *   Returns similarity score between 0-1 using Levenshtein distance
+     *   Example: Utilities.string.similarity('hello', 'hallo') // 0.8
+     *   
+     * fuzzyMatch(str: string, pattern: string, threshold?: number) -> boolean
+     *   Checks if strings are similar enough (default threshold: 0.8)
+     *   Example: Utilities.string.fuzzyMatch('sword', 'swrod') // true
+     *   
+     * findBestMatch(target: string, candidates: string[]) -> {match: string, score: number}|null
+     *   Finds the best matching string from candidates
+     *   Example: Utilities.string.findBestMatch('swrd', ['sword', 'shield', 'staff'])
+     *   Returns: {match: 'sword', score: 0.75}
+     *   
+     * wordWrap(text: string, maxWidth: number, indent?: string) -> string
+     *   Wraps text to specified width, preserving words
+     *   Example: Utilities.string.wordWrap('Long text here', 10) // "Long text\nhere"
+     *   
+     * tokenize(text: string) -> string[]
+     *   Splits text into tokens (words and punctuation)
+     *   Example: Utilities.string.tokenize("Hello, world!") // ["Hello", ",", "world", "!"]
+     *   
+     * template(str: string, data: Object) -> string
+     *   Simple string templating with ${key} syntax
+     *   Example: Utilities.string.template('Hello ${name}!', {name: 'World'}) // "Hello World!"
      */
     
     /**
@@ -145,6 +247,64 @@ const Utilities = (function() {
      * standardDeviation(numbers: number[]) -> number
      *   Calculates standard deviation
      *   Example: Utilities.math.standardDeviation([10, 20, 30]) // 8.165
+     *   
+     * roll(notation: string, seed?: any) -> {total: number, rolls: number[], notation: string}
+     *   Rolls dice using standard notation (e.g., "3d6+2")
+     *   Example: Utilities.math.roll('2d20+5', 'seed')
+     *   Returns: {total: 27, rolls: [11, 11], notation: '2d20+5'}
+     *   
+     * bestOf(values: number[], count?: number) -> number
+     *   Returns the best (highest) of values
+     *   Example: Utilities.math.bestOf([12, 18, 9]) // 18
+     *   Example: Utilities.math.bestOf([12, 18, 9, 20], 2) // 18 (2nd best)
+     *   
+     * worstOf(values: number[], count?: number) -> number
+     *   Returns the worst (lowest) of values
+     *   Example: Utilities.math.worstOf([12, 18, 9]) // 9
+     *   Example: Utilities.math.worstOf([12, 18, 9, 20], 2) // 12 (2nd worst)
+     *   
+     * averageOf(values: number[], roundToInt?: boolean) -> number
+     *   Returns the average of values
+     *   Example: Utilities.math.averageOf([12, 18, 9]) // 13
+     *   Example: Utilities.math.averageOf([12, 18, 9], false) // 13.0
+     *   
+     * distance(x1: number, y1: number, x2: number, y2: number) -> number
+     *   Calculates Euclidean distance between two points
+     *   Example: Utilities.math.distance(0, 0, 3, 4) // 5
+     *   
+     * manhattanDistance(x1: number, y1: number, x2: number, y2: number) -> number
+     *   Calculates Manhattan (grid) distance
+     *   Example: Utilities.math.manhattanDistance(0, 0, 3, 4) // 7
+     *   
+     * normalize(value: number, min: number, max: number) -> number
+     *   Normalizes value to 0-1 range
+     *   Example: Utilities.math.normalize(75, 0, 100) // 0.75
+     *   
+     * denormalize(value: number, min: number, max: number) -> number
+     *   Converts 0-1 value to specified range
+     *   Example: Utilities.math.denormalize(0.75, 0, 100) // 75
+     *   
+     * inRange(value: number, range: [number, number]) -> boolean
+     *   Checks if value is within range (inclusive)
+     *   Example: Utilities.math.inRange(5, [1, 10]) // true
+     *   
+     * modulo(n: number, m: number) -> number
+     *   True modulo operation (handles negatives correctly)
+     *   Example: Utilities.math.modulo(-1, 4) // 3
+     *   
+     * factorial(n: number) -> number
+     *   Calculates factorial (limited to prevent overflow)
+     *   Example: Utilities.math.factorial(5) // 120
+     *   
+     * combinations(n: number, k: number) -> number
+     *   Calculates combinations (n choose k)
+     *   Example: Utilities.math.combinations(5, 2) // 10
+     *   
+     * range(start: number, end: number, step?: number) -> number[]
+     *   Generates array of numbers in range
+     *   Example: Utilities.math.range(1, 5) // [1, 2, 3, 4]
+     *   Example: Utilities.math.range(0, 10, 2) // [0, 2, 4, 6, 8]
+     *   Note: More intuitive than Array.from({length: n}, (_, i) => start + i * step)
      */
     
     /**
@@ -188,6 +348,54 @@ const Utilities = (function() {
      * deepClone(obj: any) -> any
      *   Creates deep copy of object/array (handles nested structures)
      *   Example: const copy = Utilities.collection.deepClone({a: {b: 1}})
+     *   Note: structuredClone() may not be available in isolated-vm, and ours handles Date objects
+     *   
+     * deepEquals(a: any, b: any) -> boolean
+     *   Deep comparison of values including objects and arrays
+     *   Example: Utilities.collection.deepEquals({a: [1,2]}, {a: [1,2]}) // true
+     *   
+     * shuffle(array: any[], seed?: any) -> any[]
+     *   Returns deterministically shuffled copy using seed
+     *   Example: Utilities.collection.shuffle([1,2,3,4,5], 'seed123')
+     *   
+     * sample(array: any[], count: number, seed?: any) -> any[]
+     *   Returns random sample of items (no duplicates)
+     *   Example: Utilities.collection.sample([1,2,3,4,5], 3, 'seed') // [2,5,1]
+     *   
+     * weightedRandom(items: Array<{value: any, weight: number}>, seed?: any) -> any
+     *   Selects item based on weights
+     *   Example: Utilities.collection.weightedRandom([
+     *     {value: 'common', weight: 70},
+     *     {value: 'rare', weight: 25},
+     *     {value: 'legendary', weight: 5}
+     *   ], 'seed123') // likely 'common'
+     *   
+     * partition(array: any[], predicate: Function) -> [any[], any[]]
+     *   Splits array into two based on predicate
+     *   Example: Utilities.collection.partition([1,2,3,4], x => x % 2 === 0)
+     *   Returns: [[2,4], [1,3]]
+     *   
+     * zip(...arrays: any[][]) -> any[][]
+     *   Combines arrays element-wise
+     *   Example: Utilities.collection.zip([1,2,3], ['a','b','c'])
+     *   Returns: [[1,'a'], [2,'b'], [3,'c']]
+     *   
+     * frequency(array: any[]) -> Object
+     *   Counts occurrences of each element
+     *   Example: Utilities.collection.frequency(['a','b','a','c','b','a'])
+     *   Returns: {a: 3, b: 2, c: 1}
+     *   
+     * difference(array1: any[], array2: any[]) -> any[]
+     *   Returns elements in array1 not in array2
+     *   Example: Utilities.collection.difference([1,2,3,4], [2,4]) // [1,3]
+     *   
+     * intersection(array1: any[], array2: any[]) -> any[]
+     *   Returns elements present in both arrays
+     *   Example: Utilities.collection.intersection([1,2,3], [2,3,4]) // [2,3]
+     *   
+     * rotate(array: any[], positions: number) -> any[]
+     *   Rotates array elements by specified positions
+     *   Example: Utilities.collection.rotate([1,2,3,4,5], 2) // [4,5,1,2,3]
      */
     
     /**
@@ -289,6 +497,112 @@ const Utilities = (function() {
      */
     
     /**
+     * COMMAND UTILITIES API
+     * =====================
+     * Command parsing and handling utilities
+     * 
+     * parseCommand(text: string) -> {command: string, args: string[], flags: Object}|null
+     *   Parses command syntax like "/give sword --enchanted --quantity=3"
+     *   Example: Utilities.command.parseCommand('/give sword --enchanted')
+     *   Returns: {command: 'give', args: ['sword'], flags: {enchanted: true}}
+     *   
+     * parseAlias(command: string, aliases: Object) -> string
+     *   Resolves command aliases to their full command names
+     *   Example: Utilities.command.parseAlias('inv', {inv: 'inventory', i: 'inventory'})
+     *   Returns: 'inventory'
+     *   
+     * validateCommand(command: Object, schema: Object) -> {valid: boolean, errors: string[]}
+     *   Validates parsed command against a schema
+     *   Example: Utilities.command.validateCommand(cmd, {minArgs: 1, maxArgs: 2})
+     *   Returns: {valid: true, errors: []}
+     */
+    
+    /**
+     * PARSING UTILITIES API
+     * =====================
+     * General-purpose parsing utilities
+     * 
+     * parseKeyValuePairs(text: string, delimiter?: string) -> Object
+     *   Parses key=value pairs from text
+     *   Example: Utilities.parsing.parseKeyValuePairs('name=John age=25 active=true')
+     *   Returns: {name: 'John', age: 25, active: true}
+     *   
+     * parseRange(text: string) -> {min: number, max: number}|null
+     *   Parses range expressions like "10-20", "5 to 10"
+     *   Example: Utilities.parsing.parseRange('10-20')
+     *   Returns: {min: 10, max: 20}
+     *   
+     * parseJSON(text: string, fallback?: any) -> any
+     *   Safely parses JSON with optional fallback
+     *   Example: Utilities.parsing.parseJSON('{"a":1}', {})
+     *   Returns: {a: 1} or fallback on error
+     */
+    
+    /**
+     * TURN TRACKING UTILITIES API
+     * ===========================
+     * Simple turn tracking for general purposes
+     * 
+     * getCurrentTurn() -> number
+     *   Returns the current turn number
+     *   Example: const turn = Utilities.turn.getCurrentTurn()
+     *   
+     * since(turn: number) -> number
+     *   Returns turns elapsed since specific turn
+     *   Example: const age = Utilities.turn.since(createdTurn)
+     *   
+     * mark(key: string) -> number
+     *   Marks current turn with a key and returns the turn number
+     *   Example: const saveTurn = Utilities.turn.mark('last_save')
+     *   
+     * getMark(key: string) -> number|null
+     *   Gets the turn number for a mark
+     *   Example: const lastSave = Utilities.turn.getMark('last_save')
+     *   
+     * elapsed(key: string) -> number
+     *   Returns turns elapsed since mark (Infinity if not marked)
+     *   Example: const turnsSince = Utilities.turn.elapsed('last_save')
+     *   
+     * clear(key?: string) -> void
+     *   Clears specific mark or all marks
+     *   Example: Utilities.turn.clear('last_save')
+     */
+    
+    /**
+     * FUNCTIONAL UTILITIES API
+     * ========================
+     * Functional programming utilities
+     * 
+     * compose(...fns: Function[]) -> Function
+     *   Composes functions right to left
+     *   Example: const process = Utilities.functional.compose(capitalize, trim, toLowerCase);
+     *   process('  HELLO  ') // 'Hello'
+     *   
+     * pipe(...fns: Function[]) -> Function
+     *   Pipes functions left to right
+     *   Example: const process = Utilities.functional.pipe(trim, toLowerCase, capitalize);
+     *   process('  HELLO  ') // 'Hello'
+     *   
+     * memoize(fn: Function, keyFn?: Function) -> Function
+     *   Returns memoized version of function
+     *   Example: const expensiveCalc = Utilities.functional.memoize(calculate);
+     *   
+     * curry(fn: Function) -> Function
+     *   Returns curried version of function
+     *   Example: const add = Utilities.functional.curry((a, b, c) => a + b + c);
+     *   add(1)(2)(3) // 6
+     *   
+     * partial(fn: Function, ...args) -> Function
+     *   Partially applies arguments to function
+     *   Example: const add5 = Utilities.functional.partial(add, 5);
+     *   add5(10) // 15
+     *   
+     * once(fn: Function) -> Function
+     *   Ensures function is called only once
+     *   Example: const init = Utilities.functional.once(initialize);
+     */
+    
+    /**
      * STORY CARD OPERATIONS API
      * =========================
      * Direct manipulation of AI Dungeon Story Cards
@@ -328,10 +642,13 @@ const Utilities = (function() {
      *   Updates existing card or creates new one if not found
      *   Example: Utilities.storyCard.upsert({title: '[STATE] Current', entry: '90 Volts'})
      *   
-     * exists(title: string) -> boolean
-     *   Checks if card with exact title exists
-     *   Example: Utilities.storyCard.exists('[CONFIG] Main Settings')
+     * findByExpression(expression: string, text?: string) -> card[]
+     *   Finds cards with keys matching expression
+     *   Example: Utilities.storyCard.findByExpression('$E:state.health < 20')
      *   
+     * getActiveCards(text?: string) -> Array<{card, matchedKey, priority}>
+     *   Gets all cards with expression keys that currently match
+     *   Example: const active = Utilities.storyCard.getActiveCards()
      */
     
     /**
@@ -376,8 +693,8 @@ const Utilities = (function() {
      * cache.get(namespace: string, key: string) -> any
      * cache.set(namespace: string, key: string, value: any) -> any
      *   Turn-based cache storage (cleared each turn)
-     *   Example: Utilities.cache.set('session', 'userId', 12345)
-     *   Example: Utilities.cache.get('session', 'userId') // 12345
+     *   Example: Utilities.cache.set('combat', 'lastTarget', 'Goblin A')
+     *   Example: Utilities.cache.get('cards', 'playerCard') // cached card lookup
      *   
      * patterns -> Object
      *   Common precompiled regex patterns ready to use
@@ -385,6 +702,1044 @@ const Utilities = (function() {
      *   Available patterns: entityTitle, integer, decimal, percentage, etc.
      */
     
+    // =====================================
+    // EXPRESSION PARSER
+    // =====================================
+    const ExpressionParser = {
+        // Token types
+        TokenType: {
+            // Literals
+            NUMBER: 'NUMBER',
+            STRING: 'STRING',
+            BOOLEAN: 'BOOLEAN',
+            NULL: 'NULL',
+            UNDEFINED: 'UNDEFINED',
+            IDENTIFIER: 'IDENTIFIER',
+            
+            // Operators
+            PLUS: 'PLUS',
+            MINUS: 'MINUS',
+            MULTIPLY: 'MULTIPLY',
+            DIVIDE: 'DIVIDE',
+            MODULO: 'MODULO',
+            
+            // Comparison
+            EQUALS: 'EQUALS',
+            NOT_EQUALS: 'NOT_EQUALS',
+            STRICT_EQUALS: 'STRICT_EQUALS',
+            STRICT_NOT_EQUALS: 'STRICT_NOT_EQUALS',
+            LESS_THAN: 'LESS_THAN',
+            LESS_THAN_EQUALS: 'LESS_THAN_EQUALS',
+            GREATER_THAN: 'GREATER_THAN',
+            GREATER_THAN_EQUALS: 'GREATER_THAN_EQUALS',
+            
+            // Logical
+            AND: 'AND',
+            OR: 'OR',
+            NOT: 'NOT',
+            
+            // Structural
+            LPAREN: 'LPAREN',
+            RPAREN: 'RPAREN',
+            LBRACKET: 'LBRACKET',
+            RBRACKET: 'RBRACKET',
+            DOT: 'DOT',
+            COMMA: 'COMMA',
+            ARROW: 'ARROW',
+            COLON: 'COLON',
+            
+            // Special
+            OPERATOR_FUNC: 'OPERATOR_FUNC',
+            EOF: 'EOF'
+        },
+        
+        // Built-in functions (for text expressions)
+        builtinFunctions: {
+            // RegEx testing
+            regex(text, pattern, flags = '') {
+                try {
+                    const re = new RegExp(pattern, flags);
+                    return re.test(text);
+                } catch (e) {
+                    console.log('[Expression] Invalid regex:', e.message);
+                    return false;
+                }
+            },
+            
+            // Fuzzy word matching
+            fuzzy(text, pattern, threshold = 0.8) {
+                const words = text.match(/\b\w+\b/g) || [];
+                const patternLower = pattern.toLowerCase();
+                const patternLen = pattern.length;
+                
+                const minLen = Math.max(1, patternLen - 2);
+                const maxLen = patternLen + 2;
+                
+                for (const word of words) {
+                    if (word.length >= minLen && word.length <= maxLen) {
+                        if (StringUtils.fuzzyMatch(word, pattern, threshold)) {
+                            return true;
+                        }
+                    }
+                }
+                
+                return false;
+            },
+            
+            // Find best fuzzy match word in text
+            fuzzyFind(text, pattern, threshold = 0.8) {
+                const words = text.match(/\b\w+\b/g) || [];
+                const patternLen = pattern.length;
+                const minLen = Math.max(1, patternLen - 2);
+                const maxLen = patternLen + 2;
+                
+                let bestMatch = null;
+                let bestScore = threshold;
+                
+                for (const word of words) {
+                    if (word.length >= minLen && word.length <= maxLen) {
+                        const score = StringUtils.similarity(word, pattern);
+                        if (score >= threshold && score > bestScore) {
+                            bestScore = score;
+                            bestMatch = word;
+                        }
+                    }
+                }
+                
+                return bestMatch;
+            },
+            
+            // Check if any of the candidate words appear in text (fuzzy)
+            fuzzyAny(text, candidates, threshold = 0.8) {
+                if (!Array.isArray(candidates)) return false;
+                
+                for (const candidate of candidates) {
+                    if (this.fuzzy(text, candidate, threshold)) {
+                        return true;
+                    }
+                }
+                
+                return false;
+            },
+            
+            // Words within distance
+            near(text, word1, word2, maxDistance = 50) {
+                const regex1 = new RegExp('\\b' + this.escapeRegex(word1) + '\\b', 'gi');
+                const regex2 = new RegExp('\\b' + this.escapeRegex(word2) + '\\b', 'gi');
+                
+                let match1, match2;
+                while ((match1 = regex1.exec(text)) !== null) {
+                    regex2.lastIndex = 0;
+                    while ((match2 = regex2.exec(text)) !== null) {
+                        if (Math.abs(match2.index - match1.index) <= maxDistance) {
+                            return true;
+                        }
+                    }
+                }
+                return false;
+            },
+            
+            // Words in sequence
+            sequence(text, ...words) {
+                let lastIndex = -1;
+                for (const word of words) {
+                    const regex = new RegExp('\\b' + this.escapeRegex(word) + '\\b', 'i');
+                    const match = text.substring(lastIndex + 1).match(regex);
+                    if (!match) return false;
+                    lastIndex = lastIndex + 1 + match.index;
+                }
+                return true;
+            },
+            
+            seq(text, ...words) {
+                return this.sequence(text, ...words);
+            },
+            
+            // Count occurrences
+            count(text, pattern) {
+                if (pattern instanceof RegExp) {
+                    const matches = text.match(new RegExp(pattern.source, pattern.flags + 'g'));
+                    return matches ? matches.length : 0;
+                }
+                const regex = new RegExp('\\b' + this.escapeRegex(pattern) + '\\b', 'gi');
+                const matches = text.match(regex);
+                return matches ? matches.length : 0;
+            },
+            
+            // Check if all patterns exist
+            all(text, ...patterns) {
+                return patterns.every(p => {
+                    if (p instanceof RegExp) {
+                        return p.test(text);
+                    }
+                    return text.toLowerCase().includes(p.toLowerCase());
+                });
+            },
+            
+            // Check if any pattern exists
+            any(text, ...patterns) {
+                return patterns.some(p => {
+                    if (p instanceof RegExp) {
+                        return p.test(text);
+                    }
+                    return text.toLowerCase().includes(p.toLowerCase());
+                });
+            },
+            
+            // Check if no patterns exist
+            none(text, ...patterns) {
+                return !patterns.some(p => {
+                    if (p instanceof RegExp) {
+                        return p.test(text);
+                    }
+                    return text.toLowerCase().includes(p.toLowerCase());
+                });
+            },
+            
+            // Helper to escape regex special chars
+            escapeRegex(str) {
+                return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }
+        },
+        
+        // Cache for compiled expressions
+        _cache: new Map(),
+        
+        // Main parse method with context options
+        parse(expression, options = {}) {
+            const context = options.context || 'text';
+            const target = options.target || null;
+            
+            // Check cache with context-aware key
+            const cacheKey = `${expression}::${context}::${target}`;
+            if (this._cache.has(cacheKey)) {
+                return this._cache.get(cacheKey);
+            }
+            
+            try {
+                const tokens = this.tokenize(expression);
+                const ast = this.parseExpression(tokens);
+                const evaluator = this.compileAST(ast, { context, target });
+                
+                this._cache.set(cacheKey, evaluator);
+                
+                return evaluator;
+            } catch (error) {
+                console.log('[Expression] Parse error:', error.message);
+                return null;
+            }
+        },
+        
+        // Convenience methods for specific contexts
+        parseTextExpression(expression) {
+            return this.parse(expression, { context: 'text' });
+        },
+        
+        parseObjectQuery(expression, targetType = 'card') {
+            return this.parse(expression, { context: 'object', target: targetType });
+        },
+        
+        // One-step evaluate
+        evaluate(expression, data) {
+            const evaluator = this.parse(expression);
+            return evaluator ? evaluator(data) : null;
+        },
+        
+        // Evaluate convenience methods
+        evaluateText(expression, text) {
+            const evaluator = this.parseTextExpression(expression);
+            return evaluator ? evaluator(text) : null;
+        },
+        
+        evaluateObject(expression, obj, targetType = 'card') {
+            const evaluator = this.parseObjectQuery(expression, targetType);
+            return evaluator ? evaluator(obj) : null;
+        },
+        
+        // Clear expression cache
+        clearCache() {
+            this._cache.clear();
+        },
+        
+        // Tokenize expression
+        tokenize(expr) {
+            const tokens = [];
+            let pos = 0;
+            
+            const peek = (offset = 0) => expr[pos + offset] || '';
+            const advance = (count = 1) => { pos += count; };
+            const isDigit = (ch) => /\d/.test(ch);
+            const isAlpha = (ch) => /[a-zA-Z_$]/.test(ch);
+            const isAlphaNum = (ch) => /[a-zA-Z0-9_$]/.test(ch);
+            
+            while (pos < expr.length) {
+                // Skip whitespace
+                if (/\s/.test(peek())) {
+                    advance();
+                    continue;
+                }
+                
+                // RegEx literals with ~ delimiter
+                if (peek() === '~') {
+                    advance(); // Skip opening ~
+                    let pattern = '';
+                    let escaped = false;
+                    
+                    while (pos < expr.length && (peek() !== '~' || escaped)) {
+                        if (escaped) {
+                            pattern += peek();
+                            escaped = false;
+                        } else if (peek() === '\\') {
+                            pattern += peek();
+                            escaped = true;
+                        } else {
+                            pattern += peek();
+                        }
+                        advance();
+                    }
+                    
+                    if (pos >= expr.length) {
+                        throw new Error('Unterminated regex literal');
+                    }
+                    
+                    advance(); // Skip closing ~
+                    
+                    // Collect flags
+                    let flags = '';
+                    while (pos < expr.length && /[gimsuvy]/.test(peek())) {
+                        flags += peek();
+                        advance();
+                    }
+                    
+                    // Convert to regex function call
+                    tokens.push({ type: this.TokenType.IDENTIFIER, value: 'regex' });
+                    tokens.push({ type: this.TokenType.LPAREN });
+                    tokens.push({ type: this.TokenType.STRING, value: pattern });
+                    if (flags) {
+                        tokens.push({ type: this.TokenType.COMMA });
+                        tokens.push({ type: this.TokenType.STRING, value: flags });
+                    }
+                    tokens.push({ type: this.TokenType.RPAREN });
+                    continue;
+                }
+                
+                // Two-character operators
+                const twoChar = peek() + peek(1);
+                const twoCharOps = {
+                    '&&': this.TokenType.AND,
+                    '||': this.TokenType.OR,
+                    '==': this.TokenType.EQUALS,
+                    '!=': this.TokenType.NOT_EQUALS,
+                    '===': this.TokenType.STRICT_EQUALS,
+                    '!==': this.TokenType.STRICT_NOT_EQUALS,
+                    '<=': this.TokenType.LESS_THAN_EQUALS,
+                    '>=': this.TokenType.GREATER_THAN_EQUALS,
+                    '=>': this.TokenType.ARROW
+                };
+                
+                if (twoCharOps[twoChar]) {
+                    tokens.push({ type: twoCharOps[twoChar] });
+                    advance(2);
+                    continue;
+                }
+                
+                // Three-character operators
+                const threeChar = twoChar + peek(2);
+                if (threeChar === '===' || threeChar === '!==') {
+                    tokens.push({ 
+                        type: threeChar === '===' ? 
+                            this.TokenType.STRICT_EQUALS : 
+                            this.TokenType.STRICT_NOT_EQUALS 
+                    });
+                    advance(3);
+                    continue;
+                }
+                
+                // Single character operators
+                const singleCharOps = {
+                    '+': this.TokenType.PLUS,
+                    '-': this.TokenType.MINUS,
+                    '*': this.TokenType.MULTIPLY,
+                    '/': this.TokenType.DIVIDE,
+                    '%': this.TokenType.MODULO,
+                    '<': this.TokenType.LESS_THAN,
+                    '>': this.TokenType.GREATER_THAN,
+                    '!': this.TokenType.NOT,
+                    '(': this.TokenType.LPAREN,
+                    ')': this.TokenType.RPAREN,
+                    '[': this.TokenType.LBRACKET,
+                    ']': this.TokenType.RBRACKET,
+                    '.': this.TokenType.DOT,
+                    ',': this.TokenType.COMMA,
+                    ':': this.TokenType.COLON,
+                    '=': this.TokenType.EQUALS
+                };
+                
+                if (singleCharOps[peek()]) {
+                    tokens.push({ type: singleCharOps[peek()] });
+                    advance();
+                    continue;
+                }
+                
+                // Numbers
+                if (isDigit(peek()) || (peek() === '.' && isDigit(peek(1)))) {
+                    let num = '';
+                    
+                    while (isDigit(peek()) || peek() === '.') {
+                        num += peek();
+                        advance();
+                    }
+                    
+                    tokens.push({
+                        type: this.TokenType.NUMBER,
+                        value: parseFloat(num)
+                    });
+                    continue;
+                }
+                
+                // Strings
+                if (peek() === '"' || peek() === "'") {
+                    const quote = peek();
+                    advance();
+                    let str = '';
+                    let escaped = false;
+                    
+                    while (pos < expr.length && (peek() !== quote || escaped)) {
+                        if (escaped) {
+                            const escapeMap = {
+                                'n': '\n',
+                                'r': '\r',
+                                't': '\t',
+                                '\\': '\\',
+                                '"': '"',
+                                "'": "'"
+                            };
+                            str += escapeMap[peek()] || peek();
+                            escaped = false;
+                        } else if (peek() === '\\') {
+                            escaped = true;
+                        } else {
+                            str += peek();
+                        }
+                        advance();
+                    }
+                    
+                    if (pos >= expr.length) {
+                        throw new Error('Unterminated string');
+                    }
+                    
+                    advance(); // Skip closing quote
+                    tokens.push({
+                        type: this.TokenType.STRING,
+                        value: str
+                    });
+                    continue;
+                }
+                
+                // Identifiers and keywords
+                if (isAlpha(peek())) {
+                    let ident = '';
+                    
+                    while (isAlphaNum(peek())) {
+                        ident += peek();
+                        advance();
+                    }
+                    
+                    // Check for keywords
+                    const keywords = {
+                        'true': { type: this.TokenType.BOOLEAN, value: true },
+                        'false': { type: this.TokenType.BOOLEAN, value: false },
+                        'null': { type: this.TokenType.NULL, value: null },
+                        'undefined': { type: this.TokenType.UNDEFINED, value: undefined },
+                        'AND': { type: this.TokenType.AND },
+                        'OR': { type: this.TokenType.OR },
+                        'NOT': { type: this.TokenType.NOT },
+                        'contains': { type: this.TokenType.OPERATOR_FUNC, value: 'contains' },
+                        'includes': { type: this.TokenType.OPERATOR_FUNC, value: 'includes' },
+                        'startsWith': { type: this.TokenType.OPERATOR_FUNC, value: 'startsWith' },
+                        'endsWith': { type: this.TokenType.OPERATOR_FUNC, value: 'endsWith' },
+                        'match': { type: this.TokenType.OPERATOR_FUNC, value: 'match' },
+                        'regex': { type: this.TokenType.OPERATOR_FUNC, value: 'regex' },
+                        'starts': { type: this.TokenType.OPERATOR_FUNC, value: 'startsWith' },
+                        'ends': { type: this.TokenType.OPERATOR_FUNC, value: 'endsWith' },
+                        'gt': { type: this.TokenType.OPERATOR_FUNC, value: 'gt' },
+                        'lt': { type: this.TokenType.OPERATOR_FUNC, value: 'lt' },
+                        'gte': { type: this.TokenType.OPERATOR_FUNC, value: 'gte' },
+                        'lte': { type: this.TokenType.OPERATOR_FUNC, value: 'lte' }
+                    };
+                    
+                    if (keywords[ident]) {
+                        tokens.push(keywords[ident]);
+                    } else {
+                        tokens.push({
+                            type: this.TokenType.IDENTIFIER,
+                            value: ident
+                        });
+                    }
+                    continue;
+                }
+                
+                throw new Error(`Unexpected character '${peek()}' at position ${pos}`);
+            }
+            
+            tokens.push({ type: this.TokenType.EOF });
+            return tokens;
+        },
+        
+        // Parse tokens into AST
+        parseExpression(tokens) {
+            let current = 0;
+            
+            const peek = (offset = 0) => tokens[current + offset] || { type: this.TokenType.EOF };
+            const consume = (type) => {
+                if (peek().type !== type) {
+                    throw new Error(`Expected ${type} but got ${peek().type}`);
+                }
+                return tokens[current++];
+            };
+            const match = (...types) => types.includes(peek().type);
+            
+            // Expression parsing with precedence
+            const parseOr = () => {
+                let left = parseAnd();
+                
+                while (match(this.TokenType.OR)) {
+                    consume(this.TokenType.OR);
+                    const right = parseAnd();
+                    left = { type: 'LogicalExpression', operator: '||', left, right };
+                }
+                
+                return left;
+            };
+            
+            const parseAnd = () => {
+                let left = parseEquality();
+                
+                while (match(this.TokenType.AND)) {
+                    consume(this.TokenType.AND);
+                    const right = parseEquality();
+                    left = { type: 'LogicalExpression', operator: '&&', left, right };
+                }
+                
+                return left;
+            };
+            
+            const parseEquality = () => {
+                let left = parseRelational();
+                
+                while (match(
+                    this.TokenType.EQUALS,
+                    this.TokenType.NOT_EQUALS,
+                    this.TokenType.STRICT_EQUALS,
+                    this.TokenType.STRICT_NOT_EQUALS
+                )) {
+                    const op = tokens[current++];
+                    const right = parseRelational();
+                    left = {
+                        type: 'BinaryExpression',
+                        operator: op.type === this.TokenType.EQUALS ? '==' :
+                                  op.type === this.TokenType.NOT_EQUALS ? '!=' :
+                                  op.type === this.TokenType.STRICT_EQUALS ? '===' : '!==',
+                        left,
+                        right
+                    };
+                }
+                
+                return left;
+            };
+            
+            const parseRelational = () => {
+                let left = parseAdditive();
+                
+                while (match(
+                    this.TokenType.LESS_THAN,
+                    this.TokenType.LESS_THAN_EQUALS,
+                    this.TokenType.GREATER_THAN,
+                    this.TokenType.GREATER_THAN_EQUALS
+                )) {
+                    const op = tokens[current++];
+                    const right = parseAdditive();
+                    left = {
+                        type: 'BinaryExpression',
+                        operator: op.type === this.TokenType.LESS_THAN ? '<' :
+                                  op.type === this.TokenType.LESS_THAN_EQUALS ? '<=' :
+                                  op.type === this.TokenType.GREATER_THAN ? '>' : '>=',
+                        left,
+                        right
+                    };
+                }
+                
+                return left;
+            };
+            
+            const parseAdditive = () => {
+                let left = parseMultiplicative();
+                
+                while (match(this.TokenType.PLUS, this.TokenType.MINUS)) {
+                    const op = tokens[current++];
+                    const right = parseMultiplicative();
+                    left = {
+                        type: 'BinaryExpression',
+                        operator: op.type === this.TokenType.PLUS ? '+' : '-',
+                        left,
+                        right
+                    };
+                }
+                
+                return left;
+            };
+            
+            const parseMultiplicative = () => {
+                let left = parseUnary();
+                
+                while (match(this.TokenType.MULTIPLY, this.TokenType.DIVIDE, this.TokenType.MODULO)) {
+                    const op = tokens[current++];
+                    const right = parseUnary();
+                    left = {
+                        type: 'BinaryExpression',
+                        operator: op.type === this.TokenType.MULTIPLY ? '*' :
+                                  op.type === this.TokenType.DIVIDE ? '/' : '%',
+                        left,
+                        right
+                    };
+                }
+                
+                return left;
+            };
+            
+            const parseUnary = () => {
+                if (match(this.TokenType.NOT, this.TokenType.MINUS, this.TokenType.PLUS)) {
+                    const op = tokens[current++];
+                    const operand = parseUnary();
+                    return {
+                        type: 'UnaryExpression',
+                        operator: op.type === this.TokenType.NOT ? '!' :
+                                  op.type === this.TokenType.MINUS ? '-' : '+',
+                        operand
+                    };
+                }
+                
+                return parsePostfix();
+            };
+            
+            const parsePostfix = () => {
+                let left = parsePrimary();
+                
+                while (true) {
+                    // Check for object query syntax (field: value)
+                    if (match(this.TokenType.COLON)) {
+                        consume(this.TokenType.COLON);
+                        
+                        // Handle operator functions after colon
+                        if (match(this.TokenType.OPERATOR_FUNC)) {
+                            const op = consume(this.TokenType.OPERATOR_FUNC);
+                            const value = parseUnary();
+                            left = {
+                                type: 'ObjectQuery',
+                                field: left.type === 'Identifier' ? left.name : 
+                                      left.type === 'MemberExpression' ? this.memberExprToPath(left) : 
+                                      String(left),
+                                operator: op.value,
+                                value: value
+                            };
+                        } else {
+                            // Simple equality
+                            const value = parseUnary();
+                            left = {
+                                type: 'ObjectQuery',
+                                field: left.type === 'Identifier' ? left.name : 
+                                      left.type === 'MemberExpression' ? this.memberExprToPath(left) : 
+                                      String(left),
+                                operator: 'equals',
+                                value: value
+                            };
+                        }
+                        continue;
+                    }
+                    
+                    // Property access
+                    if (match(this.TokenType.DOT)) {
+                        consume(this.TokenType.DOT);
+                        
+                        // Check for operator function
+                        if (match(this.TokenType.OPERATOR_FUNC)) {
+                            const op = consume(this.TokenType.OPERATOR_FUNC);
+                            consume(this.TokenType.COLON);
+                            const value = parseUnary();
+                            left = {
+                                type: 'ObjectQuery',
+                                field: left.type === 'Identifier' ? left.name : 
+                                      left.type === 'MemberExpression' ? this.memberExprToPath(left) : 
+                                      String(left),
+                                operator: op.value,
+                                value: value
+                            };
+                        } else {
+                            const property = consume(this.TokenType.IDENTIFIER);
+                            
+                            // Check for method call
+                            if (match(this.TokenType.LPAREN)) {
+                                consume(this.TokenType.LPAREN);
+                                const args = [];
+                                
+                                while (!match(this.TokenType.RPAREN)) {
+                                    // Parse arrow functions in method calls
+                                    if (match(this.TokenType.IDENTIFIER) && peek(1).type === this.TokenType.ARROW) {
+                                        const param = consume(this.TokenType.IDENTIFIER);
+                                        consume(this.TokenType.ARROW);
+                                        const body = parseOr();
+                                        args.push({
+                                            type: 'ArrowFunctionExpression',
+                                            params: [param.value],
+                                            body
+                                        });
+                                    } else {
+                                        args.push(parseOr());
+                                    }
+                                    
+                                    if (match(this.TokenType.COMMA)) {
+                                        consume(this.TokenType.COMMA);
+                                    }
+                                }
+                                
+                                consume(this.TokenType.RPAREN);
+                                left = {
+                                    type: 'CallExpression',
+                                    callee: {
+                                        type: 'MemberExpression',
+                                        object: left,
+                                        property: property.value
+                                    },
+                                    arguments: args
+                                };
+                            } else {
+                                left = {
+                                    type: 'MemberExpression',
+                                    object: left,
+                                    property: property.value
+                                };
+                            }
+                        }
+                    } else if (match(this.TokenType.LBRACKET)) {
+                        consume(this.TokenType.LBRACKET);
+                        const index = parseOr();
+                        consume(this.TokenType.RBRACKET);
+                        left = {
+                            type: 'MemberExpression',
+                            object: left,
+                            property: index,
+                            computed: true
+                        };
+                    } else if (match(this.TokenType.LPAREN) && left.type === 'Identifier') {
+                        // Function call
+                        consume(this.TokenType.LPAREN);
+                        const args = [];
+                        
+                        while (!match(this.TokenType.RPAREN)) {
+                            args.push(parseOr());
+                            if (match(this.TokenType.COMMA)) {
+                                consume(this.TokenType.COMMA);
+                            }
+                        }
+                        
+                        consume(this.TokenType.RPAREN);
+                        left = {
+                            type: 'CallExpression',
+                            callee: left,
+                            arguments: args
+                        };
+                    } else {
+                        break;
+                    }
+                }
+                
+                return left;
+            };
+            
+            const parsePrimary = () => {
+                // Literals
+                if (match(this.TokenType.NUMBER, this.TokenType.STRING, 
+                        this.TokenType.BOOLEAN, this.TokenType.NULL, 
+                        this.TokenType.UNDEFINED)) {
+                    const token = tokens[current++];
+                    return { type: 'Literal', value: token.value };
+                }
+                
+                // Identifiers
+                if (match(this.TokenType.IDENTIFIER)) {
+                    const token = tokens[current++];
+                    return { type: 'Identifier', name: token.value };
+                }
+                
+                // Parentheses
+                if (match(this.TokenType.LPAREN)) {
+                    consume(this.TokenType.LPAREN);
+                    const expr = parseOr();
+                    consume(this.TokenType.RPAREN);
+                    return expr;
+                }
+                
+                throw new Error(`Unexpected token ${peek().type}`);
+            };
+            
+            const ast = parseOr();
+            
+            if (peek().type !== this.TokenType.EOF) {
+                throw new Error(`Unexpected token after expression: ${peek().type}`);
+            }
+            
+            return ast;
+        },
+        
+        // Helper to convert member expression to path string
+        memberExprToPath(node) {
+            if (node.type === 'Identifier') {
+                return node.name;
+            }
+            if (node.type === 'MemberExpression') {
+                const objectPath = this.memberExprToPath(node.object);
+                return objectPath + '.' + node.property;
+            }
+            return String(node);
+        },
+        
+        // Compile AST to executable function
+        compileAST(ast, options = {}) {
+            const self = this;
+            const context = options.context || 'text';
+            
+            const evaluate = (node, evalContext) => {
+                switch (node.type) {
+                    case 'Literal':
+                        return node.value;
+                        
+                    case 'Identifier':
+                        // For object context, look in the object
+                        if (context === 'object' && evalContext._object) {
+                            return evalContext._object[node.name];
+                        }
+                        
+                        // Check for builtin functions
+                        if (self.builtinFunctions[node.name]) {
+                            return self.builtinFunctions[node.name].bind(self.builtinFunctions);
+                        }
+                        
+                        // Check context (state, info, etc.)
+                        if (evalContext.hasOwnProperty(node.name)) {
+                            return evalContext[node.name];
+                        }
+                        
+                        // Check global objects
+                        if (node.name === 'state' && typeof state !== 'undefined') {
+                            return state;
+                        }
+                        if (node.name === 'info' && typeof info !== 'undefined') {
+                            return info;
+                        }
+                        
+                        return undefined;
+                        
+                    case 'MemberExpression':
+                        const obj = evaluate(node.object, evalContext);
+                        if (obj == null) return undefined;
+                        
+                        if (node.computed) {
+                            const prop = evaluate(node.property, evalContext);
+                            return obj[prop];
+                        }
+                        
+                        return obj[node.property];
+                        
+                    case 'CallExpression':
+                        const callee = evaluate(node.callee, evalContext);
+                        if (typeof callee !== 'function') {
+                            throw new Error(`${node.callee.name || 'Expression'} is not a function`);
+                        }
+                        
+                        const args = node.arguments.map(arg => {
+                            // Handle arrow functions specially
+                            if (arg.type === 'ArrowFunctionExpression') {
+                                return (...params) => {
+                                    const localContext = { ...evalContext };
+                                    arg.params.forEach((param, i) => {
+                                        localContext[param] = params[i];
+                                    });
+                                    return evaluate(arg.body, localContext);
+                                };
+                            }
+                            return evaluate(arg, evalContext);
+                        });
+                        
+                        // Special handling for builtin functions that need text
+                        if (node.callee.type === 'Identifier' && self.builtinFunctions[node.callee.name]) {
+                            // For builtin functions, always pass text as first argument
+                            return callee(evalContext._text, ...args);
+                        }
+                        
+                        // Handle method calls
+                        if (node.callee.type === 'MemberExpression') {
+                            const obj = evaluate(node.callee.object, evalContext);
+                            return callee.apply(obj, args);
+                        }
+                        
+                        return callee(...args);
+                        
+                    case 'UnaryExpression':
+                        const operand = evaluate(node.operand, evalContext);
+                        switch (node.operator) {
+                            case '!': return !operand;
+                            case '-': return -operand;
+                            case '+': return +operand;
+                        }
+                        break;
+                        
+                    case 'BinaryExpression':
+                        const left = evaluate(node.left, evalContext);
+                        const right = evaluate(node.right, evalContext);
+                        
+                        switch (node.operator) {
+                            case '+': return left + right;
+                            case '-': return left - right;
+                            case '*': return left * right;
+                            case '/': return left / right;
+                            case '%': return left % right;
+                            case '<': return left < right;
+                            case '<=': return left <= right;
+                            case '>': return left > right;
+                            case '>=': return left >= right;
+                            case '==': return left == right;
+                            case '!=': return left != right;
+                            case '===': return left === right;
+                            case '!==': return left !== right;
+                        }
+                        break;
+                        
+                    case 'LogicalExpression':
+                        switch (node.operator) {
+                            case '&&':
+                                return evaluate(node.left, evalContext) && evaluate(node.right, evalContext);
+                            case '||':
+                                return evaluate(node.left, evalContext) || evaluate(node.right, evalContext);
+                        }
+                        break;
+                        
+                    case 'ArrowFunctionExpression':
+                        return (...args) => {
+                            const localContext = { ...evalContext };
+                            node.params.forEach((param, i) => {
+                                localContext[param] = args[i];
+                            });
+                            return evaluate(node.body, localContext);
+                        };
+                        
+                    case 'ObjectQuery':
+                        // For object queries
+                        const field = node.field;
+                        const operator = node.operator || 'equals';
+                        const value = evaluate(node.value, evalContext);
+                        
+                        return (obj) => {
+                            if (!obj || typeof obj !== 'object') return false;
+                            
+                            const fieldValue = this.getFieldValue(obj, field);
+                            
+                            switch (operator) {
+                                case 'equals':
+                                    return fieldValue == value;
+                                case 'contains':
+                                case 'includes':
+                                    if (fieldValue == null) return false;
+                                    return String(fieldValue).includes(value);
+                                case 'startsWith':
+                                    if (fieldValue == null) return false;
+                                    return String(fieldValue).startsWith(value);
+                                case 'endsWith':
+                                    if (fieldValue == null) return false;
+                                    return String(fieldValue).endsWith(value);
+                                case 'match':
+                                case 'regex':
+                                    if (fieldValue == null) return false;
+                                    try {
+                                        return new RegExp(value).test(String(fieldValue));
+                                    } catch (e) {
+                                        return false;
+                                    }
+                                case 'gt':
+                                    return Number(fieldValue) > Number(value);
+                                case 'lt':
+                                    return Number(fieldValue) < Number(value);
+                                case 'gte':
+                                    return Number(fieldValue) >= Number(value);
+                                case 'lte':
+                                    return Number(fieldValue) <= Number(value);
+                                default:
+                                    return false;
+                            }
+                        };
+                }
+                
+                throw new Error(`Unknown node type: ${node.type}`);
+            };
+            
+            // Return appropriate evaluator based on context
+            if (context === 'object') {
+                return (obj) => {
+                    const evalContext = { _object: obj };
+                    try {
+                        const result = evaluate(ast, evalContext);
+                        // If the result is a function (from ObjectQuery), apply it to the object
+                        if (typeof result === 'function') {
+                            return result(obj);
+                        }
+                        return result;
+                    } catch (error) {
+                        console.log('[Expression] Evaluation error:', error.message);
+                        return false;
+                    }
+                };
+            } else {
+                // Original text-based evaluator
+                return (text) => {
+                    const evalContext = { _text: text || '' };
+                    try {
+                        return evaluate(ast, evalContext);
+                    } catch (error) {
+                        console.log('[Expression] Evaluation error:', error.message);
+                        return false;
+                    }
+                };
+            }
+        },
+        
+        // Helper to get nested field values
+        getFieldValue(obj, path) {
+            const parts = path.split('.');
+            let value = obj;
+            
+            for (const part of parts) {
+                if (value == null) return undefined;
+                value = value[part];
+            }
+            
+            return value;
+        },
+        
+        // Extract recent story text (for text expressions)
+        extractRecentStory(fullText) {
+            const recentStoryPattern = /Recent\s*Story\s*:\s*([\s\S]*?)(?=%@GEN@%|%@COM@%|$)/i;
+            const match = fullText.match(recentStoryPattern);
+            
+            if (!match) return '';
+            
+            let storyText = match[1];
+            
+            // Remove author's notes
+            storyText = storyText.replace(/\[Author['']s\s*note:[^\]]*\]/gi, ' ');
+            
+            return storyText.trim();
+        }
+    };
+
     // =====================================
     // REGEX PATTERN CACHE
     // =====================================
@@ -459,7 +1814,6 @@ const Utilities = (function() {
             text = text.trim();
             
             if (!text.startsWith('{') || !text.endsWith('}')) {
-                // console.log('[PlainText] Warning: Text not properly encapsulated');
                 return this.parseUnencapsulated(text);
             }
             
@@ -467,7 +1821,6 @@ const Utilities = (function() {
             
             const nameMatch = content.match(/^#\s+(.+)$/m);
             if (!nameMatch) {
-                // console.log('[PlainText] Warning: No primary name header found');
                 return { name: 'Unknown', sections: this.parseSections(content) };
             }
             
@@ -837,6 +2190,12 @@ const Utilities = (function() {
         },
         
         pad(str, length, char = ' ', direction = 'left') {
+            // Use native padStart/padEnd when possible
+            str = String(str);
+            if (char === ' ' && char.length === 1) {
+                return direction === 'left' ? str.padStart(length) : str.padEnd(length);
+            }
+            // Fallback for multi-char padding
             const padding = char.repeat(Math.max(0, length - str.length));
             return direction === 'left' ? padding + str : str + padding;
         },
@@ -852,15 +2211,104 @@ const Utilities = (function() {
         },
         
         parseBoolean(str) {
-            // Handle actual boolean values
             if (str === true) return true;
             if (str === false) return false;
             if (str == null) return false;
             
             const normalized = String(str).toLowerCase().trim();
             
-            // Include common abbreviations
             return ['true', 't', 'yes', 'y', '1', 'on', 'enabled', 'enable'].includes(normalized);
+        },
+        
+        levenshteinDistance(str1, str2) {
+            if (!str1) return str2.length;
+            if (!str2) return str1.length;
+            
+            const matrix = [];
+            
+            for (let i = 0; i <= str2.length; i++) {
+                matrix[i] = [i];
+            }
+            
+            for (let j = 0; j <= str1.length; j++) {
+                matrix[0][j] = j;
+            }
+            
+            for (let i = 1; i <= str2.length; i++) {
+                for (let j = 1; j <= str1.length; j++) {
+                    if (str2.charAt(i - 1) === str1.charAt(j - 1)) {
+                        matrix[i][j] = matrix[i - 1][j - 1];
+                    } else {
+                        matrix[i][j] = Math.min(
+                            matrix[i - 1][j - 1] + 1,
+                            matrix[i][j - 1] + 1,
+                            matrix[i - 1][j] + 1
+                        );
+                    }
+                }
+            }
+            
+            return matrix[str2.length][str1.length];
+        },
+        
+        similarity(str1, str2) {
+            const maxLen = Math.max(str1.length, str2.length);
+            if (maxLen === 0) return 1.0;
+            
+            const distance = this.levenshteinDistance(str1, str2);
+            return 1.0 - (distance / maxLen);
+        },
+        
+        fuzzyMatch(str, pattern, threshold = 0.8) {
+            return this.similarity(str.toLowerCase(), pattern.toLowerCase()) >= threshold;
+        },
+        
+        findBestMatch(target, candidates) {
+            if (!candidates || candidates.length === 0) return null;
+            
+            let bestMatch = null;
+            let bestScore = 0;
+            
+            for (const candidate of candidates) {
+                const score = this.similarity(target, candidate);
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = candidate;
+                }
+            }
+            
+            return bestMatch ? { match: bestMatch, score: bestScore } : null;
+        },
+        
+        wordWrap(text, maxWidth, indent = '') {
+            const words = text.split(/\s+/);
+            const lines = [];
+            let currentLine = indent;
+            
+            for (const word of words) {
+                if (currentLine.length + word.length + 1 > maxWidth && currentLine.length > indent.length) {
+                    lines.push(currentLine.trim());
+                    currentLine = indent + word;
+                } else {
+                    currentLine += (currentLine.length > indent.length ? ' ' : '') + word;
+                }
+            }
+            
+            if (currentLine.length > indent.length) {
+                lines.push(currentLine.trim());
+            }
+            
+            return lines.join('\n');
+        },
+        
+        tokenize(text) {
+            return text.match(/\w+|[^\w\s]/g) || [];
+        },
+        
+        template(str, data) {
+            return str.replace(/\${(\w+)}/g, (match, key) => {
+                return data.hasOwnProperty(key) ? String(data[key]) : match;
+            });
         }
     };
     
@@ -916,6 +2364,122 @@ const Utilities = (function() {
             const avg = this.average(numbers);
             const squareDiffs = numbers.map(value => Math.pow(value - avg, 2));
             return Math.sqrt(this.average(squareDiffs));
+        },
+        
+        roll(notation, seed = null) {
+            const match = notation.match(/^(\d+)d(\d+)([+-]\d+)?$/i);
+            if (!match) {
+                throw new Error(`Invalid dice notation: ${notation}`);
+            }
+            
+            const count = parseInt(match[1]);
+            const sides = parseInt(match[2]);
+            const modifier = match[3] ? parseInt(match[3]) : 0;
+            
+            const rolls = [];
+            let seedCounter = seed;
+            
+            for (let i = 0; i < count; i++) {
+                const roll = seed !== null ? 
+                    Math.floor(this.seededRandom(seedCounter + '_' + i, 1, sides + 1)) :
+                    Math.floor(Math.random() * sides) + 1;
+                rolls.push(roll);
+            }
+            
+            const total = rolls.reduce((sum, roll) => sum + roll, 0) + modifier;
+            
+            return {
+                total: total,
+                rolls: rolls,
+                notation: notation,
+                modifier: modifier
+            };
+        },
+        
+        bestOf(values, count = 1) {
+            return [...values].sort((a, b) => b - a)[count - 1] || values[0];
+        },
+        
+        worstOf(values, count = 1) {
+            return [...values].sort((a, b) => a - b)[count - 1] || values[0];
+        },
+        
+        averageOf(values, roundToInt = true) {
+            if (!values || values.length === 0) return 0;
+            const sum = values.reduce((a, b) => a + b, 0);
+            const avg = sum / values.length;
+            return roundToInt ? Math.round(avg) : avg;
+        },
+        
+        distance(x1, y1, x2, y2) {
+            const dx = x2 - x1;
+            const dy = y2 - y1;
+            return Math.sqrt(dx * dx + dy * dy);
+        },
+        
+        manhattanDistance(x1, y1, x2, y2) {
+            return Math.abs(x2 - x1) + Math.abs(y2 - y1);
+        },
+        
+        normalize(value, min, max) {
+            if (max === min) return 0;
+            return (value - min) / (max - min);
+        },
+        
+        denormalize(value, min, max) {
+            return min + value * (max - min);
+        },
+        
+        inRange(value, range) {
+            return value >= range[0] && value <= range[1];
+        },
+        
+        modulo(n, m) {
+            return ((n % m) + m) % m;
+        },
+        
+        factorial(n) {
+            if (n < 0) return NaN;
+            if (n > 170) return Infinity;
+            if (n === 0 || n === 1) return 1;
+            
+            let result = 1;
+            for (let i = 2; i <= n; i++) {
+                result *= i;
+            }
+            return result;
+        },
+        
+        combinations(n, k) {
+            if (k > n) return 0;
+            if (k === 0 || k === n) return 1;
+            
+            k = Math.min(k, n - k);
+            
+            let result = 1;
+            for (let i = 0; i < k; i++) {
+                result *= (n - i);
+                result /= (i + 1);
+            }
+            
+            return Math.round(result);
+        },
+        
+        range(start, end, step = 1) {
+            const result = [];
+            if (step === 0) return result;
+            
+            if (step > 0) {
+                for (let i = start; i < end; i += step) {
+                    result.push(i);
+                }
+            } else {
+                for (let i = start; i > end; i += step) {
+                    result.push(i);
+                }
+            }
+            
+            return result;
         }
     };
     
@@ -952,13 +2516,8 @@ const Utilities = (function() {
         },
         
         flatten(array, depth = 1) {
-            if (depth <= 0) return array;
-            return array.reduce((flat, item) => {
-                if (Array.isArray(item)) {
-                    return flat.concat(this.flatten(item, depth - 1));
-                }
-                return flat.concat(item);
-            }, []);
+            // Use native flat() which is available in ES2019+
+            return array.flat(depth);
         },
         
         sortBy(array, ...keyFns) {
@@ -997,6 +2556,125 @@ const Utilities = (function() {
                 clone[key] = this.deepClone(value);
                 return clone;
             }, {});
+        },
+        
+        deepEquals(a, b) {
+            if (a === b) return true;
+            
+            if (a === null || b === null) return false;
+            if (typeof a !== typeof b) return false;
+            
+            if (typeof a !== 'object') return a === b;
+            
+            if (Array.isArray(a)) {
+                if (!Array.isArray(b) || a.length !== b.length) return false;
+                return a.every((item, i) => this.deepEquals(item, b[i]));
+            }
+            
+            const keysA = Object.keys(a);
+            const keysB = Object.keys(b);
+            
+            if (keysA.length !== keysB.length) return false;
+            
+            return keysA.every(key => this.deepEquals(a[key], b[key]));
+        },
+        
+        shuffle(array, seed = null) {
+            const arr = [...array];
+            const rng = seed !== null ? 
+                () => MathUtils.seededRandom(seed + arr.length) : 
+                () => Math.random();
+            
+            for (let i = arr.length - 1; i > 0; i--) {
+                const j = Math.floor(rng() * (i + 1));
+                [arr[i], arr[j]] = [arr[j], arr[i]];
+            }
+            
+            return arr;
+        },
+        
+        sample(array, count, seed = null) {
+            if (count >= array.length) return this.shuffle(array, seed);
+            
+            const shuffled = this.shuffle(array, seed);
+            return shuffled.slice(0, count);
+        },
+        
+        weightedRandom(items, seed = null) {
+            if (!items || items.length === 0) return null;
+            
+            const totalWeight = items.reduce((sum, item) => sum + (item.weight || 0), 0);
+            if (totalWeight <= 0) return null;
+            
+            const random = seed !== null ? 
+                MathUtils.seededRandom(seed, 0, totalWeight) : 
+                Math.random() * totalWeight;
+            
+            let cumulative = 0;
+            for (const item of items) {
+                cumulative += item.weight || 0;
+                if (random < cumulative) {
+                    return item.value;
+                }
+            }
+            
+            return items[items.length - 1].value;
+        },
+        
+        partition(array, predicate) {
+            const pass = [];
+            const fail = [];
+            
+            for (const item of array) {
+                if (predicate(item)) {
+                    pass.push(item);
+                } else {
+                    fail.push(item);
+                }
+            }
+            
+            return [pass, fail];
+        },
+        
+        zip(...arrays) {
+            const minLength = Math.min(...arrays.map(arr => arr.length));
+            const result = [];
+            
+            for (let i = 0; i < minLength; i++) {
+                result.push(arrays.map(arr => arr[i]));
+            }
+            
+            return result;
+        },
+        
+        frequency(array) {
+            return array.reduce((freq, item) => {
+                freq[item] = (freq[item] || 0) + 1;
+                return freq;
+            }, {});
+        },
+        
+        difference(array1, array2) {
+            const set2 = new Set(array2);
+            return array1.filter(item => !set2.has(item));
+        },
+        
+        intersection(array1, array2) {
+            const set2 = new Set(array2);
+            return array1.filter(item => set2.has(item));
+        },
+        
+        rotate(array, positions) {
+            if (array.length === 0) return [];
+            
+            const n = positions % array.length;
+            if (n === 0) return [...array];
+            
+            if (n > 0) {
+                return [...array.slice(-n), ...array.slice(0, -n)];
+            } else {
+                return [...array.slice(-n), ...array.slice(0, -n)];
+            }
         }
     };
     
@@ -1180,6 +2858,244 @@ const Utilities = (function() {
     };
     
     // =====================================
+    // COMMAND UTILITIES
+    // =====================================
+    const CommandUtils = {
+        parseCommand(text) {
+            const match = text.match(/^\/(\w+)(?:\s+(.+))?$/);
+            if (!match) return null;
+            
+            const command = match[1].toLowerCase();
+            const remainder = match[2] || '';
+            
+            const args = [];
+            const flags = {};
+            
+            // Parse tokens, handling quoted strings
+            const tokens = remainder.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
+            
+            for (const token of tokens) {
+                if (token.startsWith('--')) {
+                    const flagMatch = token.match(/^--([^=]+)(?:=(.+))?$/);
+                    if (flagMatch) {
+                        const flagName = flagMatch[1];
+                        const flagValue = flagMatch[2] || true;
+                        
+                        // Parse flag values
+                        if (typeof flagValue === 'string') {
+                            if (flagValue === 'true') flags[flagName] = true;
+                            else if (flagValue === 'false') flags[flagName] = false;
+                            else if (/^\d+$/.test(flagValue)) flags[flagName] = parseInt(flagValue);
+                            else if (/^\d*\.\d+$/.test(flagValue)) flags[flagName] = parseFloat(flagValue);
+                            else flags[flagName] = flagValue;
+                        } else {
+                            flags[flagName] = flagValue;
+                        }
+                    }
+                } else {
+                    // Remove quotes from arguments
+                    args.push(token.replace(/^"(.*)"$/, '$1'));
+                }
+            }
+            
+            return { command, args, flags };
+        },
+        
+        parseAlias(command, aliases) {
+            return aliases[command] || command;
+        },
+        
+        validateCommand(command, schema) {
+            const errors = [];
+            
+            if (schema.minArgs !== undefined && command.args.length < schema.minArgs) {
+                errors.push(`Requires at least ${schema.minArgs} argument(s)`);
+            }
+            
+            if (schema.maxArgs !== undefined && command.args.length > schema.maxArgs) {
+                errors.push(`Accepts at most ${schema.maxArgs} argument(s)`);
+            }
+            
+            if (schema.requiredFlags) {
+                for (const flag of schema.requiredFlags) {
+                    if (!(flag in command.flags)) {
+                        errors.push(`Missing required flag: --${flag}`);
+                    }
+                }
+            }
+            
+            if (schema.allowedFlags) {
+                for (const flag in command.flags) {
+                    if (!schema.allowedFlags.includes(flag)) {
+                        errors.push(`Unknown flag: --${flag}`);
+                    }
+                }
+            }
+            
+            return {
+                valid: errors.length === 0,
+                errors: errors
+            };
+        }
+    };
+    
+    // =====================================
+    // PARSING UTILITIES
+    // =====================================
+    const ParsingUtils = {
+        parseKeyValuePairs(text, delimiter = '=') {
+            const pairs = {};
+            const tokens = text.match(/\S+/g) || [];
+            
+            for (const token of tokens) {
+                const parts = token.split(delimiter);
+                if (parts.length === 2) {
+                    const key = parts[0];
+                    let value = parts[1];
+                    
+                    // Auto-convert types
+                    if (value === 'true') value = true;
+                    else if (value === 'false') value = false;
+                    else if (/^\d+$/.test(value)) value = parseInt(value);
+                    else if (/^\d*\.\d+$/.test(value)) value = parseFloat(value);
+                    
+                    pairs[key] = value;
+                }
+            }
+            
+            return pairs;
+        },
+        
+        parseRange(text) {
+            // Handle various range formats
+            const patterns = [
+                /^(\d+)\s*-\s*(\d+)$/,        // 10-20
+                /^(\d+)\s*to\s*(\d+)$/i,      // 10 to 20
+                /^(\d+)\s*\.\.\.?\s*(\d+)$/,  // 10..20 or 10...20
+            ];
+            
+            for (const pattern of patterns) {
+                const match = text.match(pattern);
+                if (match) {
+                    return {
+                        min: parseInt(match[1]),
+                        max: parseInt(match[2])
+                    };
+                }
+            }
+            
+            return null;
+        },
+        
+        parseJSON(text, fallback = null) {
+            try {
+                return JSON.parse(text);
+            } catch (error) {
+                return fallback;
+            }
+        }
+    };
+    
+    // =====================================
+    // TURN TRACKING UTILITIES
+    // =====================================
+    const TurnUtils = {
+        marks: new Map(),
+        
+        getCurrentTurn() {
+            return typeof info !== 'undefined' && info.actionCount || 0;
+        },
+        
+        since(turn) {
+            return this.getCurrentTurn() - turn;
+        },
+        
+        mark(key) {
+            const turn = this.getCurrentTurn();
+            this.marks.set(key, turn);
+            return turn;
+        },
+        
+        getMark(key) {
+            return this.marks.get(key) || null;
+        },
+        
+        elapsed(key) {
+            const marked = this.marks.get(key);
+            return marked !== undefined ? this.since(marked) : Infinity;
+        },
+        
+        clear(key = null) {
+            if (key === null) {
+                this.marks.clear();
+            } else {
+                this.marks.delete(key);
+            }
+        }
+    };
+    
+    // =====================================
+    // FUNCTIONAL UTILITIES
+    // =====================================
+    const FunctionalUtils = {
+        compose(...fns) {
+            return (arg) => fns.reduceRight((result, fn) => fn(result), arg);
+        },
+        
+        pipe(...fns) {
+            return (arg) => fns.reduce((result, fn) => fn(result), arg);
+        },
+        
+        memoize(fn, keyFn = null) {
+            const cache = new Map();
+            
+            return function(...args) {
+                const key = keyFn ? keyFn(...args) : JSON.stringify(args);
+                
+                if (cache.has(key)) {
+                    return cache.get(key);
+                }
+                
+                const result = fn.apply(this, args);
+                cache.set(key, result);
+                return result;
+            };
+        },
+        
+        curry(fn) {
+            const arity = fn.length;
+            
+            return function curried(...args) {
+                if (args.length >= arity) {
+                    return fn.apply(this, args);
+                }
+                return function(...nextArgs) {
+                    return curried.apply(this, args.concat(nextArgs));
+                };
+            };
+        },
+        
+        partial(fn, ...partialArgs) {
+            return function(...args) {
+                return fn.apply(this, partialArgs.concat(args));
+            };
+        },
+        
+        once(fn) {
+            let called = false;
+            let result;
+            
+            return function(...args) {
+                if (!called) {
+                    called = true;
+                    result = fn.apply(this, args);
+                }
+                return result;
+            };
+        }
+    };
+    
+    // =====================================
     // CACHE UTILITIES
     // =====================================
     class TurnCache {
@@ -1261,118 +3177,115 @@ const Utilities = (function() {
                 throw new Error('[StoryCard] get requires a string title');
             }
             
-            return this.find(c => c && c.title === title);
-        },
-        
-        find(predicate, getAll = false) {
-            if (typeof predicate !== 'function') {
-                throw new Error('[StoryCard] find requires a function as first parameter');
-            }
-            if (typeof getAll !== 'boolean') {
-                throw new Error('[StoryCard] find requires a boolean as second parameter');
+            // Check cache first
+            const cached = turnCache.get('storyCards', title);
+            if (cached !== null) {
+                // Verify it's still valid
+                if (storyCards.includes(cached) && cached.title === title) {
+                    return cached;
+                }
+                // Invalid - just clear this one entry
+                turnCache.delete('storyCards', title);
             }
             
-            try {
-                if (typeof storyCards === 'undefined' || !Array.isArray(storyCards)) {
-                    // console.log('[StoryCard] Warning: storyCards array not accessible');
-                    return getAll ? [] : null;
+            // Linear search with opportunistic caching
+            for (const card of storyCards) {
+                if (!card) continue;
+                
+                // Cache every card we see during iteration!
+                const existingCache = turnCache.get('storyCards', card.title);
+                if (existingCache === null) {
+                    turnCache.set('storyCards', card.title, card);
                 }
                 
-                const matches = [];
-                
-                for (const card of storyCards) {
-                    if (predicate(card)) {
-                        if (!getAll) {
-                            return card;
-                        }
-                        matches.push(card);
-                    }
+                // Check if this is what we're looking for
+                if (card.title === title) {
+                    return card;
                 }
+            }
+            
+            return null;
+        },
+        
+        find(query, getAll = false) {
+            // Backwards compatibility - if it's a function, use it directly
+            if (typeof query === 'function') {
+                return this._findByPredicate(query, getAll);
+            }
+            
+            const predicate = ExpressionParser.parseObjectQuery(query, 'card');
+            if (!predicate) {
+                const titlePredicate = (card) => card && card.title === query;
+                return this._findByPredicateWithCaching(titlePredicate, getAll);
+            }
+            
+            return this._findByPredicate(predicate, getAll);
+        },
+        
+        remove(query, removeAll = false) {
+            // If it's a function, use it directly
+            if (typeof query === 'function') {
+                return this._removeByPredicate(query, removeAll);
+            }
+            
+            // Handle object with title (backwards compatibility)
+            if (typeof query === 'object' && query !== null && query.title) {
+                const titlePredicate = (card) => card && card.title === query.title;
+                return this._removeByPredicate(titlePredicate, removeAll);
+            }
+            
+            // Parse ALL string queries through the expression parser
+            const predicate = ExpressionParser.parseObjectQuery(query, 'card');
+            if (!predicate) {
+                // Fallback: treat as simple title match
+                const titlePredicate = (card) => card && card.title === query;
+                return this._removeByPredicate(titlePredicate, removeAll);
+            }
+            
+            return this._removeByPredicate(predicate, removeAll);
+        },
+        
+        // Internal predicate-based find
+        _findByPredicate(predicate, getAll) {
+          try {
+              if (typeof storyCards === 'undefined' || !Array.isArray(storyCards)) {
+                  return getAll ? [] : null;
+              }
+              
+              const matches = [];
+              
+              for (const card of storyCards) {
+                  // Opportunistic caching while we iterate
+                  if (card && card.title) {
+                      const existingCache = turnCache.get('storyCards', card.title);
+                      if (existingCache === null) {
+                          turnCache.set('storyCards', card.title, card);
+                      }
+                  }
+                  
+                  if (predicate(card)) {
+                      if (!getAll) {
+                          return card;
+                      }
+                      matches.push(card);
+                  }
+              }
                 
                 return getAll ? matches : null;
             } catch (error) {
-                // console.log(`[StoryCard] Error in find: ${error.message}`);
+                console.log('[StoryCard] Error in find:', error.message);
                 return getAll ? [] : null;
             }
         },
         
-        add(cardData, entry = '', type = 'character', keys = undefined, description = '', insertionIndex = 0) {
-            try {
-                if (typeof cardData === 'object' && cardData !== null) {
-                    const title = cardData.title || '';
-                    const cardEntry = cardData.entry || '';
-                    const cardType = cardData.type || 'character';
-                    const cardKeys = cardData.keys || title;
-                    const cardDesc = cardData.description || '';
-                    const cardIndex = cardData.insertionIndex || 0;
-                    
-                    return this.buildCard(title, cardEntry, cardType, cardKeys, cardDesc, cardIndex);
-                }
-                
-                if (typeof cardData === 'string') {
-                    const title = cardData;
-                    keys = keys || title;
-                    return this.buildCard(title, entry, type, keys, description, insertionIndex);
-                }
-                
-                // console.log('[StoryCard] Error: Invalid parameters for add');
-                return null;
-            } catch (error) {
-                // console.log(`[StoryCard] Error in add: ${error.message}`);
-                return null;
-            }
-        },
-        
-        update(title, updates) {
-            try {
-                const card = this.get(title);
-                if (!card) {
-                    // console.log(`[StoryCard] Error: Card '${title}' not found`);
-                    return false;
-                }
-                
-                if (updates.entry !== undefined) card.entry = updates.entry;
-                if (updates.keys !== undefined) card.keys = updates.keys;
-                if (updates.description !== undefined) card.description = updates.description;
-                if (updates.type !== undefined) card.type = updates.type;
-                
-                turnCache.delete('storyCards', title);
-                
-                return true;
-            } catch (error) {
-                // console.log(`[StoryCard] Error updating card '${title}': ${error.message}`);
-                return false;
-            }
-        },
-        
-        remove(predicate, removeAll = false) {
-            if (typeof predicate === 'string') {
-                const title = predicate;
-                predicate = card => card && card.title === title;
-                removeAll = false;
-            }
-            
-            if (typeof predicate === 'object' && predicate !== null && predicate.title) {
-                const title = predicate.title;
-                predicate = card => card && card.title === title;
-                removeAll = false;
-            }
-            
-            if (typeof predicate !== 'function') {
-                throw new Error('[StoryCard] remove requires function, object, or string');
-            }
-            if (typeof removeAll !== 'boolean') {
-                throw new Error('[StoryCard] remove requires boolean as second parameter');
-            }
-            
+        // Internal predicate-based remove
+        _removeByPredicate(predicate, removeAll) {
             try {
                 if (typeof removeStoryCard !== 'function') {
-                    // console.log('[StoryCard] Error: removeStoryCard is not available');
                     return removeAll ? 0 : false;
                 }
                 
                 if (typeof storyCards === 'undefined' || !Array.isArray(storyCards)) {
-                    // console.log('[StoryCard] Error: storyCards array not available');
                     return removeAll ? 0 : false;
                 }
                 
@@ -1397,8 +3310,55 @@ const Utilities = (function() {
                     return removed;
                 }
             } catch (error) {
-                // console.log(`[StoryCard] Error in remove: ${error.message}`);
+                console.log('[StoryCard] Error in remove:', error.message);
                 return removeAll ? 0 : false;
+            }
+        },
+        
+        add(cardData, entry = '', type = 'character', keys = undefined, description = '', insertionIndex = 0) {
+            try {
+                if (typeof cardData === 'object' && cardData !== null) {
+                    const title = cardData.title || '';
+                    const cardEntry = cardData.entry || '';
+                    const cardType = cardData.type || 'character';
+                    const cardKeys = cardData.keys || title;
+                    const cardDesc = cardData.description || '';
+                    const cardIndex = cardData.insertionIndex || 0;
+                    
+                    return this.buildCard(title, cardEntry, cardType, cardKeys, cardDesc, cardIndex);
+                }
+                
+                if (typeof cardData === 'string') {
+                    const title = cardData;
+                    keys = keys || title;
+                    return this.buildCard(title, entry, type, keys, description, insertionIndex);
+                }
+                
+                return null;
+            } catch (error) {
+                console.log('[StoryCard] Error in add:', error.message);
+                return null;
+            }
+        },
+        
+        update(title, updates) {
+            try {
+                const card = this.get(title);
+                if (!card) {
+                    return false;
+                }
+                
+                if (updates.entry !== undefined) card.entry = updates.entry;
+                if (updates.keys !== undefined) card.keys = updates.keys;
+                if (updates.description !== undefined) card.description = updates.description;
+                if (updates.type !== undefined) card.type = updates.type;
+                
+                turnCache.delete('storyCards', title);
+                
+                return true;
+            } catch (error) {
+                console.log('[StoryCard] Error updating card:', error.message);
+                return false;
             }
         },
         
@@ -1585,6 +3545,7 @@ const Utilities = (function() {
     // Freeze the API to prevent modification
     return Object.freeze({
         // Core APIs
+        expression: ExpressionParser,
         plainText: PlainTextParser,
         string: StringUtils,
         math: MathUtils,
@@ -1592,6 +3553,10 @@ const Utilities = (function() {
         validation: ValidationUtils,
         format: FormatUtils,
         entity: EntityUtils,
+        command: CommandUtils,
+        parsing: ParsingUtils,
+        turn: TurnUtils,
+        functional: FunctionalUtils,
         storyCard: StoryCardOps,
         history: HistoryUtils,
         
@@ -1607,7 +3572,8 @@ const Utilities = (function() {
         clearAll() {
             this.regex.clear();
             this.cache.clear();
-            // console.log('[Utilities] All caches cleared');
+            this.turn.clear();
+            ExpressionParser.clearCache();
         }
     });
 })();
