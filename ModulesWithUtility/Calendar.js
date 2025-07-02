@@ -438,10 +438,10 @@ const Utilities = (function() {
      *   Formats number with thousands separators
      *   Example: Utilities.format.formatNumber(1234567) // '1,234,567'
      *   
-     * formatCurrency(amount: number, symbol?: string) -> string
-     *   Formats as currency (default: 'col')
-     *   Example: Utilities.format.formatCurrency(1000) // '1,000 col'
-     *   Example: Utilities.format.formatCurrency(50, '$') // '50 $'
+     * formatCurrency(amount: number, symbol?: string, position?: string) -> string
+     *   Formats number as currency with symbol (default: '$' prepended)
+     *   Example: Utilities.format.formatCurrency(1000) // '$ 1,000'
+     *   Example: Utilities.format.formatCurrency(50, '€', 'append') // '50 €'
      *   
      * formatPercentage(value: number, decimals?: number) -> string
      *   Formats decimal as percentage
@@ -2869,8 +2869,16 @@ const Utilities = (function() {
             return num.toFixed(decimals).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
         },
         
-        formatCurrency(amount, symbol = 'col') {
-            return `${this.formatNumber(amount)} ${symbol}`;
+        formatCurrency(amount, symbol = '$', position = 'prepend', includeSpace = true) {
+            const formattedAmount = this.formatNumber(amount);
+            const space = includeSpace ? ' ' : '';
+            
+            if (position === 'append' || position === 'after') {
+                return `${formattedAmount}${space}${symbol}`;
+            } else {
+                // Default to prepend
+                return `${symbol}${space}${formattedAmount}`;
+            }
         },
         
         formatPercentage(value, decimals = 0) {
@@ -3696,7 +3704,6 @@ const Utilities = (function() {
         }
     });
 })();
-
 
 function Calendar(hook, text) {
     'use strict';
