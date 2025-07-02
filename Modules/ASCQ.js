@@ -434,36 +434,30 @@ function ASCQ(text) {
             `## Overview\n`+
             `ASCQ triggers story cards based on query expressions.\n`+
             `Prefix triggers with $Q: to create a query trigger.\n`+
+            `Can place complex triggers in description if encapsulated like {$Q: Expression}\n` +
             `\n`+
             `### Text Pattern Functions\n`+
             `near("word1", "word2", distance) - Words within N characters\n`+
             `Example: $Q:near("sword", "broken", 50)\n`+
             `\n`+
             `sequence("word1", "word2", ...) or seq(...) - Words in order\n`+
-            `Example: $Q:seq("opened", "book")\n`+
+            `Example: $Q:seq("opened", "gate")\n`+
             `\n`+
             `count("word") >= number - Word frequency\n`+
-            `Example: $Q:count("wolf") > 2\n`+
-            `\n`+
-            `### Fuzzy Matching\n`+
-            `fuzzy("word") - Fuzzy match any word in text\n`+
-            `fuzzy("word", 0.7) - With custom threshold\n`+
-            `fuzzyFind("word") - Find best matching word\n`+
-            `fuzzyAny(["word1", "word2"]) - Match any word\n`+
+            `Example: $Q:count("Beetlejuice") >= 3\n`+
             `\n`+
             `### State/Info Access\n`+
             `Access state, info, and other scripting properties:\n`+
             `info.actionCount - Turn counter\n`+
             `state.propertyName - State properties\n`+
             `state.array.includes("value") - Array methods\n`+
-            `state.nested.property - Nested properties\n`+
             `\n`+
             `Examples:\n`+
             `$Q:info.actionCount > 50\n`+
             `$Q:state.level >= 10 && state.class == "warrior"\n`+
             `$Q:state.inventory.includes("sword")\n`+
             `$Q:!state.questCompleted.includes("tutorial")\n`+
-            `$Q:Calendar.getDayOfWeek() === "Sunday"`
+            `$Q:Calendar.getDayOfWeek() === "Sunday"\n` +
             `\n`+
             `### Boolean Functions\n`+
             `any("word1", "word2") - At least one word present\n`+
@@ -478,15 +472,14 @@ function ASCQ(text) {
             `\n`+
             `### RegEx Support\n`+
             `~pattern~flags - Regular expression matching\n`+
-            `Example: $Q:~dragon\\s+slain~i\n`+
+            `Example: $Q:~(crystal|gem|jewel)\\s+(glows?|shines?|pulses?)~i\n`+
             `\n`+
             `### Complex Examples\n`+
-            `$Q:(info.actionCount > 100) && near("dragon", "defeated", 50)\n`+
+            `$Q:(info.actionCount > 100) && near("dragon", "slain", 50)\n`+
             `$Q:state.hp < 20 || state.status.includes("poisoned")\n`+
             `$Q:all("quest", "complete") && state.level >= 5\n`+
-            `$Q:seq("entered", "castle") && !state.bannedAreas.includes("castle")\n`+
-            `$Q:fuzzy("swrod") || fuzzy("shiled")\n`+
-            `$Q:~boss.*defeated~i && state.bossesKilled < 5\n`+
+            `$Q:fuzzy("probdont") || fuzzy("usethis")\n`+
+            `$Q:(info.actionCount > 50 && near("portal", "opened", 75)) || state.keyFragments >= 3\n`+
             `\n`+
             `## Priority System\n`+
             `Add $priority: N to card description (default: 0).\n`+

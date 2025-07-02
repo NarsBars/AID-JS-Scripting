@@ -4145,12 +4145,6 @@ function ASCQ(text) {
             `count("word") >= number - Word frequency\n`+
             `Example: $Q:count("Beetlejuice") >= 3\n`+
             `\n`+
-            `### Fuzzy Matching\n`+
-            `fuzzy("word") - Fuzzy match any word in text\n`+
-            `fuzzy("word", 0.7) - With custom threshold\n`+
-            `fuzzyFind("word") - Find best matching word\n`+
-            `fuzzyAny(["word1", "word2"]) - Match any word\n`+
-            `// Use this sparingly \n\n`+
             `### State/Info Access\n`+
             `Access state, info, and other scripting properties:\n`+
             `info.actionCount - Turn counter\n`+
@@ -4183,7 +4177,8 @@ function ASCQ(text) {
             `$Q:(info.actionCount > 100) && near("dragon", "slain", 50)\n`+
             `$Q:state.hp < 20 || state.status.includes("poisoned")\n`+
             `$Q:all("quest", "complete") && state.level >= 5\n`+
-            `$Q:(info.actionCount > 50) && near("portal", "opened", 75) && state.keyFragments >= 3\n`+
+            `$Q:fuzzy("probdont") || fuzzy("usethis")\n`+
+            `$Q:(info.actionCount > 50 && near("portal", "opened", 75)) || state.keyFragments >= 3\n`+
             `\n`+
             `## Priority System\n`+
             `Add $priority: N to card description (default: 0).\n`+
