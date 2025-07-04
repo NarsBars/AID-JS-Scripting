@@ -1,16 +1,29 @@
 function Calendar(hook, text) {
     'use strict';
     
+    const debug = false; 
+    
     // Usage in Scripting Sandbox:
     // Input Modifier: 
     //   text = Calendar("input", text);
+    //
     // Context Modifier: 
     //   Calendar("context");
-    //
+    //   Calendar();
+
+    if (typeof hook === 'undefined' || hook === null) {
+        hook = 'context';
+    }
+
     // Configuration Cards:
     //   [CALENDAR] Time Configuration - Main time system settings
+    //     Note: Leap Year Adjustments must be in a separate ## Leap Year Adjustments section
     //   [CALENDAR] Event Days - Holiday and event definitions
-    //   [CALENDAR] Event Days 2, 3... - Additional event cards. Probably unnecessary bc I extended to description but oh well.
+    //   [CALENDAR] Event Days 2, 3... - Additional event cards
+    //
+    // State Card displays:
+    //   Today's Events: All events scheduled for today
+    //   Active Events: Only events currently in their time window
     //
     // API Methods:
     // Time Methods:
@@ -33,41 +46,35 @@ function Calendar(hook, text) {
     //   Calendar.getYearProgress() - Returns year completion (0.0-1.0)
     //
     // Event Methods:
-    //   Calendar.getTodayEvents() - Returns array of today's events
+    //   Calendar.getTodayEvents() - Returns array of today's events with time info
+    //   Calendar.getActiveTimeRangeEvents() - Returns only currently active time-range events
     //   Calendar.getUpcomingEvents(days) - Returns events in next N days
     //   Calendar.getAllEvents() - Returns all configured events
     //   Calendar.isEventDay() - Returns true if today has events
     //   Calendar.getMonthWeekdays(offset) - Returns weekday map for a month
-    //     Returns: {month: "November", year: 2023, weekdays: {Monday: [6,13,20,27], ...}}
     //   Calendar.clearEventCache() - Force reload of event configuration
+    //   Calendar.clearConfigCache() - Force reload of time configuration  
+    //   Calendar.clearAllCaches() - Clear all cached data
     //
     // Core Methods:
     //   Calendar.getState() - Returns full time state
     //   Calendar.getConfig() - Returns configuration
     //   Calendar.events - Array of time events this turn
-    //     Event types: 'dayChanged', 'seasonChanged', 'eventDay', 'timeReversed', 'timeOfDayChanged'
-    //     Event data includes:
-    //       - dayChanged: {previousDay, currentDay, state}
-    //       - seasonChanged: {previousSeason, currentSeason, state}
-    //       - eventDay: {events, date, state}
-    //       - timeReversed: {state, reversed: true}
-    //       - timeOfDayChanged: {previousPeriod, currentPeriod, state}
-    //     State object contains:
-    //       - day: Current day number (can be negative, 0, 200, etc.)
-    //       - progress: Actions completed in current day (0 to actionsPerDay-1)
-    //       - lastProcessedAction: Last action count processed
+    //     Event types: 'dayChanged', 'seasonChanged', 'eventDay', 'timeReversed', 'timeOfDayChanged',
+    //                  'timeRangeEventStarted', 'timeRangeEventEnding', 'timeRangeEventEnded'
     //
     // Time Manipulation Methods:
-    //   Calendar.advanceTime(timeSpec) - Skip forward/backward in time (e.g., "3d", "-2h"), returns true on success
-    //   Calendar.setTime(hour, minute) - Set time on current day, returns true on success
-    //   Calendar.setDay(day) - Jump to specific day number, returns true on success
-    //   Calendar.setActionsPerDay(number) - Update actions per day config, returns true on success
-    //   Calendar.setHoursPerDay(number) - Update hours per day config, returns true on success
+    //   Calendar.advanceTime(timeSpec) - Skip forward/backward in time (e.g., "3d", "-2h")
+    //   Calendar.setTime(hour, minute) - Set time on current day
+    //   Calendar.setDay(day) - Jump to specific day number
+    //   Calendar.setActionsPerDay(number) - Update actions per day config
+    //   Calendar.setHoursPerDay(number) - Update hours per day config
     //
-    // Time State card is the single source of truth
-    // Day number in state can be any value (negative, 0, 200, etc.)
-    // Progress in state determines time of day (0 to actionsPerDay-1)
-    // All configuration must come from [CALENDAR] cards
+    // Time System Notes:
+    // - Day number in state can be any value (negative, 0, 200, etc.)
+    // - Progress in state determines time of day (0 to actionsPerDay-1)
+    // - All configuration must come from [CALENDAR] cards
+    // - Leap Year Adjustments must be in a separate section from Leap Year settings
     //
     // Example Usage:
     //   const time = Calendar.getCurrentTime();        // "14:30"
@@ -95,39 +102,49 @@ function Calendar(hook, text) {
     //   Calendar.setDay(-30);                           // Jump to 30 days before start
     //   Calendar.setActionsPerDay(300);                 // Change to 300 actions per day
     //   Calendar.setHoursPerDay(20);                    // Change to 20-hour days
-    //
-    // Event Configuration Examples:
-    //   - Fixed Annual: "Christmas: 12/25"
-    //   - Relative Annual: "Thanksgiving: 4th Thursday of November"
-    //   - Periodic: "Olympics: 7/1/2024 every 4 years"
-    //   - One-time: "Solar Eclipse: 4/8/2024 once"
-    //   - Relative Periodic: "Mages Meeting: 1st Monday of January 2024 every 3 years"
-    
-    // Module constants
-    const debug = false;
-    const MODULE_NAME = 'Time';
+
+    const MODULE_NAME = 'Calendar';
     const CONFIG_CARD = '[CALENDAR] Time Configuration';
     const STATE_CARD = '[CALENDAR] Time State';
     const EVENT_CARD_PREFIX = '[CALENDAR] Event Days';
     
-    // Module-level cache for events (valid for this turn only)
+    // Module-level cache for events, config, and state (valid for this turn only)
     let eventCache = null;
+    let configCache = null;
+    let stateCache = null;
     
     // Configuration Management
     function loadConfiguration() {
+        // Return cached config if available
+        if (configCache !== null) {
+            return configCache;
+        }
+        
         const configCard = Utilities.storyCard.get(CONFIG_CARD);
         if (!configCard) {
-            if (debug) console.log('[Time] No configuration found, creating default');
+            if (debug) console.log(`[${MODULE_NAME}] No configuration found, creating default`);
             createDefaultConfiguration();
             
-            // Also create default event days card
+            // Also create default event days card if needed
             if (!Utilities.storyCard.exists(EVENT_CARD_PREFIX)) {
                 createDefaultEventDays();
             }
             
-            return loadConfiguration();
+            // Try to load again after creation
+            const newConfigCard = Utilities.storyCard.get(CONFIG_CARD);
+            if (!newConfigCard) {
+                if (debug) console.log(`[${MODULE_NAME}] ERROR: Failed to create configuration card`);
+                return null;
+            }
+            configCache = parseConfigurationCard(newConfigCard);
+            return configCache;
         }
         
+        configCache = parseConfigurationCard(configCard);
+        return configCache;
+    }
+    
+    function parseConfigurationCard(configCard) {
         // Ensure command documentation is present
         if (!configCard.description || !configCard.description.includes('TIME SYSTEM COMMANDS')) {
             Utilities.storyCard.update(CONFIG_CARD, {
@@ -137,7 +154,7 @@ function Calendar(hook, text) {
         
         const configText = configCard.entry || configCard.value || '';
         if (!configText) {
-            if (debug) console.log('[Time] ERROR: Configuration card is empty. Time system requires configuration.');
+            if (debug) console.log(`[${MODULE_NAME}] ERROR: Configuration card is empty. Time system requires configuration.`);
             return null;
         }
         
@@ -158,7 +175,7 @@ function Calendar(hook, text) {
         
         // Validate required fields
         if (!config.actionsPerDay || !config.startDate || !config.hoursPerDay) {
-            if (debug) console.log('[Time] ERROR: Missing required configuration fields');
+            if (debug) console.log(`[${MODULE_NAME}] ERROR: Missing required configuration fields`);
             return null;
         }
         
@@ -170,11 +187,12 @@ function Calendar(hook, text) {
         const periodsSection = sections.time_periods;
         const seasonsSection = sections.seasons;
         const leapSection = sections.leap_year;
+        const leapAdjustmentsSection = sections.leap_year_adjustments;
         
         // Time Periods - required
         config.timePeriods = parseTimePeriods(periodsSection);
         if (!config.timePeriods || Object.keys(config.timePeriods).length === 0) {
-            if (debug) console.log('[Time] ERROR: No time periods defined in configuration');
+            if (debug) console.log(`[${MODULE_NAME}] ERROR: No time periods defined in configuration`);
             return null;
         }
         
@@ -184,14 +202,14 @@ function Calendar(hook, text) {
         // Days of Week - required
         config.daysOfWeek = parseDaysOfWeek(daysSection);
         if (!config.daysOfWeek || config.daysOfWeek.length === 0) {
-            if (debug) console.log('[Time] ERROR: No days of week defined in configuration');
+            if (debug) console.log(`[${MODULE_NAME}] ERROR: No days of week defined in configuration`);
             return null;
         }
         
         // Months - required
         const monthData = parseMonths(monthsSection);
         if (!monthData || monthData.names.length === 0) {
-            if (debug) console.log('[Time] ERROR: No months defined in configuration');
+            if (debug) console.log(`[${MODULE_NAME}] ERROR: No months defined in configuration`);
             return null;
         }
         config.months = monthData.names;
@@ -200,6 +218,11 @@ function Calendar(hook, text) {
         // Leap Year - optional but fully defined if present
         if (leapSection) {
             config.leapYear = parseLeapYear(leapSection, config.months);
+            
+            // Check for separate leap year adjustments section
+            if (config.leapYear && leapAdjustmentsSection && Array.isArray(leapAdjustmentsSection)) {
+                parseLeapYearAdjustments(config.leapYear, leapAdjustmentsSection, config.months);
+            }
         }
         
         return config;
@@ -233,7 +256,7 @@ function Calendar(hook, text) {
                 }
             });
         } else {
-            if (debug) console.log('[Time] Warning: Time periods data not in expected array format');
+            if (debug) console.log(`[${MODULE_NAME}] Warning: Time periods data not in expected array format`);
             return null;
         }
         
@@ -269,7 +292,7 @@ function Calendar(hook, text) {
                 }
             });
         } else {
-            if (debug) console.log('[Time] Warning: Seasons data not in expected array format');
+            if (debug) console.log(`[${MODULE_NAME}] Warning: Seasons data not in expected array format`);
             return null;
         }
         
@@ -285,7 +308,7 @@ function Calendar(hook, text) {
         }
         
         // Shouldn't reach here with proper utilities parsing, but keep as fallback
-        if (debug) console.log('[Time] Warning: Days data not in expected array format');
+        if (debug) console.log(`[${MODULE_NAME}] Warning: Days data not in expected array format`);
         return null;
     }
     
@@ -311,7 +334,7 @@ function Calendar(hook, text) {
                 }
             });
         } else {
-            if (debug) console.log('[Time] Warning: Months data not in expected array format');
+            if (debug) console.log(`[${MODULE_NAME}] Warning: Months data not in expected array format`);
             return null;
         }
         
@@ -339,32 +362,8 @@ function Calendar(hook, text) {
             // Initialize adjustments object
             leap.adjustments = {};
             
-            // Check for adjustments list
-            if (leapData.adjustments && Array.isArray(leapData.adjustments)) {
-                for (const adjustment of leapData.adjustments) {
-                    if (typeof adjustment === 'string') {
-                        // Parse "Month: +/-X" format
-                        const match = adjustment.match(/^(.+?):\s*([+-]?\d+)$/);
-                        if (match) {
-                            const monthName = match[1].trim();
-                            const dayAdjustment = parseInt(match[2]);
-                            
-                            const monthIndex = monthNames.findIndex(m => 
-                                m.toLowerCase() === monthName.toLowerCase()
-                            );
-                            
-                            if (monthIndex !== -1) {
-                                leap.adjustments[monthIndex] = dayAdjustment;
-                            } else {
-                                if (debug) console.log(`[Time] WARNING: Unknown month in leap adjustment: ${monthName}`);
-                            }
-                        }
-                    }
-                }
-            }
-            
             // Backwards compatibility: Check for old "Month: name" format
-            if (leapData.month && Object.keys(leap.adjustments).length === 0) {
+            if (leapData.month) {
                 const monthName = String(leapData.month);
                 const monthIndex = monthNames.findIndex(m => 
                     m.toLowerCase() === monthName.toLowerCase()
@@ -373,25 +372,19 @@ function Calendar(hook, text) {
                 if (monthIndex !== -1) {
                     // Default to +1 day for backwards compatibility
                     leap.adjustments[monthIndex] = 1;
-                    if (debug) console.log(`[Time] Converting legacy leap year format to new format: ${monthName} +1`);
+                    if (debug) console.log(`[${MODULE_NAME}] Converting legacy leap year format to new format: ${monthName} +1`);
                 } else {
-                    if (debug) console.log(`[Time] WARNING: Unknown month in legacy leap year: ${monthName}`);
+                    if (debug) console.log(`[${MODULE_NAME}] WARNING: Unknown month in legacy leap year: ${monthName}`);
                 }
             }
-            
-            // Must have at least one adjustment
-            if (Object.keys(leap.adjustments).length === 0) {
-                if (debug) console.log('[Time] WARNING: No leap year adjustments defined');
-                return null;
-            }
         } else {
-            if (debug) console.log('[Time] Warning: Leap year data not in expected object format');
+            if (debug) console.log(`[${MODULE_NAME}] Warning: Leap year data not in expected object format`);
             return null;
         }
         
         // Validate leap year configuration if enabled
-        if (leap.enabled && (!leap.adjustments || !leap.frequency)) {
-            if (debug) console.log('[Time] WARNING: Leap year enabled but configuration incomplete');
+        if (leap.enabled && !leap.frequency) {
+            if (debug) console.log(`[${MODULE_NAME}] WARNING: Leap year enabled but frequency not specified`);
             return null;
         }
         
@@ -401,6 +394,38 @@ function Calendar(hook, text) {
         if (leap.startYear === undefined) leap.startYear = 0;
         
         return leap;
+    }
+    
+    function parseLeapYearAdjustments(leap, adjustmentsList, monthNames) {
+        if (!leap || !adjustmentsList || !Array.isArray(adjustmentsList)) return;
+        
+        for (const adjustment of adjustmentsList) {
+            if (typeof adjustment === 'string') {
+                // Parse "Month: +/-X" format
+                const match = adjustment.match(/^(.+?):\s*([+-]?\d+)$/);
+                if (match) {
+                    const monthName = match[1].trim();
+                    const dayAdjustment = parseInt(match[2]);
+                    
+                    const monthIndex = monthNames.findIndex(m => 
+                        m.toLowerCase() === monthName.toLowerCase()
+                    );
+                    
+                    if (monthIndex !== -1) {
+                        leap.adjustments[monthIndex] = dayAdjustment;
+                    } else {
+                        if (debug) console.log(`[${MODULE_NAME}] WARNING: Unknown month in leap adjustment: ${monthName}`);
+                    }
+                }
+            }
+        }
+        
+        // Must have at least one adjustment if enabled
+        if (leap.enabled && Object.keys(leap.adjustments).length === 0) {
+            if (debug) console.log(`[${MODULE_NAME}] WARNING: Leap year enabled but no adjustments defined`);
+            // Disable leap year if no adjustments
+            leap.enabled = false;
+        }
     }
     
     function loadEventDays() {
@@ -443,7 +468,7 @@ function Calendar(hook, text) {
             
             return uniqueEvents;
         } catch (error) {
-            if (debug) console.log('[Time] Error loading event days:', error.message);
+            if (debug) console.log(`[${MODULE_NAME}] Error loading event days:`, error.message);
             eventCache = [];
             return [];
         }
@@ -472,13 +497,96 @@ function Calendar(hook, text) {
         return eventsList;
     }
     
+    function parseTimeRanges(timePattern) {
+        const ranges = [];
+        const rangeParts = timePattern.split(',').map(s => s.trim());
+        
+        for (const rangePart of rangeParts) {
+            const match = rangePart.match(/(\d{1,2}):(\d{2})-(\d{1,2}):(\d{2})/);
+            if (!match) continue;
+            
+            ranges.push({
+                start: {
+                    hour: parseInt(match[1]),
+                    minute: parseInt(match[2])
+                },
+                end: {
+                    hour: parseInt(match[3]),
+                    minute: parseInt(match[4])
+                }
+            });
+        }
+        
+        return ranges.length > 0 ? ranges : null;
+    }
+
     function parseEventLine(line) {
         // Remove bullet points if present
         const cleaned = line.replace(/^[-•*]\s*/, '').trim();
         if (!cleaned) return null;
         
+        // Extract time range if present (@ HH:MM-HH:MM)
+        let timeRanges = null;
+        let duration = 1;
+        let baseEvent = cleaned;
+        
+        // Check for @ symbol indicating time ranges
+        const timeRangeMatch = cleaned.match(/^(.+?)@\s*(.+)$/);
+        if (timeRangeMatch) {
+            baseEvent = timeRangeMatch[1].trim();
+            const timeSpec = timeRangeMatch[2].trim();
+            
+            // Parse duration if present
+            const durationMatch = baseEvent.match(/^(.+?)\s+lasting\s+(\d+)\s+days?$/i);
+            if (durationMatch) {
+                baseEvent = durationMatch[1].trim();
+                duration = parseInt(durationMatch[2]);
+            }
+            
+            // Parse time ranges
+            timeRanges = parseTimeRanges(timeSpec);
+        }
+        
+        // Check for daily format: "Event: daily"
+        const dailyMatch = baseEvent.match(/^(.+?):\s*daily\s*$/i);
+        if (dailyMatch) {
+            const name = dailyMatch[1].trim();
+            
+            return {
+                name: name,
+                type: 'daily',
+                duration: duration,
+                timeRanges: timeRanges
+            };
+        }
+        
+        // Check for weekly recurring format: "Event: Monday" or "Event: Mondays"
+        const weeklyMatch = baseEvent.match(/^(.+?):\s*(\w+?)s?\s*$/i);
+        if (weeklyMatch) {
+            const name = weeklyMatch[1].trim();
+            const dayName = weeklyMatch[2];
+            
+            // Find weekday index
+            const config = loadConfiguration();
+            if (!config) return null;
+            
+            const weekdayIndex = config.daysOfWeek.findIndex(d => 
+                d.toLowerCase() === dayName.toLowerCase()
+            );
+            
+            if (weekdayIndex !== -1) {
+                return {
+                    name: name,
+                    type: 'weekly',
+                    weekday: weekdayIndex,
+                    duration: duration,
+                    timeRanges: timeRanges
+                };
+            }
+        }
+        
         // First check for nth weekday format: "Event: 4th Thursday of November"
-        const nthWeekdayMatch = cleaned.match(/^(.+?):\s*(1st|2nd|3rd|4th|5th|last)\s+(\w+)\s+of\s+(\w+)\s*(.*)$/i);
+        const nthWeekdayMatch = baseEvent.match(/^(.+?):\s*(1st|2nd|3rd|4th|5th|last)\s+(\w+)\s+of\s+(\w+)\s*(.*)$/i);
         if (nthWeekdayMatch) {
             const name = nthWeekdayMatch[1].trim();
             const nth = nthWeekdayMatch[2].toLowerCase();
@@ -494,7 +602,7 @@ function Calendar(hook, text) {
                 m.toLowerCase() === monthName.toLowerCase()
             );
             if (monthIndex === -1) {
-                if (debug) console.log(`[Time] Invalid month in event: ${name} (${monthName})`);
+                if (debug) console.log(`[${MODULE_NAME}] Invalid month in event: ${name} (${monthName})`);
                 return null;
             }
             
@@ -503,7 +611,7 @@ function Calendar(hook, text) {
                 d.toLowerCase() === weekday.toLowerCase()
             );
             if (weekdayIndex === -1) {
-                if (debug) console.log(`[Time] Invalid weekday in event: ${name} (${weekday})`);
+                if (debug) console.log(`[${MODULE_NAME}] Invalid weekday in event: ${name} (${weekday})`);
                 return null;
             }
             
@@ -514,7 +622,7 @@ function Calendar(hook, text) {
             } else {
                 nthNum = parseInt(nth.replace(/[^\d]/g, ''));
                 if (isNaN(nthNum) || nthNum < 1 || nthNum > 5) {
-                    if (debug) console.log(`[Time] Invalid nth value in event: ${name} (${nth})`);
+                    if (debug) console.log(`[${MODULE_NAME}] Invalid nth value in event: ${name} (${nth})`);
                     return null;
                 }
             }
@@ -524,7 +632,9 @@ function Calendar(hook, text) {
                 month: monthIndex,
                 type: 'relative',
                 nth: nthNum,
-                weekday: weekdayIndex
+                weekday: weekdayIndex,
+                duration: duration,
+                timeRanges: timeRanges
             };
             
             // Check for year constraints
@@ -549,7 +659,7 @@ function Calendar(hook, text) {
         }
         
         // Original date format: "Event Name: MM/DD/YYYY every N years" or "Event Name: MM/DD" etc.
-        const match = cleaned.match(/^(.+?):\s*(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?\s*(.*)$/);
+        const match = baseEvent.match(/^(.+?):\s*(\d{1,2})\/(\d{1,2})(?:\/(\d{4}))?\s*(.*)$/);
         if (!match) return null;
         
         const name = match[1].trim();
@@ -564,7 +674,7 @@ function Calendar(hook, text) {
         
         // Validate month
         if (month < 0 || month >= config.months.length) {
-            if (debug) console.log(`[Time] Invalid month in event: ${name} (${match[2]})`);
+            if (debug) console.log(`[${MODULE_NAME}] Invalid month in event: ${name} (${match[2]})`);
             return null;
         }
         
@@ -579,9 +689,12 @@ function Calendar(hook, text) {
                 leapMonthDays = maxDaysInMonth + adjustment;
             }
         }
-                              
+                                  
         if (day < 1 || day > leapMonthDays) {
-            if (debug) console.log(`[Time] Invalid day in event: ${name} (${match[3]} in ${config.months[month]})`);
+            // Only log for truly invalid days, not leap days
+            if (day !== 29 || month !== 1 || !config.leapYear || !config.leapYear.enabled) {
+                if (debug) console.log(`[${MODULE_NAME}] Invalid day in event: ${name} (${match[3]} in ${config.months[month]})`);
+            }
             return null;
         }
         
@@ -589,7 +702,9 @@ function Calendar(hook, text) {
             name: name,
             month: month,
             day: day,
-            type: 'annual' // default
+            type: 'annual', // default
+            duration: duration,
+            timeRanges: timeRanges
         };
         
         // Parse modifiers
@@ -625,7 +740,18 @@ function Calendar(hook, text) {
         
         for (const event of eventsList) {
             let key;
-            if (event.type === 'relative') {
+            
+            if (event.type === 'daily') {
+                // Daily events: name, type, and time ranges
+                const timeRangeStr = event.timeRanges ? 
+                    JSON.stringify(event.timeRanges) : 'allday';
+                key = `${event.name}:daily:${timeRangeStr}`;
+            } else if (event.type === 'weekly') {
+                // Weekly events: name, weekday, type, and time ranges
+                const timeRangeStr = event.timeRanges ? 
+                    JSON.stringify(event.timeRanges) : 'allday';
+                key = `${event.name}:weekly:${event.weekday}:${timeRangeStr}`;
+            } else if (event.type === 'relative') {
                 key = `${event.name}:${event.month}:${event.nth}:${event.weekday}:relative:${event.onlyYear || ''}:${event.frequency || ''}`;
             } else {
                 key = `${event.name}:${event.month}:${event.day}:${event.type}:${event.year || ''}`;
@@ -656,7 +782,24 @@ function Calendar(hook, text) {
                 return todayEvents; // This day doesn't exist (e.g., Feb 30)
             }
             
+            // Calculate what day of week this is
+            const dayOfWeekIndex = getDayOfWeekForDate(month, day, year, config);
+            
             for (const event of eventsList) {
+                // Handle daily events - occur every single day
+                if (event.type === 'daily') {
+                    todayEvents.push(event);
+                    continue;
+                }
+                
+                // Handle weekly recurring events
+                if (event.type === 'weekly') {
+                    if (event.weekday === dayOfWeekIndex) {
+                        todayEvents.push(event);
+                    }
+                    continue;
+                }
+                
                 // Handle relative date events (nth weekday of month)
                 if (event.type === 'relative') {
                     if (event.month !== month) continue;
@@ -708,12 +851,57 @@ function Calendar(hook, text) {
                 }
             }
         } catch (error) {
-            if (debug) console.log('[Time] Error checking events:', error.message);
+            if (debug) console.log(`[${MODULE_NAME}] Error checking events:`, error.message);
         }
         
         return todayEvents;
     }
     
+    function checkEventTimeRange(event, dayProgress, hoursPerDay) {
+        if (!event.timeRanges) {
+            // Legacy event - active all day
+            return { active: true, allDay: true };
+        }
+        
+        // Calculate current time from day progress
+        const totalMinutes = Math.floor(dayProgress * hoursPerDay * 60);
+        const currentHour = Math.floor(totalMinutes / 60) % hoursPerDay;
+        const currentMinute = totalMinutes % 60;
+        const currentMinutes = currentHour * 60 + currentMinute;
+        
+        for (const range of event.timeRanges) {
+            const startMinutes = range.start.hour * 60 + range.start.minute;
+            const endMinutes = range.end.hour * 60 + range.end.minute;
+            
+            if (currentMinutes >= startMinutes && currentMinutes <= endMinutes) {
+                return {
+                    active: true,
+                    currentRange: range,
+                    progress: (currentMinutes - startMinutes) / (endMinutes - startMinutes),
+                    minutesRemaining: endMinutes - currentMinutes
+                };
+            }
+        }
+        
+        // Check if event is upcoming today
+        const nextRange = event.timeRanges.find(range => {
+            const startMinutes = range.start.hour * 60 + range.start.minute;
+            return startMinutes > currentMinutes;
+        });
+        
+        if (nextRange) {
+            const startMinutes = nextRange.start.hour * 60 + nextRange.start.minute;
+            return {
+                active: false,
+                upcoming: true,
+                nextRange: nextRange,
+                minutesUntil: startMinutes - currentMinutes
+            };
+        }
+        
+        return { active: false, upcoming: false, completed: true };
+    }
+
     function calculateNthWeekdayOfMonth(nth, weekday, month, year, config) {
         // Calculate what day the nth weekday of the month falls on
         // nth: 1-5 for 1st-5th, -1 for last
@@ -870,7 +1058,9 @@ function Calendar(hook, text) {
             `\nSkip Frequency: 100` +
             `\nSkip Exception: 400` +
             `\nStart Year: 0` +
-            `\nAdjustments:` +
+            `\n` +
+            `\n## Leap Year Adjustments` +
+            `\n// List of months to adjust in leap years` +
             `\n- February: +1` +
             `\n` +
             `\n// Examples:` +
@@ -897,7 +1087,7 @@ function Calendar(hook, text) {
         });
         
         if (!card) {
-            if (debug) console.log('[Time] Failed to create configuration card');
+            if (debug) console.log(`[${MODULE_NAME}] Failed to create configuration card`);
         }
     }
     
@@ -906,37 +1096,58 @@ function Calendar(hook, text) {
             `# Event Days Configuration` +
             `\n// Format: Event Name: MM/DD [modifiers]` +
             `\n// Format: Event Name: Nth Weekday of Month` +
-            `\n// Modifiers: annual, once, every N years` +
-            `\n// Works with custom day/month names` +
-            `\n// Example: "Harvest Moon: 3rd Seventhday of Ninthmonth"` +
-            `\n// Example: "Council: last Firstday of Firstmonth"` +
+            `\n// Format: Event Name: Weekday (for weekly)` +
+            `\n// Format: Event Name: daily (for every day)` +
+            `\n// Add @ HH:MM-HH:MM for time ranges` +
+            `\n// Add "lasting N days" for multi-day events` +
+            `\n//` +
+            `\n// State card will show:` +
+            `\n// Today's Events: All events scheduled for today` +
+            `\n// Active Events: Only events currently in progress` +
             `\n` +
             `\n## Annual Events` +
             `\n- New Year: 1/1` +
             `\n- Valentine's Day: 2/14` +
             `\n- Independence Day: 7/4` +
             `\n- Halloween: 10/31` +
-            `\n- Christmas: 12/25` +
+            `\n- Christmas: 12/25 @ 10:00-14:00` +
             `\n` +
             `\n## Relative Date Events` +
             `\n- Martin Luther King Jr Day: 3rd Monday of January` +
             `\n- Presidents Day: 3rd Monday of February` +
-            `\n- Mother's Day: 2nd Sunday of May` +
+            `\n- Mother's Day: 2nd Sunday of May @ 11:00-14:00` +
             `\n- Memorial Day: last Monday of May` +
             `\n- Father's Day: 3rd Sunday of June` +
             `\n- Labor Day: 1st Monday of September` +
             `\n- Columbus Day: 2nd Monday of October` +
-            `\n- Thanksgiving: 4th Thursday of November` +
+            `\n- Thanksgiving: 4th Thursday of November @ 12:00-20:00` +
+            `\n` +
+            `\n## Daily Events` +
+            `\n- Sunrise: daily @ 6:00-6:30` +
+            `\n- Lunch Break: daily @ 12:00-13:00` +
+            `\n- Sunset: daily @ 18:00-18:30` +
+            `\n- Shop Hours: daily @ 9:00-17:00` +
+            `\n` +
+            `\n## Weekly Events` +
+            `\n- Monday Meeting: Monday @ 9:00-10:00` +
+            `\n- Trash Pickup: Tuesday @ 8:00-8:30` +
+            `\n- Market Day: Wednesday @ 8:00-14:00` +
+            `\n- Happy Hour: Friday @ 17:00-19:00` +
+            `\n- Boss Raid: Sunday @ 20:00-22:00` +
+            `\n` +
+            `\n## Multi-Day Events` +
+            `\n- Spring Conference: 3/15 lasting 3 days @ 9:00-17:00` +
+            `\n- Summer Festival: 2nd Friday of July lasting 3 days @ 10:00-22:00` +
             `\n` +
             `\n## Periodic Events` +
-            `\n- Summer Olympics: 7/15/2024 every 4 years` +
-            `\n- Winter Olympics: 2/1/2026 every 4 years` +
+            `\n- Summer Olympics: 7/15/2024 every 4 years @ 9:00-23:00` +
+            `\n- Winter Olympics: 2/1/2026 every 4 years @ 8:00-22:00` +
             `\n- World Cup: 6/1/2026 every 4 years` +
             `\n- Leap Day: 2/29 annual` +
             `\n// Invalid dates will not trigger` +
             `\n` +
             `\n## One-Time Events` +
-            `\n- Solar Eclipse: 4/8/2024 once`
+            `\n- Solar Eclipse: 4/8/2024 @ 14:00-14:30 once`
         );
         
         const description = `// You can continue in the description.`;
@@ -948,7 +1159,7 @@ function Calendar(hook, text) {
         });
         
         if (!card) {
-            if (debug) console.log('[Time] Failed to create event days card');
+            if (debug) console.log(`[${MODULE_NAME}] Failed to create event days card`);
         }
     }
     
@@ -959,6 +1170,7 @@ function Calendar(hook, text) {
             `\n/settime [hour]:[minute] [am/pm]` +
             `\n  Set the current time` +
             `\n  Examples: /settime 14:30, /settime 6:30pm, /settime 6pm` +
+            `\n  Feedback: "⏰ Time set to 2:30 PM"` +
             `\n  Note: AM/PM based on Hours Per Day / 2` +
             `\n` +
             `\n/wait [number] [minutes/hours/days]` +
@@ -968,15 +1180,18 @@ function Calendar(hook, text) {
             `\n  Examples: /skip 30 minutes, /wait 3 hours, /skip 2 days` +
             `\n  Short forms: /skip 30m, /wait 3h, /skip 2d` +
             `\n  Combined: /skip 1h30m, /wait 1.5h` +
+            `\n  Feedback: "⏩ Skipped 3 hours to 5:30 PM, Tuesday, July 15, 2023"` +
             `\n` +
             `\n/rewind [number] [minutes/hours/days]` +
             `\n  Go back in time` +
             `\n  Examples: /rewind 2 hours, /rewind 1 day` +
             `\n  Short forms: /rewind 2h, /rewind 1d` +
+            `\n  Feedback: "⏪ Rewound 2 hours to 11:30 AM, Monday, July 14, 2023"` +
             `\n` +
             `\n/time` +
             `\n/currenttime` +
-            `\n  Display the current time and date`
+            `\n  Display the current time and date` +
+            `\n  Feedback: "📅 2:30 PM, Tuesday, July 15, 2023, Summer"`
         );
     }
     
@@ -991,19 +1206,39 @@ function Calendar(hook, text) {
         return currentSeason !== 'Unknown' ? `\nSeason: [${currentSeason}]` : '';
     }
     
-    function formatEventsForState(day, config) {
+    function formatEventsForState(day, config, progress = null) {
         const eventsList = loadEventDays();
         if (eventsList.length === 0) return '';
         
         const dateInfo = calculateDateInfo(day, config.startDate, config);
         const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
         
-        if (todayEvents.length > 0) {
-            const eventNames = todayEvents.map(e => e.name).join(', ');
-            return `\nEvents: [${eventNames}]`;
+        if (todayEvents.length === 0) return '';
+        
+        // If progress not provided, don't show active events
+        if (progress === null) {
+            const todayEventNames = todayEvents.map(e => e.name).join(', ');
+            return `\nToday's Events: [${todayEventNames}]`;
         }
         
-        return '';
+        const dayProgress = progress / config.actionsPerDay;
+        
+        // Separate today's events and active events
+        const todayEventNames = todayEvents.map(e => e.name).join(', ');
+        
+        const activeEvents = todayEvents.filter(event => {
+            const timeInfo = checkEventTimeRange(event, dayProgress, config.hoursPerDay);
+            return timeInfo.active;
+        });
+        
+        let result = `\nToday's Events: [${todayEventNames}]`;
+        
+        if (activeEvents.length > 0) {
+            const activeEventNames = activeEvents.map(e => e.name).join(', ');
+            result += `\nActive Events: [${activeEventNames}]`;
+        }
+        
+        return result;
     }
     
     function getCurrentSeasonInfo(day, config) {
@@ -1025,7 +1260,30 @@ function Calendar(hook, text) {
         
         if (todayEvents.length > 0) {
             const eventNames = todayEvents.map(e => e.name).join(', ');
-            return ` [${eventNames}]`;
+            return ` [Today: ${eventNames}]`;
+        }
+        
+        return '';
+    }
+    
+    function getActiveEventInfo(day, progress, config) {
+        const eventsList = loadEventDays();
+        if (eventsList.length === 0) return '';
+        
+        const dateInfo = calculateDateInfo(day, config.startDate, config);
+        const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
+        
+        if (todayEvents.length === 0) return '';
+        
+        const dayProgress = progress / config.actionsPerDay;
+        const activeEvents = todayEvents.filter(event => {
+            const timeInfo = checkEventTimeRange(event, dayProgress, config.hoursPerDay);
+            return timeInfo.active;
+        });
+        
+        if (activeEvents.length > 0) {
+            const activeNames = activeEvents.map(e => e.name).join(', ');
+            return ` [Active: ${activeNames}]`;
         }
         
         return '';
@@ -1048,16 +1306,22 @@ function Calendar(hook, text) {
     
     // State Management
     function loadTimeState() {
+        // Return cached state if available
+        if (stateCache !== null) {
+            return stateCache;
+        }
+        
         const config = loadConfiguration();
         if (!config) {
-            if (debug) console.log('[Time] Cannot load state without configuration');
+            if (debug) console.log(`[${MODULE_NAME}] Cannot load state without configuration`);
             return null;
         }
         
         const stateCard = Utilities.storyCard.get(STATE_CARD);
         if (!stateCard) {
-            if (debug) console.log('[Time] No state found, creating initial state');
-            return createInitialState();
+            if (debug) console.log(`[${MODULE_NAME}] No state found, creating initial state`);
+            stateCache = createInitialState();
+            return stateCache;
         }
         
         const lines = stateCard.entry.split('\n');
@@ -1081,19 +1345,20 @@ function Calendar(hook, text) {
             }
         }
         
+        stateCache = state;
         return state;
     }
     
     function createInitialState() {
         const config = loadConfiguration();
         if (!config) {
-            if (debug) console.log('[Time] Cannot create initial state without configuration');
+            if (debug) console.log(`[${MODULE_NAME}] Cannot create initial state without configuration`);
             return null;
         }
         
         // Check if a state card already exists with manual edits
         const existingCard = Utilities.storyCard.get(STATE_CARD);
-        if (existingCard && existingCard.entry) {
+        if (existingCard && existingCard.entry && existingCard.entry.includes('# Time State')) {
             // Try to parse existing values
             const lines = existingCard.entry.split('\n');
             let day = 0;
@@ -1136,7 +1401,7 @@ function Calendar(hook, text) {
         
         const config = loadConfiguration();
         if (!config) {
-            if (debug) console.log('[Time] Cannot save state without configuration');
+            if (debug) console.log(`[${MODULE_NAME}] Cannot save state without configuration`);
             return;
         }
         
@@ -1149,7 +1414,7 @@ function Calendar(hook, text) {
         
         // Use helper functions for season and event strings
         const seasonStr = formatSeasonForState(state.day, config);
-        const eventStr = formatEventsForState(state.day, config);
+        const eventStr = formatEventsForState(state.day, config, state.progress);
         
         const entry = (
             `# Time State` +
@@ -1167,6 +1432,9 @@ function Calendar(hook, text) {
             title: STATE_CARD,
             entry: entry
         });
+        
+        // Clear state cache after saving
+        stateCache = null;
     }
     
     // Time Calculations
@@ -1323,7 +1591,7 @@ function Calendar(hook, text) {
                 
                 // Ensure days never goes below 1
                 if (days < 1) {
-                    if (debug) console.log(`[Time] WARNING: Leap adjustment would make ${config.months[monthIndex]} have ${days} days. Setting to 1.`);
+                    if (debug) console.log(`[${MODULE_NAME}] WARNING: Leap adjustment would make ${config.months[monthIndex]} have ${days} days. Setting to 1.`);
                     days = 1;
                 }
             }
@@ -1421,7 +1689,7 @@ function Calendar(hook, text) {
         const config = loadConfiguration();
         
         if (!state || !config) {
-            if (debug) console.log('[Time] Cannot process actions without state and configuration');
+            if (debug) console.log(`[${MODULE_NAME}] Cannot process actions without state and configuration`);
             return null;
         }
         
@@ -1529,7 +1797,7 @@ function Calendar(hook, text) {
         
         const config = loadConfiguration();
         if (!config) {
-            if (debug) console.log('[Time] Cannot parse commands without configuration');
+            if (debug) console.log(`[${MODULE_NAME}] Cannot parse commands without configuration`);
             return null;
         }
         
@@ -1659,13 +1927,15 @@ function Calendar(hook, text) {
     function processTimeCommand(command) {
         if (!command) return;
         
-        const state = loadTimeState();
+        const timeState = loadTimeState();
         const config = loadConfiguration();
         
-        if (!state || !config) {
-            if (debug) console.log('[Time] Cannot process commands without state and configuration');
+        if (!timeState || !config) {
+            if (debug) console.log(`[${MODULE_NAME}] Cannot process commands without state and configuration`);
             return;
         }
+        
+        let message = '';
         
         switch (command.type) {
             case 'setTime':
@@ -1678,13 +1948,30 @@ function Calendar(hook, text) {
                 
                 // Set time on current day (allows rewinding within the day)
                 const newState = {
-                    day: state.day,
+                    day: timeState.day,
                     progress: newProgress,
-                    lastProcessedAction: state.lastProcessedAction
+                    lastProcessedAction: timeState.lastProcessedAction
                 };
                 
                 saveTimeState(newState);
-                if (debug) console.log(`[Time] Set time to ${String(command.hour).padStart(2, '0')}:${String(command.minute).padStart(2, '0')}, Day ${state.day}`);
+                
+                // Get active events at new time
+                const activeInfoSet = getActiveEventInfo(timeState.day, newProgress, config);
+                
+                // Format time for display
+                let formattedTime = `${String(command.hour).padStart(2, '0')}:${String(command.minute).padStart(2, '0')}`;
+                if (config.hoursPerDay % 2 === 0) {
+                    const halfDay = config.hoursPerDay / 2;
+                    let displayHour = command.hour;
+                    const isPM = displayHour >= halfDay;
+                    if (isPM && displayHour > halfDay) displayHour -= halfDay;
+                    if (displayHour === 0) displayHour = halfDay;
+                    formattedTime = `${displayHour}:${String(command.minute).padStart(2, '0')} ${isPM ? 'PM' : 'AM'}`;
+                }
+                
+                message = `⏰ Time set to ${formattedTime}${activeInfoSet}`;
+                
+                if (debug) console.log(`[${MODULE_NAME}] Set time to ${String(command.hour).padStart(2, '0')}:${String(command.minute).padStart(2, '0')}, Day ${timeState.day}${activeInfoSet}`);
                 break;
                 
             case 'skipTime':
@@ -1693,8 +1980,8 @@ function Calendar(hook, text) {
                 const progressToAdd = hoursToAdd / config.hoursPerDay;
                 const actionsToAdd = Math.round(progressToAdd * config.actionsPerDay);
                 
-                let skipProgress = state.progress + actionsToAdd;
-                let skipDay = state.day;
+                let skipProgress = timeState.progress + actionsToAdd;
+                let skipDay = timeState.day;
                 
                 // Handle day overflow
                 while (skipProgress >= config.actionsPerDay) {
@@ -1705,16 +1992,54 @@ function Calendar(hook, text) {
                 const skipState = {
                     day: skipDay,
                     progress: skipProgress,
-                    lastProcessedAction: state.lastProcessedAction
+                    lastProcessedAction: timeState.lastProcessedAction
                 };
                 
                 saveTimeState(skipState);
                 
-                // Check if we changed seasons and get event info
-                const seasonChangeInfo = getSeasonChangeInfo(state.day, skipDay, config);
-                const eventInfoSkip = skipDay !== state.day ? getCurrentEventInfo(skipDay, config) : '';
+                // Get the new time
+                const skipDayProgress = skipProgress / config.actionsPerDay;
+                const skipTimeStr = progressToTime(skipDayProgress, config.hoursPerDay);
+                let skipDisplayTime = skipTimeStr;
                 
-                if (debug) console.log(`[Time] Skipped ${command.hours} hours to Day ${skipDay}${seasonChangeInfo}${eventInfoSkip}`);
+                // Format time with AM/PM if applicable
+                if (config.hoursPerDay % 2 === 0) {
+                    const [hourStr, minuteStr] = skipTimeStr.split(':');
+                    let hour = parseInt(hourStr);
+                    const halfDay = config.hoursPerDay / 2;
+                    const isPM = hour >= halfDay;
+                    if (isPM && hour > halfDay) hour -= halfDay;
+                    if (hour === 0) hour = halfDay;
+                    skipDisplayTime = `${hour}:${minuteStr} ${isPM ? 'PM' : 'AM'}`;
+                }
+                
+                // Check if we changed seasons and get event info
+                const seasonChangeInfo = getSeasonChangeInfo(timeState.day, skipDay, config);
+                const eventInfoSkip = skipDay !== timeState.day ? getCurrentEventInfo(skipDay, config) : '';
+                const activeInfoSkip = getActiveEventInfo(skipDay, skipProgress, config);
+                
+                // Format the skip duration
+                let skipDuration = '';
+                if (hoursToAdd >= config.hoursPerDay) {
+                    const days = Math.floor(hoursToAdd / config.hoursPerDay);
+                    const hours = hoursToAdd % config.hoursPerDay;
+                    skipDuration = days > 0 ? `${days} day${days > 1 ? 's' : ''}` : '';
+                    if (hours >= 1) {
+                        skipDuration += `${skipDuration ? ' and ' : ''}${hours} hour${hours !== 1 ? 's' : ''}`;
+                    } else if (hours > 0) {
+                        const minutes = Math.round(hours * 60);
+                        skipDuration += `${skipDuration ? ' and ' : ''}${minutes} minute${minutes !== 1 ? 's' : ''}`;
+                    }
+                } else if (hoursToAdd >= 1) {
+                    skipDuration = `${hoursToAdd} hour${hoursToAdd !== 1 ? 's' : ''}`;
+                } else {
+                    const minutes = Math.round(hoursToAdd * 60);
+                    skipDuration = `${minutes} minute${minutes !== 1 ? 's' : ''}`;
+                }
+                
+                message = `⏩ Skipped ${skipDuration} to ${skipDisplayTime}, ${calculateDate(skipDay, config.startDate, config)}${seasonChangeInfo}${eventInfoSkip}${activeInfoSkip}`;
+                
+                if (debug) console.log(`[${MODULE_NAME}] Skipped ${command.hours} hours to ${skipDisplayTime}, Day ${skipDay}${seasonChangeInfo}${eventInfoSkip}${activeInfoSkip}`);
                 break;
                 
             case 'rewindTime':
@@ -1723,8 +2048,8 @@ function Calendar(hook, text) {
                 const progressToSubtract = hoursToSubtract / config.hoursPerDay;
                 const actionsToSubtract = Math.round(progressToSubtract * config.actionsPerDay);
                 
-                let rewindProgress = state.progress - actionsToSubtract;
-                let rewindDay = state.day;
+                let rewindProgress = timeState.progress - actionsToSubtract;
+                let rewindDay = timeState.day;
                 
                 // Handle day underflow
                 while (rewindProgress < 0) {
@@ -1735,42 +2060,113 @@ function Calendar(hook, text) {
                 const rewindState = {
                     day: rewindDay,
                     progress: rewindProgress,
-                    lastProcessedAction: state.lastProcessedAction
+                    lastProcessedAction: timeState.lastProcessedAction
                 };
                 
                 saveTimeState(rewindState);
                 
-                // Check if we changed seasons and get event info
-                const rewindSeasonInfo = getSeasonChangeInfo(state.day, rewindDay, config);
-                const rewindEventInfo = rewindDay !== state.day ? getCurrentEventInfo(rewindDay, config) : '';
+                // Get the new time
+                const rewindDayProgress = rewindProgress / config.actionsPerDay;
+                const rewindTimeStr = progressToTime(rewindDayProgress, config.hoursPerDay);
+                let rewindDisplayTime = rewindTimeStr;
                 
-                if (debug) console.log(`[Time] Rewound ${command.hours} hours to Day ${rewindDay}${rewindSeasonInfo}${rewindEventInfo}`);
+                // Format time with AM/PM if applicable
+                if (config.hoursPerDay % 2 === 0) {
+                    const [hourStr, minuteStr] = rewindTimeStr.split(':');
+                    let hour = parseInt(hourStr);
+                    const halfDay = config.hoursPerDay / 2;
+                    const isPM = hour >= halfDay;
+                    if (isPM && hour > halfDay) hour -= halfDay;
+                    if (hour === 0) hour = halfDay;
+                    rewindDisplayTime = `${hour}:${minuteStr} ${isPM ? 'PM' : 'AM'}`;
+                }
+                
+                // Check if we changed seasons and get event info
+                const rewindSeasonInfo = getSeasonChangeInfo(timeState.day, rewindDay, config);
+                const rewindEventInfo = rewindDay !== timeState.day ? getCurrentEventInfo(rewindDay, config) : '';
+                const activeInfoRewind = getActiveEventInfo(rewindDay, rewindProgress, config);
+                
+                // Format the rewind duration
+                let rewindDuration = '';
+                if (hoursToSubtract >= config.hoursPerDay) {
+                    const days = Math.floor(hoursToSubtract / config.hoursPerDay);
+                    const hours = hoursToSubtract % config.hoursPerDay;
+                    rewindDuration = days > 0 ? `${days} day${days > 1 ? 's' : ''}` : '';
+                    if (hours >= 1) {
+                        rewindDuration += `${rewindDuration ? ' and ' : ''}${hours} hour${hours !== 1 ? 's' : ''}`;
+                    } else if (hours > 0) {
+                        const minutes = Math.round(hours * 60);
+                        rewindDuration += `${rewindDuration ? ' and ' : ''}${minutes} minute${minutes !== 1 ? 's' : ''}`;
+                    }
+                } else if (hoursToSubtract >= 1) {
+                    rewindDuration = `${hoursToSubtract} hour${hoursToSubtract !== 1 ? 's' : ''}`;
+                } else {
+                    const minutes = Math.round(hoursToSubtract * 60);
+                    rewindDuration = `${minutes} minute${minutes !== 1 ? 's' : ''}`;
+                }
+                
+                message = `⏪ Rewound ${rewindDuration} to ${rewindDisplayTime}, ${calculateDate(rewindDay, config.startDate, config)}${rewindSeasonInfo}${rewindEventInfo}${activeInfoRewind}`;
+                
+                if (debug) console.log(`[${MODULE_NAME}] Rewound ${command.hours} hours to ${rewindDisplayTime}, Day ${rewindDay}${rewindSeasonInfo}${rewindEventInfo}${activeInfoRewind}`);
                 break;
                 
             case 'queryTime':
                 // Calculate current time from progress
-                const dayProgress = state.progress / config.actionsPerDay;
+                const dayProgress = timeState.progress / config.actionsPerDay;
                 const currentTime = progressToTime(dayProgress, config.hoursPerDay);
-                const currentDate = calculateDate(state.day, config.startDate, config);
+                const currentDate = calculateDate(timeState.day, config.startDate, config);
+                
+                // Get formatted time
+                let displayTime = currentTime;
+                if (config.hoursPerDay % 2 === 0) {
+                    const [hourStr, minuteStr] = currentTime.split(':');
+                    let hour = parseInt(hourStr);
+                    const halfDay = config.hoursPerDay / 2;
+                    const isPM = hour >= halfDay;
+                    if (isPM && hour > halfDay) hour -= halfDay;
+                    if (hour === 0) hour = halfDay;
+                    displayTime = `${hour}:${minuteStr} ${isPM ? 'PM' : 'AM'}`;
+                }
                 
                 // Get season and event info
-                const seasonInfo = getCurrentSeasonInfo(state.day, config);
-                const eventInfoQuery = getCurrentEventInfo(state.day, config);
+                const seasonInfo = getCurrentSeasonInfo(timeState.day, config);
+                const eventInfoQuery = getCurrentEventInfo(timeState.day, config);
+                const activeEventInfo = getActiveEventInfo(timeState.day, timeState.progress, config);
                 
-                if (debug) console.log(`[Time] Current: ${currentTime}, ${currentDate}${seasonInfo}, Day ${state.day}${eventInfoQuery}`);
+                message = `📅 ${displayTime}, ${currentDate}${seasonInfo}${eventInfoQuery}${activeEventInfo}`;
+                
+                if (debug) console.log(`[${MODULE_NAME}] Current: ${currentTime}, ${currentDate}${seasonInfo}, Day ${timeState.day}${eventInfoQuery}${activeEventInfo}`);
                 break;
         }
+        
+        return message;
     }
     
-    // INPUT HOOK: Only remove commands from text
+    // INPUT HOOK: Process commands and provide feedback
     if (hook === 'input') {
+        if (debug) console.log(`[${MODULE_NAME}] Input hook called with text:`, text);
+        
         const command = parseTimeCommand(text);
         
         if (command) {
-            processTimeCommand(command);
+            if (debug) console.log(`[${MODULE_NAME}] Command detected:`, command);
+            
+            const message = processTimeCommand(command);
+            
+            if (debug) console.log(`[${MODULE_NAME}] Command processed, message:`, message);
+            
+            // Set message in global state if available
+            if (message && typeof state !== 'undefined' && state && typeof state === 'object') {
+                state.message = message;
+                if (debug) console.log(`[${MODULE_NAME}] Successfully set state.message`);
+            }
+            
+            // Return zero-width space to delete the command
+            if (debug) console.log(`[${MODULE_NAME}] Returning zero-width space to delete command`);
             return '\u200B';
         }
         
+        if (debug) console.log(`[${MODULE_NAME}] No command found, returning original text`);
         return text;
     }
     
@@ -1778,7 +2174,7 @@ function Calendar(hook, text) {
     if (hook === 'context') {
         const config = loadConfiguration();
         if (!config) {
-            if (debug) console.log('[Time] Time system requires configuration to function');
+            if (debug) console.log(`[${MODULE_NAME}] Time system requires configuration to function`);
             return;
         }
         
@@ -1829,6 +2225,54 @@ function Calendar(hook, text) {
                             eventDispatcher.dispatch('seasonChanged', {
                                 previousSeason: prevSeason,
                                 currentSeason: currSeason,
+                                state: actionResult.state
+                            });
+                        }
+                    }
+                }
+                
+                // Check time-range events if time actually progressed
+                const prevProgress = previousState ? previousState.progress : 0;
+                const currProgress = actionResult.state.progress;
+                
+                if (currProgress !== prevProgress) {
+                    const eventsList = loadEventDays();
+                    const dateInfo = calculateDateInfo(actionResult.state.day, config.startDate, config);
+                    const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
+                    
+                    // Calculate progress for both states
+                    const prevDayProgress = prevProgress / config.actionsPerDay;
+                    const currDayProgress = currProgress / config.actionsPerDay;
+                    
+                    for (const event of todayEvents) {
+                        if (!event.timeRanges) continue; // Skip all-day events
+                        
+                        const prevTime = checkEventTimeRange(event, prevDayProgress, config.hoursPerDay);
+                        const currTime = checkEventTimeRange(event, currDayProgress, config.hoursPerDay);
+                        
+                        // Event just started
+                        if (!prevTime.active && currTime.active) {
+                            eventDispatcher.dispatch('timeRangeEventStarted', {
+                                event: event,
+                                timeRange: currTime.currentRange,
+                                state: actionResult.state
+                            });
+                        }
+                        
+                        // Event ending soon (crossed 5-minute threshold)
+                        if (currTime.active && currTime.minutesRemaining <= 5 && 
+                            prevTime.active && prevTime.minutesRemaining > 5) {
+                            eventDispatcher.dispatch('timeRangeEventEnding', {
+                                event: event,
+                                minutesRemaining: currTime.minutesRemaining,
+                                state: actionResult.state
+                            });
+                        }
+                        
+                        // Event just ended
+                        if (prevTime.active && !currTime.active) {
+                            eventDispatcher.dispatch('timeRangeEventEnded', {
+                                event: event,
                                 state: actionResult.state
                             });
                         }
@@ -1993,9 +2437,24 @@ function Calendar(hook, text) {
             if (eventsList.length === 0) return [];
             
             const dateInfo = calculateDateInfo(state.day, config.startDate, config);
-            return checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
+            const dayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
+            
+            // Add time range info to each event
+            const dayProgress = state.progress / config.actionsPerDay;
+            return dayEvents.map(event => {
+                const timeInfo = checkEventTimeRange(event, dayProgress, config.hoursPerDay);
+                return {
+                    ...event,
+                    timeInfo: timeInfo
+                };
+            });
         };
         
+        Calendar.getActiveTimeRangeEvents = () => {
+            const todayEvents = Calendar.getTodayEvents();
+            return todayEvents.filter(event => event.timeInfo && event.timeInfo.active);
+        };
+
         Calendar.getUpcomingEvents = (daysAhead = 30) => {
             const state = loadTimeState();
             const config = loadConfiguration();
@@ -2078,6 +2537,18 @@ function Calendar(hook, text) {
         
         Calendar.clearEventCache = () => {
             eventCache = null;
+            return true;
+        };
+        
+        Calendar.clearConfigCache = () => {
+            configCache = null;
+            return true;
+        };
+        
+        Calendar.clearAllCaches = () => {
+            eventCache = null;
+            configCache = null;
+            stateCache = null;
             return true;
         };
         
@@ -2204,6 +2675,9 @@ function Calendar(hook, text) {
             
             Utilities.storyCard.update(CONFIG_CARD, { entry: configText });
             
+            // Clear config cache after update
+            configCache = null;
+            
             // Adjust current progress to maintain same time
             const newProgress = Math.floor(currentProgress * newActionsPerDay);
             
@@ -2239,6 +2713,9 @@ function Calendar(hook, text) {
             );
             
             Utilities.storyCard.update(CONFIG_CARD, { entry: configText });
+            
+            // Clear config cache after update
+            configCache = null;
             
             // Maintain same progress through the day
             // No need to adjust progress since it's already percentage-based
