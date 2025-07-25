@@ -102,7 +102,6 @@ function QualityAssurance(hook, text) {
             separateDialogue: Utilities.string.parseBoolean(settings.separate_dialogue || 'true'),
             enforceParagraphs: Utilities.string.parseBoolean(settings.enforce_paragraphs || 'true'),
             replaceNames: Utilities.string.parseBoolean(settings.replace_names || 'true'),
-            ensureSpacing: Utilities.string.parseBoolean(settings.ensure_spacing || 'true'),
             fixHangingPunctuation: Utilities.string.parseBoolean(settings.fix_hanging_punctuation || 'true')
         };
         
@@ -120,7 +119,6 @@ function QualityAssurance(hook, text) {
             separate_dialogue: true,
             enforce_paragraphs: true,
             replace_names: true,
-            ensure_spacing: true,
             fix_hanging_punctuation: true
         };
         
@@ -135,7 +133,6 @@ function QualityAssurance(hook, text) {
             `Separate Dialogue: ${defaultSettings.separate_dialogue}\n`+
             `Enforce Paragraphs: ${defaultSettings.enforce_paragraphs}\n`+
             `Replace Names: ${defaultSettings.replace_names}\n`+
-            `Ensure Spacing: ${defaultSettings.ensure_spacing}\n`+
             `Fix Hanging Punctuation: ${defaultSettings.fix_hanging_punctuation}`
         );
         
@@ -194,7 +191,7 @@ function QualityAssurance(hook, text) {
             `\n`+
             `## This Changes Everything\n`+
             `Type: phrase\n`+
-            `Match: This changes everything\n`+
+            `Match: (this|that) changes everything\n`+
             `Action: remove`
         );
         
@@ -324,7 +321,7 @@ function QualityAssurance(hook, text) {
             if (card.entry && card.entry.includes('##')) {
                 sources.push(card.entry);
             }
-            if (card.description && !card.description.startsWith('//')) {
+            if (card.description && card.description.includes('##')) {
                 sources.push(card.description);
             }
             
@@ -385,7 +382,7 @@ function QualityAssurance(hook, text) {
             if (card.entry && card.entry.includes('##')) {
                 sources.push(card.entry);
             }
-            if (card.description && !card.description.startsWith('//')) {
+            if (card.description && card.description.includes('##')) {
                 sources.push(card.description);
             }
             
@@ -434,97 +431,160 @@ function QualityAssurance(hook, text) {
         const groups = new Map();
         
         const nameCards = findAllCardsWithPrefix(NAME_PREFIX);
+        if (debug) console.log(`[QA] Found ${nameCards.length} name replacement cards`);
+        
         nameCards.forEach(card => {
-            if (!card) {
-                if (debug) console.log('[QA] Skipping null name card');
-                return;
-            }
+            if (!card) return;
             
-            // Parse rules from both entry and description
+            // Parse both entry and description
             const sources = [];
-            if (card.entry && card.entry.includes('##')) {
-                sources.push(card.entry);
-            }
-            if (card.description && !card.description.startsWith('//')) {
+            if (card.entry) sources.push(card.entry);
+            if (card.description && card.description.includes('##')) {
                 sources.push(card.description);
             }
             
             sources.forEach(source => {
-                const sections = Utilities.plainText.parseSections(source);
-                if (!sections || typeof sections !== 'object') {
-                    if (debug) console.log('[QA] Failed to parse sections from name source');
-                    return;
+                // Simple line-by-line parsing
+                const lines = source.split('\n');
+                let currentSection = null;
+                let currentData = {};
+                
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    
+                    // Check for section header
+                    if (trimmed.startsWith('##')) {
+                        // Save previous section if it has names and replacements
+                        if (currentSection && currentData.names && currentData.replacements) {
+                            const names = currentData.names.split(',').map(n => n.trim()).filter(n => n);
+                            const replacements = currentData.replacements;
+                            
+                            if (names.length > 0 && replacements.length > 0) {
+                                names.forEach(name => {
+                                    groups.set(name.toLowerCase(), {
+                                        groupName: currentSection,
+                                        replacements: replacements
+                                    });
+                                    if (debug) console.log(`[QA] Mapped "${name}" -> ${replacements.length} replacements`);
+                                });
+                            }
+                        }
+                        
+                        // Start new section
+                        currentSection = trimmed.replace(/^##\s*/, '');
+                        currentData = {};
+                    }
+                    // Check for Names: line
+                    else if (trimmed.startsWith('Names:')) {
+                        currentData.names = trimmed.substring(6).trim();
+                    }
+                    // Check for Replacements: line
+                    else if (trimmed.startsWith('Replacements:')) {
+                        currentData.replacements = [];
+                        currentData.inReplacements = true;
+                    }
+                    // If we're in replacements section, collect replacement names
+                    else if (currentData.inReplacements && trimmed.startsWith('-')) {
+                        const replacement = trimmed.substring(1).trim();
+                        if (replacement) {
+                            currentData.replacements.push(replacement);
+                        }
+                    }
+                    // Empty line ends replacements section
+                    else if (currentData.inReplacements && !trimmed) {
+                        currentData.inReplacements = false;
+                    }
                 }
                 
-                Object.entries(sections).forEach(([groupName, content]) => {
-                    // Skip meta sections
-                    if (groupName.toLowerCase() === 'settings' || 
-                        groupName.toLowerCase() === 'configuration' ||
-                        groupName.toLowerCase().includes('active') ||
-                        groupName.toLowerCase().includes('purpose')) {
-                        return;
+                // Don't forget the last section
+                if (currentSection && currentData.names && currentData.replacements) {
+                    const names = currentData.names.split(',').map(n => n.trim()).filter(n => n);
+                    const replacements = currentData.replacements;
+                    
+                    if (names.length > 0 && replacements.length > 0) {
+                        names.forEach(name => {
+                            groups.set(name.toLowerCase(), {
+                                groupName: currentSection,
+                                replacements: replacements
+                            });
+                            if (debug) console.log(`[QA] Mapped "${name}" -> ${replacements.length} replacements`);
+                        });
                     }
-                    
-                    // Add defensive checks
-                    if (!content || typeof content !== 'object') {
-                        if (debug) console.log(`[QA] Skipping invalid name group section: ${groupName}`);
-                        return;
-                    }
-                    
-                    // Check if this section has names and replacements
-                    if (!content.names || !content.replacements) {
-                        if (debug) console.log(`[QA] Name group missing required fields: ${groupName}`, content);
-                        return;
-                    }
-                    
-                    // Parse names list
-                    let names = [];
-                    if (Array.isArray(content.names)) {
-                        names = content.names;
-                    } else if (typeof content.names === 'string') {
-                        names = content.names.split(',').map(n => n.trim()).filter(n => n);
-                    }
-                    
-                    if (names.length === 0) {
-                        if (debug) console.log(`[QA] No valid names in group: ${groupName}`);
-                        return;
-                    }
-                    
-                    // Parse replacements
-                    let replacements = [];
-                    if (Array.isArray(content.replacements)) {
-                        replacements = content.replacements;
-                    } else if (content.replacements) {
-                        replacements = content.replacements
-                            .split('\n')
-                            .map(r => r.trim())
-                            .filter(r => r && r !== '-');
-                    }
-                    
-                    if (replacements.length === 0) {
-                        if (debug) console.log(`[QA] No valid replacements in group: ${groupName}`);
-                        return;
-                    }
-                    
-                    const group = {
-                        groupName: groupName,
-                        replacements: replacements
-                    };
-                    
-                    // Map each name to this group
-                    names.forEach(name => {
-                        if (name) {
-                            groups.set(name.toLowerCase(), group);
-                        }
-                    });
-                });
+                }
             });
         });
         
+        if (debug) console.log(`[QA] Total names mapped: ${groups.size}`);
         nameGroupsCache = groups;
         return groups;
     }
     
+    function processNames(text, nameGroups) {
+        if (nameGroups.size === 0) return text;
+        
+        // Build regex pattern from all names (sorted by length, longest first)
+        const allNames = Array.from(nameGroups.keys());
+        allNames.sort((a, b) => b.length - a.length);
+        
+        const pattern = new RegExp(
+            "\\b(" + allNames.map(n => n.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join("|") + ")\\b", 
+            "gi"
+        );
+        
+        if (debug) console.log(`[QA] Name pattern: ${pattern.source}`);
+        
+        // Replace names consistently throughout the text
+        const processedText = text.replace(pattern, function(match) {
+            const lowerMatch = match.toLowerCase();
+            const group = nameGroups.get(lowerMatch);
+            
+            if (!group) return match;
+            
+            // Get consistent replacement for this name
+            const cacheKey = `${group.groupName}:${lowerMatch}`;
+            if (!nameMapCache.has(cacheKey)) {
+                const replacements = group.replacements;
+                let newName;
+                let attempts = 0;
+                
+                // Try to get a unique name
+                do {
+                    const idx = Math.floor(
+                        Utilities.math.seededRandom(lowerMatch + attempts + text, 0, replacements.length)
+                    );
+                    newName = replacements[idx];
+                    attempts++;
+                    if (attempts > replacements.length * 2) break;
+                } while (usedNamesCache.has(newName));
+                
+                nameMapCache.set(cacheKey, newName);
+                usedNamesCache.add(newName);
+                
+                if (debug) console.log(`[QA] Mapping "${match}" -> "${newName}"`);
+            }
+            
+            const replacement = nameMapCache.get(cacheKey);
+            
+            // Preserve original capitalization
+            if (match === match.toUpperCase()) {
+                return replacement.toUpperCase();
+            } else if (match[0] === match[0].toUpperCase()) {
+                return replacement[0].toUpperCase() + replacement.slice(1).toLowerCase();
+            } else {
+                return replacement.toLowerCase();
+            }
+        });
+        
+        // Update stats
+        const replacementCount = (processedText.match(pattern) || []).length;
+        statsCache.namesReplaced = Object.keys(nameMapCache).length;
+        statsCache.totalReplacements += statsCache.namesReplaced;
+        
+        if (debug) console.log(`[QA] Replaced ${statsCache.namesReplaced} unique names`);
+        
+        return processedText;
+    }
+
     // Process text with rules
     function processTextRules(text, rules) {
         let processedText = text;
@@ -607,85 +667,17 @@ function QualityAssurance(hook, text) {
         
         // Clean up spacing
         processedText = processedText
-            .replace(/\s+/g, ' ')
-            .replace(/\s+([.,!?;:])/g, '$1')
-            .replace(/\.\s*\./g, '.')
-            .replace(/^\s*[a-z]/gm, match => match.toUpperCase())
-            .trim();
-        
-        return processedText;
-    }
+        .replace(/\s+/g, ' ')                    // Collapse whitespace
+        .replace(/\s+([,!?;:])/g, '$1')          // Remove space before punctuation (but NOT periods)
+        .replace(/\s+(\.(?!\.))/g, '$1')         // Remove space before single period only
+        .replace(/(\w)\s+\.\s+\.\s+\./g, '$1...') // Fix spaced ellipses
+        .replace(/\.\s+\.\s+\./g, '...')        // Fix standalone spaced ellipses
+        .replace(/\.{2}(?!\.)/g, '...')         // Convert .. to ...
+        .replace(/\.{4,}/g, '...')               // Fix too many dots
+        .replace(/^\s*[a-z]/gm, match => match.toUpperCase())
+        .trim();
     
-    // Process name replacements using groups
-    function processNames(text, nameGroups) {
-        if (nameGroups.size === 0) return text;
-        
-        // Process text sentence by sentence
-        const sentences = text.match(/[^.!?]+[.!?]+/g) || [text];
-        
-        const processedSentences = sentences.map(sentence => {
-            const words = sentence.match(/\S+|\s+/g) || [];
-            
-            return words.map((word, index) => {
-                if (/^\s+$/.test(word)) return word;
-                
-                const wordMatch = word.match(/^(\W*)([\w'-]+)(\W*)$/);
-                if (!wordMatch) return word;
-                
-                const [, prePunct, actualWord, postPunct] = wordMatch;
-                const lowerWord = actualWord.toLowerCase();
-                
-                const group = nameGroups.get(lowerWord);
-                if (!group) return word;
-                
-                // Proper noun detection
-                const isCapitalized = actualWord[0] === actualWord[0].toUpperCase();
-                if (!isCapitalized) return word;
-                
-                const isStartOfSentence = index === 0 || (index === 1 && /^\s+$/.test(words[0]));
-                if (isStartOfSentence) {
-                    const nextWords = words.slice(index + 1, index + 4).join('');
-                    const nameIndicators = /^(\s+(said|says|asked|asks|replied|replies|walked|ran|stood|sat|is|was|has|had|'s|,))/i;
-                    if (!nameIndicators.test(nextWords)) return word;
-                }
-                
-                // Get or create replacement for this name
-                const cacheKey = `${group.groupName}:${lowerWord}`;
-                if (!nameMapCache.has(cacheKey)) {
-                    const replacements = group.replacements;
-                    let newName;
-                    let attempts = 0;
-                    
-                    do {
-                        const idx = Math.floor(
-                            Utilities.math.seededRandom(lowerWord + attempts + text, 0, replacements.length)
-                        );
-                        newName = replacements[idx];
-                        attempts++;
-                        if (attempts > replacements.length * 2) break;
-                    } while (usedNamesCache.has(newName));
-                    
-                    nameMapCache.set(cacheKey, newName);
-                    usedNamesCache.add(newName);
-                    statsCache.namesReplaced++;
-                    statsCache.totalReplacements++;
-                }
-                
-                // Preserve capitalization
-                const replacement = nameMapCache.get(cacheKey);
-                let finalReplacement = replacement;
-                
-                if (actualWord === actualWord.toUpperCase()) {
-                    finalReplacement = replacement.toUpperCase();
-                } else if (actualWord[0] === actualWord[0].toUpperCase()) {
-                    finalReplacement = replacement[0].toUpperCase() + replacement.slice(1);
-                }
-                
-                return prePunct + finalReplacement + postPunct;
-            }).join('');
-        });
-        
-        return processedSentences.join('');
+    return processedText;
     }
     
     // Fix hanging punctuation
@@ -695,68 +687,110 @@ function QualityAssurance(hook, text) {
         let processedText = text;
         let modified = false;
         
-        // Count open quotes vs closed quotes
-        const doubleQuoteCount = (text.match(/"/g) || []).length;
-        const singleQuoteCount = (text.match(/'/g) || []).length;
+        if (debug) console.log('[QA] fixHangingPunctuation input:', text.slice(-50));
+        
+        // First, remove orphaned opening punctuation at the very end
+        const orphanedOpenings = /[\s—-]*["([{][\s—-]*$/;
+        if (orphanedOpenings.test(processedText)) {
+            processedText = processedText.replace(orphanedOpenings, '');
+            modified = true;
+            statsCache.hangingFixed++;
+            if (debug) console.log('[QA] Removed orphaned opening punctuation');
+        }
+        
+        // Count paired punctuation
+        const doubleQuoteCount = (processedText.match(/"/g) || []).length;
+        
+        if (debug) console.log('[QA] Double quote count:', doubleQuoteCount);
         
         // Fix unclosed double quotes
         if (doubleQuoteCount % 2 !== 0) {
-            // Check if last quote is opening (after any non-quote character)
-            if (text.match(/[^"]\s*"[^"]*$/)) {
-                // This is likely incomplete dialogue - add em-dash and close
-                processedText = processedText.trimEnd() + '—"';
-                modified = true;
-                statsCache.hangingFixed++;
+            // Find the last quote
+            const lastQuoteIndex = processedText.lastIndexOf('"');
+            
+            if (lastQuoteIndex !== -1) {
+                const afterQuote = processedText.substring(lastQuoteIndex + 1);
+                
+                if (debug) console.log('[QA] Content after last quote:', afterQuote);
+                
+                if (afterQuote.trim().length > 0) {
+                    // There's content after the quote
+                    // Check if it ends with punctuation
+                    if (afterQuote.trim().match(/[.!?]$/)) {
+                        // Already has ending punctuation - just close the quote
+                        processedText = processedText + '"';
+                        if (debug) console.log('[QA] Added closing quote after punctuation');
+                    } else {
+                        // No ending punctuation - add em-dash and close
+                        processedText = processedText + '—"';
+                        if (debug) console.log('[QA] Added em-dash and closing quote');
+                    }
+                    modified = true;
+                    statsCache.hangingFixed++;
+                } else {
+                    // No content - remove the orphaned quote
+                    processedText = processedText.substring(0, lastQuoteIndex).trimEnd();
+                    modified = true;
+                    statsCache.hangingFixed++;
+                    if (debug) console.log('[QA] Removed orphaned quote');
+                }
             }
         }
         
-        // Fix unclosed single quotes (but be careful of contractions)
-        if (singleQuoteCount % 2 !== 0) {
-            // Check if it's likely dialogue (not a contraction)
-            const lastSingleQuote = text.lastIndexOf("'");
-            if (lastSingleQuote > 0) {
-                const beforeQuote = text.substring(Math.max(0, lastSingleQuote - 10), lastSingleQuote);
-                // If there's whitespace before the quote, it's likely dialogue
-                if (beforeQuote.match(/\s'$/)) {
-                    processedText = processedText.trimEnd() + '—\'';
+        // Count other paired punctuation
+        const openParen = (processedText.match(/\(/g) || []).length;
+        const closeParen = (processedText.match(/\)/g) || []).length;
+        const openBracket = (processedText.match(/\[/g) || []).length;
+        const closeBracket = (processedText.match(/\]/g) || []).length;
+        const openBrace = (processedText.match(/\{/g) || []).length;
+        const closeBrace = (processedText.match(/\}/g) || []).length;
+        
+        // Fix unclosed parentheses
+        if (openParen > closeParen) {
+            const lastOpenParen = processedText.lastIndexOf('(');
+            if (lastOpenParen > -1) {
+                const afterParen = processedText.substring(lastOpenParen + 1).trim();
+                if (afterParen.length > 0) {
+                    processedText = processedText + ')';
                     modified = true;
                     statsCache.hangingFixed++;
                 }
             }
         }
         
-        // Fix unclosed parentheses
-        const openParen = (text.match(/\(/g) || []).length;
-        const closeParen = (text.match(/\)/g) || []).length;
-        if (openParen > closeParen) {
-            processedText = processedText.trimEnd() + ')';
-            modified = true;
-            statsCache.hangingFixed++;
-        }
-        
         // Fix unclosed brackets
-        const openBracket = (text.match(/\[/g) || []).length;
-        const closeBracket = (text.match(/\]/g) || []).length;
         if (openBracket > closeBracket) {
-            processedText = processedText.trimEnd() + ']';
-            modified = true;
-            statsCache.hangingFixed++;
+            const lastOpenBracket = processedText.lastIndexOf('[');
+            if (lastOpenBracket > -1) {
+                const afterBracket = processedText.substring(lastOpenBracket + 1).trim();
+                if (afterBracket.length > 0) {
+                    processedText = processedText + ']';
+                    modified = true;
+                    statsCache.hangingFixed++;
+                }
+            }
         }
         
-        // Fix unclosed curly braces
-        const openBrace = (text.match(/\{/g) || []).length;
-        const closeBrace = (text.match(/\}/g) || []).length;
+        // Fix unclosed braces
         if (openBrace > closeBrace) {
-            processedText = processedText.trimEnd() + '}';
-            modified = true;
-            statsCache.hangingFixed++;
+            const lastOpenBrace = processedText.lastIndexOf('{');
+            if (lastOpenBrace > -1) {
+                const afterBrace = processedText.substring(lastOpenBrace + 1).trim();
+                if (afterBrace.length > 0) {
+                    processedText = processedText + '}';
+                    modified = true;
+                    statsCache.hangingFixed++;
+                }
+            }
         }
         
         if (modified) {
             statsCache.totalReplacements++;
         }
         
-        return processedText;
+        if (debug) console.log('[QA] fixHangingPunctuation output:', processedText.slice(-50));
+        
+        return processedText.trim() + ' ';  // Always end with space
     }
     
     // Other processing functions remain the same
@@ -861,21 +895,20 @@ function QualityAssurance(hook, text) {
             '$1\n"$2"'
         );
         
-        // Add newline after dialogue + attribution before new sentences
-        text = text.replace(/"([^"]+)"([^.!?]*[.!?])\s+([A-Z])/g, 
-            '"$1"$2\n$3'
-        );
-        
         return text;
     }
     
     function enforceParagraphBreaks(text) {
         if (!text || typeof text !== 'string') return '';
         
+        // Normalize spacing first
         text = text.replace(/\s*\n\s*/g, '\n');
         text = text.replace(/\n{3,}/g, '\n\n');
         text = text.replace(/\s{2,}/g, ' ');
-        text = text.replace(/([.!?])\s*\n\s*([A-Z])/g, '$1\n\n$2');
+        
+        // Only add paragraph breaks between non-dialogue sentences
+        // This regex specifically excludes patterns that look like dialogue
+        text = text.replace(/([.!?])(?!["'])\s*\n\s*(?!["'])([A-Z])/g, '$1\n\n$2');
         
         return text.trim();
     }
@@ -960,7 +993,7 @@ function QualityAssurance(hook, text) {
                     if (debug) console.log('[QA] Error fixing hanging punctuation:', error.message);
                 }
             }
-            
+
             // Step 5: Separate dialogue
             if (config.separateDialogue) {
                 try {
@@ -969,7 +1002,7 @@ function QualityAssurance(hook, text) {
                     if (debug) console.log('[QA] Error separating dialogue:', error.message);
                 }
             }
-            
+
             // Step 6: Enforce paragraph breaks
             if (config.enforceParagraphs) {
                 try {
@@ -978,7 +1011,7 @@ function QualityAssurance(hook, text) {
                     if (debug) console.log('[QA] Error enforcing paragraphs:', error.message);
                 }
             }
-            
+
             // Always ensure output ends with space
             processedText = processedText.trim() + ' ';
         
