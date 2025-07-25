@@ -434,7 +434,7 @@ function ASCQ(text) {
             `## Overview\n`+
             `ASCQ triggers story cards based on query expressions.\n`+
             `Prefix triggers with $Q: to create a query trigger.\n`+
-            `Can place complex triggers in description if encapsulated like {$Q: Expression}\n` +
+            `Can also place complex triggers in description encapsulated in {}` +
             `\n`+
             `### Text Pattern Functions\n`+
             `near("word1", "word2", distance) - Words within N characters\n`+

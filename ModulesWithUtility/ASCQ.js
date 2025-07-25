@@ -1,20 +1,6 @@
 const Utilities = (function() {
     'use strict';
-    
-    // Usage in other modules:
-    // const data = Utilities.plainText.parseEncapsulated(text);
-    // const hash = Utilities.math.hash(input);
-    // const card = Utilities.storyCard.get(title);
-    // const cmd = Utilities.command.parseCommand('/give sword --enchanted');
-    // const turnsSince = Utilities.turn.elapsed('last_save');
-    
-    // Note: Some utilities enhance native JS functions rather than duplicate them:
-    // - pad() uses native padStart/padEnd when possible, falls back for multi-char padding
-    // - flatten() uses native Array.flat() (ES2019+)
-    // - round() adds decimal place support to Math.round()
-    // - modulo() provides true modulo (not remainder like %)
-    // - deepClone() used since structuredClone() may not be in isolated-vm
-    
+
     // =====================================
     // API DOCUMENTATION
     // =====================================
@@ -24,12 +10,6 @@ const Utilities = (function() {
      * =====================
      * General-purpose expression parser for evaluating string expressions
      * with state/info access, text matching, regex, and fuzzy matching.
-     * 
-     * DOCUMENTATION CORRECTIONS FOR AI DUNGEON:
-     * - Promises work asynchronously via microtask queue (standard JS behavior)
-     * - No true parallelism - single threaded with event loop
-     * - No timer APIs (setTimeout, setInterval) or Worker threads
-     * - Use info.actionCount for turn count (state.actionCount is not native)
      * 
      * parse(expression: string) -> Function|null
      *   Parses expression and returns evaluator function
@@ -4141,7 +4121,7 @@ function ASCQ(text) {
             `## Overview\n`+
             `ASCQ triggers story cards based on query expressions.\n`+
             `Prefix triggers with $Q: to create a query trigger.\n`+
-            `Can place complex triggers in description if encapsulated like {$Q: Expression}\n` +
+            `Can also place complex triggers in description encapsulated in {}` +
             `\n`+
             `### Text Pattern Functions\n`+
             `near("word1", "word2", distance) - Words within N characters\n`+
@@ -4206,7 +4186,7 @@ function ASCQ(text) {
         Utilities.storyCard.upsert({
             title: "[ASCQ] Help & Configuration",
             entry: helpEntry,
-            type: "ASCQ",
+            type: "SYSTEM",
             keys: "",
             description: configText
         });
@@ -4307,7 +4287,7 @@ function ASCQ(text) {
         Utilities.storyCard.upsert({
             title: debugTitle,
             entry: debugEntry,
-            type: "ASCQ",
+            type: "DEBUG",
             keys: "",
             description: finalContext.replace(/\{title:[^}]+\}/g, '%ACtitleDebugOnly%')
         });
