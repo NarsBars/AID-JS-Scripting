@@ -910,20 +910,41 @@ function QualityAssurance(hook, text) {
         return text;
     }
     
-    function removeMarkdown(text) {
+   function removeMarkdown(text) {
         // Remove markdown pairs but keep text inside
         // Handles *italic*, **bold**, and ***bold italic***
         let processedText = text;
         let markdownCount = 0;
+        let strayCount = 0;
         
+        // First pass: remove markdown pairs
         processedText = processedText.replace(/\*{1,3}([^*]+)\*{1,3}/g, (match, content) => {
             markdownCount++;
             return content;
         });
         
-        if (markdownCount > 0) {
-            statsCache.markdownRemoved += markdownCount;
-            statsCache.totalReplacements += markdownCount;
+        // Second pass: remove stray asterisks from last ~200 characters
+        const splitPoint = Math.max(0, processedText.length - 200);
+        const start = processedText.substring(0, splitPoint);
+        let end = processedText.substring(splitPoint);
+        
+        // Count and remove stray asterisks in the end portion
+        const strayAsterisks = (end.match(/\*/g) || []).length;
+        if (strayAsterisks > 0) {
+            end = end.replace(/\*/g, '');
+            strayCount = strayAsterisks;
+        }
+        
+        processedText = start + end;
+        
+        // Update stats
+        if (markdownCount > 0 || strayCount > 0) {
+            statsCache.markdownRemoved += markdownCount + strayCount;
+            statsCache.totalReplacements += markdownCount + strayCount;
+            
+            if (debug) {
+                console.log(`[QA] Removed ${markdownCount} markdown pairs and ${strayCount} stray asterisks`);
+            }
         }
         
         return processedText;
