@@ -50,6 +50,7 @@ function QualityAssurance(hook, text) {
         phrasesRemoved: 0,
         namesReplaced: 0,
         hangingFixed: 0,
+        markdownRemoved: 0,
         totalReplacements: 0
     };
     
@@ -104,7 +105,8 @@ function QualityAssurance(hook, text) {
             reduceFillers: Utilities.string.parseBoolean(settings.reduce_fillers || 'true'),
             separateDialogue: Utilities.string.parseBoolean(settings.separate_dialogue || 'true'),
             replaceNames: Utilities.string.parseBoolean(settings.replace_names || 'true'),
-            fixHangingPunctuation: Utilities.string.parseBoolean(settings.fix_hanging_punctuation || 'true')
+            fixHangingPunctuation: Utilities.string.parseBoolean(settings.fix_hanging_punctuation || 'true'),
+            removeMarkdown: Utilities.string.parseBoolean(settings.remove_markdown || 'true')
         };
         
         configCache = config;
@@ -120,7 +122,8 @@ function QualityAssurance(hook, text) {
             reduce_fillers: true,
             separate_dialogue: true,
             replace_names: true,
-            fix_hanging_punctuation: true
+            fix_hanging_punctuation: true,
+            remove_markdown: true
         };
         
                 const entryText = (
@@ -133,7 +136,8 @@ function QualityAssurance(hook, text) {
             `Reduce Fillers: ${defaultSettings.reduce_fillers}\n`+
             `Separate Dialogue: ${defaultSettings.separate_dialogue}\n`+
             `Replace Names: ${defaultSettings.replace_names}\n`+
-            `Fix Hanging Punctuation: ${defaultSettings.fix_hanging_punctuation}`
+            `Fix Hanging Punctuation: ${defaultSettings.fix_hanging_punctuation}\n` +
+            `Remove Markdown: ${defaultSettings.remove_markdown}`
         );
         
         const descriptionText = ``;
@@ -906,6 +910,26 @@ function QualityAssurance(hook, text) {
         return text;
     }
     
+    function removeMarkdown(text) {
+        // Remove markdown pairs but keep text inside
+        // Handles *italic*, **bold**, and ***bold italic***
+        let processedText = text;
+        let markdownCount = 0;
+        
+        processedText = processedText.replace(/\*{1,3}([^*]+)\*{1,3}/g, (match, content) => {
+            markdownCount++;
+            return content;
+        });
+        
+        if (markdownCount > 0) {
+            statsCache.markdownRemoved += markdownCount;
+            statsCache.totalReplacements += markdownCount;
+        }
+        
+        return processedText;
+    }
+    
+
     function resetStats() {
         statsCache = {
             clichesRemoved: 0,
@@ -913,6 +937,7 @@ function QualityAssurance(hook, text) {
             phrasesRemoved: 0,
             namesReplaced: 0,
             hangingFixed: 0,
+            markdownRemoved: 0,
             totalReplacements: 0
         };
         nameMapCache.clear();
@@ -987,7 +1012,16 @@ function QualityAssurance(hook, text) {
                 }
             }
 
-            // Step 5: Separate dialogue
+            // Step 5: Remove markdown formatting
+            if (config.removeMarkdown) {
+                try {
+                    processedText = removeMarkdown(processedText);
+                } catch (error) {
+                    if (debug) console.log('[QA] Error removing markdown:', error.message);
+                }
+            }
+
+            // Step 6: Separate dialogue
             if (config.separateDialogue) {
                 try {
                     processedText = separateDialogue(processedText);
