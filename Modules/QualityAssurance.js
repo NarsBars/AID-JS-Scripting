@@ -58,7 +58,10 @@ function QualityAssurance(hook, text) {
     let usedNamesCache = new Set();
     let usedReplacements = {};
     
-    // Helper to find all cards with a prefix
+    function cardExists(title) {
+        return Utilities.storyCard.get(title) !== null;
+    }
+    
     function findAllCardsWithPrefix(prefix) {
         const cards = [];
         
@@ -143,10 +146,16 @@ function QualityAssurance(hook, text) {
             description: descriptionText
         });
         
-        // Create default rule cards
-        createDefaultClicheRules();
-        createDefaultFillerRules();
-        createDefaultNameGroups();
+        // Only create default rule cards if they don't exist
+        if (!cardExists(CLICHE_PREFIX)) {
+            createDefaultClicheRules();
+        }
+        if (!cardExists(FILLER_PREFIX)) {
+            createDefaultFillerRules();
+        }
+        if (!cardExists(NAME_PREFIX)) {
+            createDefaultNameGroups();
+        }
     }
     
     function createDefaultClicheRules() {
@@ -297,6 +306,7 @@ function QualityAssurance(hook, text) {
     
     // Load cliché and filler rules from all cards
     function loadTextRules() {
+        
         if (rulesCache) return rulesCache;
         
         const rules = {
@@ -423,6 +433,7 @@ function QualityAssurance(hook, text) {
     
     // Load name replacement groups from all cards
     function loadNameGroups() {
+        
         if (nameGroupsCache) return nameGroupsCache;
         
         const groups = new Map();
