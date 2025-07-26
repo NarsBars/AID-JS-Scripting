@@ -100,7 +100,6 @@ function QualityAssurance(hook, text) {
             removeCliches: Utilities.string.parseBoolean(settings.remove_cliches || 'true'),
             reduceFillers: Utilities.string.parseBoolean(settings.reduce_fillers || 'true'),
             separateDialogue: Utilities.string.parseBoolean(settings.separate_dialogue || 'true'),
-            enforceParagraphs: Utilities.string.parseBoolean(settings.enforce_paragraphs || 'true'),
             replaceNames: Utilities.string.parseBoolean(settings.replace_names || 'true'),
             fixHangingPunctuation: Utilities.string.parseBoolean(settings.fix_hanging_punctuation || 'true')
         };
@@ -117,7 +116,6 @@ function QualityAssurance(hook, text) {
             remove_cliches: true,
             reduce_fillers: true,
             separate_dialogue: true,
-            enforce_paragraphs: true,
             replace_names: true,
             fix_hanging_punctuation: true
         };
@@ -131,7 +129,6 @@ function QualityAssurance(hook, text) {
             `Remove Cliches: ${defaultSettings.remove_cliches}\n`+
             `Reduce Fillers: ${defaultSettings.reduce_fillers}\n`+
             `Separate Dialogue: ${defaultSettings.separate_dialogue}\n`+
-            `Enforce Paragraphs: ${defaultSettings.enforce_paragraphs}\n`+
             `Replace Names: ${defaultSettings.replace_names}\n`+
             `Fix Hanging Punctuation: ${defaultSettings.fix_hanging_punctuation}`
         );
@@ -892,25 +889,10 @@ function QualityAssurance(hook, text) {
     function separateDialogue(text) {
         // Add newline before dialogue after sentence endings
         text = text.replace(/([.!?])\s+"([^"]+)"/g, 
-            '$1\n"$2"'
+            '$1\n\n"$2"'
         );
         
         return text;
-    }
-    
-    function enforceParagraphBreaks(text) {
-        if (!text || typeof text !== 'string') return '';
-        
-        // Normalize spacing first
-        text = text.replace(/\s*\n\s*/g, '\n');
-        text = text.replace(/\n{3,}/g, '\n\n');
-        text = text.replace(/\s{2,}/g, ' ');
-        
-        // Only add paragraph breaks between non-dialogue sentences
-        // This regex specifically excludes patterns that look like dialogue
-        text = text.replace(/([.!?])(?!["'])\s*\n\s*(?!["'])([A-Z])/g, '$1\n\n$2');
-        
-        return text.trim();
     }
     
     function resetStats() {
@@ -1000,15 +982,6 @@ function QualityAssurance(hook, text) {
                     processedText = separateDialogue(processedText);
                 } catch (error) {
                     if (debug) console.log('[QA] Error separating dialogue:', error.message);
-                }
-            }
-
-            // Step 6: Enforce paragraph breaks
-            if (config.enforceParagraphs) {
-                try {
-                    processedText = enforceParagraphBreaks(processedText);
-                } catch (error) {
-                    if (debug) console.log('[QA] Error enforcing paragraphs:', error.message);
                 }
             }
 
