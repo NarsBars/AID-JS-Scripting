@@ -802,7 +802,7 @@ function QualityAssurance(hook, text) {
         
         if (debug) console.log('[QA] fixHangingPunctuation output:', processedText.slice(-50));
         
-        return processedText.trim() + ' ';  // Always end with space
+        return processedText;
     }
     
     // Other processing functions remain the same
@@ -910,7 +910,7 @@ function QualityAssurance(hook, text) {
         return text;
     }
     
-   function removeMarkdown(text) {
+    function removeMarkdown(text) {
         // Remove markdown pairs but keep text inside
         // Handles *italic*, **bold**, and ***bold italic***
         let processedText = text;
@@ -966,6 +966,15 @@ function QualityAssurance(hook, text) {
         usedReplacements = {};
     }
     
+    if (hook === 'input') {
+        text = text.replace(/^ /, '');
+        const hasTrailingWhitespace = /\s$/.test(text);
+        if (!hasTrailingWhitespace) {
+            text = text + ' ';
+        }
+        return text;
+    }
+
     // CONTEXT HOOK: Store context for repeated phrase detection
     if (hook === 'context') {
         const config = loadConfiguration();
@@ -973,9 +982,8 @@ function QualityAssurance(hook, text) {
         if (config.removeRepeated) {
             const recentStoryRegex = /^[\s\S]*?Recent Story:?\s*/i;
             const contextText = text.replace(recentStoryRegex, '');
-            Utilities.cache.set('quality', 'context', contextText);
+            state.storedContext = contextText;
         }
-        
         // Context hook returns nothing
         return;
     }
@@ -1010,7 +1018,7 @@ function QualityAssurance(hook, text) {
             // Step 3: Remove repeated phrases from context
             if (config.removeRepeated) {
                 try {
-                    const storedContext = Utilities.cache.get('quality', 'context');
+                    const storedContext = state.storedContext;
                     if (storedContext) {
                         processedText = removeRepeatedPhrases(
                             processedText, 
@@ -1052,7 +1060,10 @@ function QualityAssurance(hook, text) {
             }
 
             // Always ensure output ends with space
-            processedText = processedText.trim() + ' ';
+            const hasTrailingWhitespace = /\s$/.test(text);
+            if (!hasTrailingWhitespace) {
+              processedText = processedText + ' ';
+            }
         
             if (debug) {
                 console.log(`[QA] Stats:`, statsCache);
