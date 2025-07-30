@@ -41,7 +41,6 @@ function QualityAssurance(hook, text) {
     const NAME_PREFIX = '[QA] Name Replacer';
     
     // Module-level cache
-    let configCache = null;
     let rulesCache = null;
     let nameGroupsCache = null;
     let statsCache = {
@@ -85,8 +84,7 @@ function QualityAssurance(hook, text) {
     
     // Configuration Management
     function loadConfiguration() {
-        if (configCache) return configCache;
-        
+
         const configCard = Utilities.storyCard.get(CONFIG_CARD);
         if (!configCard) {
             createDefaultConfiguration();
@@ -103,13 +101,12 @@ function QualityAssurance(hook, text) {
             minOccurrences: parseInt(settings.min_occurrences) || 2,
             removeCliches: Utilities.string.parseBoolean(settings.remove_cliches || 'true'),
             reduceFillers: Utilities.string.parseBoolean(settings.reduce_fillers || 'true'),
-            separateDialogue: Utilities.string.parseBoolean(settings.separate_dialogue || 'true'),
+            separateDialogue: Utilities.string.parseBoolean(settings.separate_dialogue || 'false'),
             replaceNames: Utilities.string.parseBoolean(settings.replace_names || 'true'),
             fixHangingPunctuation: Utilities.string.parseBoolean(settings.fix_hanging_punctuation || 'true'),
             removeMarkdown: Utilities.string.parseBoolean(settings.remove_markdown || 'true')
         };
         
-        configCache = config;
         return config;
     }
     
@@ -903,9 +900,10 @@ function QualityAssurance(hook, text) {
     
     function separateDialogue(text) {
         // Add newline before dialogue after sentence endings
-        text = text.replace(/([.!?])\s+"([^"]+)"/g, 
-            '$1\n\n"$2"'
-        );
+        text = text.replace(/([.!?])\s+"([^"]+)"/g, '$1\n\n"$2"');
+        
+        // Add newline between consecutive dialogue (quote followed by quote)
+        text = text.replace(/"\s+"/g, '"\n\n"');
         
         return text;
     }
@@ -1060,7 +1058,7 @@ function QualityAssurance(hook, text) {
             }
 
             // Always ensure output ends with space
-            const hasTrailingWhitespace = /\s$/.test(text);
+            const hasTrailingWhitespace = /\s$/.test(processedText);
             if (!hasTrailingWhitespace) {
               processedText = processedText + ' ';
             }
