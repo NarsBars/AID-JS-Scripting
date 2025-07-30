@@ -899,13 +899,20 @@ function QualityAssurance(hook, text) {
     }
     
     function separateDialogue(text) {
-        // Add newline before dialogue after sentence endings
-        text = text.replace(/([.!?])\s+"([^"]+)"/g, '$1\n\n"$2"');
-        
-        // Add newline between consecutive dialogue (quote followed by quote)
-        text = text.replace(/"\s+"/g, '"\n\n"');
-        
-        return text;
+    // add breaks before dialogue starts (after narrative)
+    text = text.replace(/([.!?])\s+(?=")/g, '$1\n\n');
+    
+    // add breaks between consecutive dialogue
+    text = text.replace(/("\s+)(?=")/g, '$1\n\n');
+    
+    // add breaks after dialogue ends (before narrative)
+    text = text.replace(/("\s+)(?=[A-Z][^"])/g, '$1\n\n');
+    
+    // break up long narrative sections (over ~150 chars without existing breaks)
+    text = text.replace(/([^"\n]{150,}?[.!?])\s+(?=[A-Z])/g, '$1\n\n');
+    text = text.replace(/\n{3,}/g, '\n\n');
+    
+    return text;
     }
     
     function removeMarkdown(text) {
