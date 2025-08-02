@@ -4,7 +4,7 @@ function INSANITY(hook, text) {
     // scenario specific
     const MARKER = '<<<INSANITY_MARKER>>>';
     const OPENING = `${MARKER}\n` +
-    `The portal spits you out onto the cold concrete floor. Again.\n\n` +
+    `You're spit back out onto the cold concrete floor. Again.\n\n` +
     `You don't even try to catch yourself anymore. Your palms know every scratch in this surface, every imperfection in the grey expanse. The fluorescent lights flicker to life overhead - same pattern as always. Two beats, pause, one beat, steady hum.\n\n` +
     `Sector 7. Sublevel 3. Containment Wing B.\n\n` +
     `The emergency lockdown has been active for... you've lost count of how many loops, how many alternate realities.\n\n` +
