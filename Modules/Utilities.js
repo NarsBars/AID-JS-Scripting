@@ -1829,8 +1829,7 @@ const Utilities = (function() {
                     if (sectionContent.length > 0) {
                         const content = sectionContent.join('\n').trim();
                         if (content) {
-                            sections[StringUtils.toSnakeCase(currentSection)] = 
-                                this.parseSectionContent(content);
+                            sections[currentSection] = this.parseSectionContent(content);
                         }
                     }
                     
@@ -1844,8 +1843,7 @@ const Utilities = (function() {
             if (sectionContent.length > 0) {
                 const content = sectionContent.join('\n').trim();
                 if (content) {
-                    sections[StringUtils.toSnakeCase(currentSection)] = 
-                        this.parseSectionContent(content);
+                    sections[currentSection] = this.parseSectionContent(content);
                 }
             }
             
@@ -1876,7 +1874,7 @@ const Utilities = (function() {
                 
                 const match = trimmed.match(/^([^:]+):\s*(.+)$/);
                 if (match) {
-                    const key = StringUtils.toSnakeCase(match[1].trim());
+                    const key = match[1].trim();
                     let value = match[2].trim();
                     
                     if (parseValues) {
@@ -1973,7 +1971,7 @@ const Utilities = (function() {
                         .map(cell => cell.trim());
                     
                     if (!headers) {
-                        headers = cells.map(h => StringUtils.toSnakeCase(h));
+                        headers = cells;
                         inTable = true;
                     } else {
                         const row = {};
@@ -2000,7 +1998,7 @@ const Utilities = (function() {
             if (data.sections) {
                 Object.entries(data.sections).forEach(([sectionName, content]) => {
                     lines.push('');
-                    lines.push(`## ${StringUtils.toTitleCase(sectionName)}`);
+                    lines.push(`## ${sectionName}`);
                     lines.push(this.formatSectionContent(content));
                 });
             }
@@ -2030,9 +2028,8 @@ const Utilities = (function() {
         formatKeyValues(obj) {
             return Object.entries(obj)
                 .map(([key, value]) => {
-                    const formattedKey = StringUtils.toTitleCase(key.replace(/_/g, ' '));
                     const formattedValue = this.formatValue(value);
-                    return `${formattedKey}: ${formattedValue}`;
+                    return `${key}: ${formattedValue}`;
                 })
                 .join('\n');
         },
@@ -2070,7 +2067,7 @@ const Utilities = (function() {
             if (rows.length === 0) return '';
             
             const headers = Object.keys(rows[0]);
-            const headerRow = headers.map(h => StringUtils.toTitleCase(h.replace(/_/g, ' ')));
+            const headerRow = headers;
             
             const widths = headers.map((header, i) => {
                 const values = [headerRow[i], ...rows.map(r => String(r[header] || ''))];
