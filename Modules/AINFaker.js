@@ -114,7 +114,6 @@ function AINFaker(text) {
                     const card = storyCards[i];
                     card.entry = helpText;
                     card.description = configText;
-                    updateStoryCard(i, "", helpText, card.type || "system", configText);
                     break;
                 }
             }
