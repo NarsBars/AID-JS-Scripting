@@ -676,7 +676,7 @@ function QualityAssurance(hook, text) {
         
         // Clean up spacing
         processedText = processedText
-        .replace(/\s+/g, ' ')                    // Collapse whitespace
+        .replace(/[^\S\n]+/g, ' ')                      // Collapse whitespace
         .replace(/\s+([,!?;:])/g, '$1')          // Remove space before punctuation (but NOT periods)
         .replace(/\s+(\.(?!\.))/g, '$1')         // Remove space before single period only
         .replace(/(\w)\s+\.\s+\.\s+\./g, '$1...') // Fix spaced ellipses
@@ -899,20 +899,18 @@ function QualityAssurance(hook, text) {
     }
     
     function separateDialogue(text) {
-    // add breaks before dialogue starts (after narrative)
-    text = text.replace(/([.!?])\s+(?=")/g, '$1\n\n');
-    
-    // add breaks between consecutive dialogue
-    text = text.replace(/("\s+)(?=")/g, '$1\n\n');
-    
-    // add breaks after dialogue ends (before narrative)
-    text = text.replace(/("\s+)(?=[A-Z][^"])/g, '$1\n\n');
-    
-    // break up long narrative sections (over ~150 chars without existing breaks)
-    text = text.replace(/([^"\n]{150,}?[.!?])\s+(?=[A-Z])/g, '$1\n\n');
-    text = text.replace(/\n{3,}/g, '\n\n');
-    
-    return text;
+        // add breaks before dialogue starts (after narrative)
+        text = text.replace(/([.!?])\s+(?=")/g, '$1\n\n');
+        
+        // add breaks between consecutive dialogue
+        text = text.replace(/("\s+)(?=")/g, '$1\n\n');
+        
+        // add breaks after dialogue ends (before narrative)
+        text = text.replace(/("\s+)(?=[A-Z][^"])/g, '$1\n\n');
+        
+        text = text.replace(/\n{3,}/g, '\n\n');
+        
+        return text;
     }
     
     function removeMarkdown(text) {
@@ -954,7 +952,6 @@ function QualityAssurance(hook, text) {
         
         return processedText;
     }
-    
 
     function resetStats() {
         statsCache = {
@@ -972,11 +969,6 @@ function QualityAssurance(hook, text) {
     }
     
     if (hook === 'input') {
-        text = text.replace(/^ /, '');
-        const hasTrailingWhitespace = /\s$/.test(text);
-        if (!hasTrailingWhitespace) {
-            text = text + ' ';
-        }
         return text;
     }
 
@@ -1065,9 +1057,14 @@ function QualityAssurance(hook, text) {
             }
 
             // Always ensure output ends with space
-            const hasTrailingWhitespace = /\s$/.test(processedText);
-            if (!hasTrailingWhitespace) {
-              processedText = processedText + ' ';
+            const shouldNotAddSpace = 
+                /[\s\n]$/.test(processedText) ||      // Already has whitespace/newline
+                /[-—–]$/.test(processedText) ||        // Ends with dash/emdash (interrupted speech)
+                /^$/.test(processedText);               // Empty string
+
+            // Only add space if it doesn't end with these special cases
+            if (!shouldNotAddSpace) {
+                processedText = processedText + ' ';
             }
         
             if (debug) {
