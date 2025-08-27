@@ -2312,34 +2312,79 @@ const Utilities = (function() {
     
     const ContextUtils = {
         extractPlotEssentials(context) {
-            // Everything from start to World Lore or Recent Story
-            const worldLoreMatch = context.match(/World\s*Lore\s*:\s*/i);
-            const recentStoryMatch = context.match(/Recent\s*Story\s*:\s*/i);
+            // Everything from start to World Lore, Memories, or Recent Story (whichever comes first)
+            const worldLoreMatch = context.match(/#?\s*World\s*Lore\s*:\s*/i);
+            const memoriesMatch = context.match(/#?\s*Memories\s*:\s*/i);
+            const recentStoryMatch = context.match(/#?\s*Recent\s*Story\s*:\s*/i);
             
-            let endIndex;
-            if (worldLoreMatch) {
+            let endIndex = context.length;
+            
+            // Find the earliest section marker
+            if (worldLoreMatch && worldLoreMatch.index < endIndex) {
                 endIndex = worldLoreMatch.index;
-            } else if (recentStoryMatch) {
+            }
+            if (memoriesMatch && memoriesMatch.index < endIndex) {
+                endIndex = memoriesMatch.index;
+            }
+            if (recentStoryMatch && recentStoryMatch.index < endIndex) {
                 endIndex = recentStoryMatch.index;
-            } else {
-                return context; // No sections found, entire text is plot essentials
+            }
+            
+            // If no sections found, entire text is plot essentials
+            if (endIndex === context.length) {
+                return context;
             }
             
             return context.substring(0, endIndex).trim();
         },
-
+        
         extractWorldLore(context) {
-            // Everything from World Lore: to Recent Story:
-            const worldLoreMatch = context.match(/World\s*Lore\s*:\s*/i);
+            // Everything from World Lore: to Memories: or Recent Story: (whichever comes first)
+            const worldLoreMatch = context.match(/#?\s*World\s*Lore:\s*/i);
             if (!worldLoreMatch) return '';
             
-            const recentStoryMatch = context.match(/Recent\s*Story\s*:\s*/i);
+            const memoriesMatch = context.match(/#?\s*Memories:\s*/i);
+            const recentStoryMatch = context.match(/#?\s*Recent\s*Story:\s*/i);
+            
             const startIndex = worldLoreMatch.index + worldLoreMatch[0].length;
+            let endIndex = context.length;
+            
+            // Find the next section after World Lore
+            if (memoriesMatch && memoriesMatch.index > startIndex) {
+                endIndex = memoriesMatch.index;
+            }
+            if (recentStoryMatch && recentStoryMatch.index > startIndex && recentStoryMatch.index < endIndex) {
+                endIndex = recentStoryMatch.index;
+            }
+            
+            return context.substring(startIndex, endIndex).trim();
+        },
+        
+        extractMemories(context) {
+            // Everything from Memories: to Recent Story:
+            const memoriesMatch = context.match(/#?\s*Memories\s*:\s*/i);
+            if (!memoriesMatch) return '';
+            
+            const recentStoryMatch = context.match(/#?\s*Recent\s*Story\s*:\s*/i);
+            const startIndex = memoriesMatch.index + memoriesMatch[0].length;
             const endIndex = recentStoryMatch ? recentStoryMatch.index : context.length;
             
             return context.substring(startIndex, endIndex).trim();
         },
         
+        extractRecentStory(context, removeAuthorNotes = false) {
+            const recentStoryPattern = /#?\s*Recent\s*Story\s*:\s*([\s\S]*?)(?=%@GEN@%|%@COM@%|$)/i;
+            const match = context.match(recentStoryPattern);
+            
+            if (!match) return '';
+            
+            const storyText = match[1].trim();
+            
+            // Only remove author's notes if explicitly requested
+            return removeAuthorNotes ? this.removeAuthorsNotes(storyText) : storyText;
+        },
+        
+        // Helper functions that remain the same
         extractAuthorsNotes(context) {
             // All [Author's note: ...] content
             const notes = [];
@@ -2356,55 +2401,7 @@ const Utilities = (function() {
         removeAuthorsNotes(context) {
             // Remove all author's notes from text
             return context.replace(/\[Author['']s\s*note:[^\]]*\]/gi, '').trim();
-        },
-        
-        extractRecentStory(context, removeAuthorNotes = false) {
-            const recentStoryPattern = /Recent\s*Story\s*:\s*([\s\S]*?)(?=%@GEN@%|%@COM@%|$)/i;
-            const match = context.match(recentStoryPattern);
-            
-            if (!match) return '';
-            
-            const storyText = match[1].trim();
-            
-            // Only remove author's notes if explicitly requested
-            return removeAuthorNotes ? this.removeAuthorsNotes(storyText) : storyText;
-        },
-
-        replaceRecentStory(context, newStoryText) {
-        const recentStoryPattern = /Recent\s*Story\s*:\s*([\s\S]*?)(%@GEN@%|%@COM@%|\s\[\s*Author's\s*note\s*:|$)/i;
-        const match = context.match(recentStoryPattern);
-        
-        if (!match) return context;
-        
-        return context.replace(recentStoryPattern, `Recent Story:\n${newStoryText}${match[2]}`);
-        },
-
-            insertIntoWorldLore(context, insertText) {
-        if (!insertText || insertText.trim().length === 0) {
-            return context;
         }
-        
-        const worldLoreMatch = context.match(/World\s*Lore\s*:\s*/i);
-        if (worldLoreMatch) {
-            const index = worldLoreMatch.index + worldLoreMatch[0].length;
-            const beforeInsert = context.slice(0, index);
-            const afterInsert = context.slice(index);
-            
-            const hasNewline = afterInsert.startsWith('\n');
-            const prefix = hasNewline ? "" : "\n";
-            
-            return beforeInsert + prefix + insertText + "\n" + afterInsert;
-        } else {
-            const recentStoryMatch = context.match(/Recent\s*Story\s*:/i);
-            if (recentStoryMatch) {
-                return context.slice(0, recentStoryMatch.index) + 
-                    "World Lore:\n" + insertText + "\n" +
-                    context.slice(recentStoryMatch.index);
-            } else {
-                return "World Lore:\n" + insertText + "\n" + context;
-            }
-        }
-    }
     };
     
     // =====================================
