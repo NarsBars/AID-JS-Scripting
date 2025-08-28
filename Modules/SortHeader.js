@@ -49,7 +49,6 @@ function GiveMeHeaders(text) {
             `# Level 1 Headers\n` +
             `// Sections parallel to World Lore\n` +
             `-10: System\n` +
-            `-5: Quests\n` +
             `100: Custom\n` +
             `\n` +
             `## Level 2 Headers\n` +
@@ -58,15 +57,10 @@ function GiveMeHeaders(text) {
             `20: Locations\n` +
             `30: Items\n` +
             `40: Factions\n` +
-            `50: Lore\n` +
-            `60: History\n` +
-            `70: Rules\n` +
             `\n` +
             `### Level 3 Headers\n` +
             `// Subsections within Level 2 sections\n` +
             `// Add specific priorities here if needed:\n` +
-            `// 10: Important NPCs\n` +
-            `// 20: Town of Beginnings\n` +
             `\n` +
             `#### Level 4 Headers\n` +
             `// Sub-subsections\n` +
