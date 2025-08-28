@@ -4,98 +4,121 @@ function Calendar(hook, text) {
     const debug = false;
     const MODULE_NAME = 'Calendar';
     
-    // Usage in Scripting Sandbox:
-    // Context Modifier: 
-    //   Calendar("context");
+    // =====================================
+    // CALENDAR MODULE v2.0
+    // =====================================
+    // A complete time and event system for AI Dungeon
     //
-    // API Initialization:
-    //   Calendar();
-    
-    // Configuration Cards:
-    //   [CALENDAR] Time Configuration - Main time system settings
-    //     Note: Leap Year Adjustments must be in a separate ## Leap Year Adjustments section
-    //   [CALENDAR] Event Days - Holiday and event definitions
-    //   [CALENDAR] Event Days 2, 3... - Additional event cards
+    // USAGE:
+    //   Context Modifier: Calendar("context");
+    //   API Only: Calendar();
     //
-    // State Card displays:
-    //   Today's Events: All events scheduled for today
-    //   Active Events: Only events currently in their time window
+    // CONFIGURATION CARDS:
+    //   [CALENDAR] Time Configuration
+    //     - Actions Per Day: How many actions = 1 full day
+    //     - Start Date: MM/DD/YYYY format
+    //     - Starting Time: HH:MM (applied once on first creation)
+    //     - Hours Per Day: Default 24
+    //     - Sections: Time Periods, Seasons, Days of Week, Months, Leap Year
     //
-    // API Methods:
-    // Time Methods:
-    //   Calendar.getCurrentTime() - Returns current time as HH:MM
-    //   Calendar.getFormattedTime() - Returns time with AM/PM
-    //   Calendar.getTimeOfDay() - Returns time period name (e.g., "Morning", "Evening")
-    //   Calendar.getDayProgress() - Returns progress through day (0.0-1.0)
+    //   [CALENDAR] Event Days (1, 2, 3...)
+    //     - Annual: Event Name: MM/DD
+    //     - Weekly: Event Name: Weekday
+    //     - Daily: Event Name: daily
+    //     - Relative: Event Name: Nth Weekday of Month
+    //     - Time ranges: @ HH:MM-HH:MM
+    //     - Multi-day: lasting N days
     //
-    // Date Methods:
-    //   Calendar.getCurrentDate() - Returns full formatted date string
-    //   Calendar.getDayOfWeek() - Returns day name (e.g., "Monday")
-    //   Calendar.getDayOfMonth() - Returns day number in month (1-31)
-    //   Calendar.getMonth() - Returns month name (e.g., "January")
-    //   Calendar.getYear() - Returns current year number
-    //   Calendar.getDayNumber() - Returns current day number (e.g., day 457)
-    //   Calendar.getDayOfYear() - Returns day within current year (e.g., Feb 14 = day 45)
+    // TIME SYSTEM:
+    //   - Uses dayProgress (0.0 to 1.0) for position in day
+    //   - Tracks lastProcessedAction to detect repeated/reversed turns
+    //   - Handles negative action counts and time reversals
+    //   - Normalizes floating point errors on day boundaries
+    //   - Adjustments are tracked and reversible
     //
-    // Season Methods:
-    //   Calendar.getCurrentSeason() - Returns current season name
-    //   Calendar.getYearProgress() - Returns year completion (0.0-1.0)
+    // =====================================
+    // API REFERENCE
+    // =====================================
     //
-    // Event Methods:
-    //   Calendar.getTodayEvents() - Returns array of today's events with time info
-    //   Calendar.getActiveTimeRangeEvents() - Returns only currently active time-range events
-    //   Calendar.getUpcomingEvents(days) - Returns events in next N days
-    //   Calendar.getAllEvents() - Returns all configured events
-    //   Calendar.isEventDay() - Returns true if today has events
-    //   Calendar.clearEventCache() - Force reload of event configuration
-    //   Calendar.clearConfigCache() - Force reload of time configuration  
-    //   Calendar.clearAllCaches() - Clear all cached data
+    // TIME METHODS:
+    //   getCurrentTime()        Returns "HH:MM" format
+    //   getFormattedTime()      Returns "H:MM AM/PM" format  
+    //   getTimeOfDay()          Returns period name (e.g., "Morning")
+    //   getDayProgress()        Returns 0.0-1.0 position in day
     //
-    // Core Methods:
-    //   Calendar.getState() - Returns full time state
-    //   Calendar.getConfig() - Returns configuration
-    //   Calendar.events - Array of time events this turn
-    //     Event types: 'dayChanged', 'seasonChanged', 'eventDay', 'timeReversed', 'timeOfDayChanged',
-    //                  'timeRangeEventStarted', 'timeRangeEventEnding', 'timeRangeEventEnded'
+    // DATE METHODS:
+    //   getCurrentDate()        Returns "Weekday, Month DD, YYYY"
+    //   getDayNumber()          Returns absolute day number (can be negative)
+    //   getDayOfWeek()          Returns weekday name
+    //   getDayOfMonth()         Returns day number in month (1-31)
+    //   getMonth()              Returns month name
+    //   getYear()               Returns year number
+    //   getDayOfYear()          Returns day within year (1-365/366)
     //
-    // Time Manipulation Methods:
-    //   Calendar.advanceTime(timeSpec) - Skip forward/backward in time (e.g., "3d", "-2h")
-    //   Calendar.setTime(hour, minute) - Set time on current day
-    //   Calendar.setDay(day) - Jump to specific day number
-    //   Calendar.setActionsPerDay(number) - Update actions per day config
-    //   Calendar.setHoursPerDay(number) - Update hours per day config
+    // SEASON METHODS:
+    //   getCurrentSeason()      Returns season name or null
+    //   getYearProgress()       Returns 0.0-1.0 position in year
     //
-    // Time System Notes:
-    // - Day number in state can be any value (negative, 0, 200, etc.)
-    // - Progress in state determines time of day (0 to actionsPerDay-1)
-    // - All configuration must come from [CALENDAR] cards
-    // - Leap Year Adjustments must be in a separate section from Leap Year settings
+    // EVENT METHODS:
+    //   getTodayEvents()        Returns array of events for today
+    //   getActiveTimeRangeEvents()  Returns currently active time-range events
+    //   getUpcomingEvents(days) Returns events in next N days
+    //   getAllEvents()          Returns all configured events
+    //   isEventDay()            Returns true if today has events
     //
-    // Example Usage:
-    //   const time = Calendar.getCurrentTime();        // "14:30"
-    //   const time12 = Calendar.getFormattedTime();    // "2:30 PM"
-    //   const period = Calendar.getTimeOfDay();        // "Afternoon"
-    //   const day = Calendar.getDayOfWeek();           // "Tuesday"
-    //   const month = Calendar.getMonth();             // "July"
-    //   const dayNum = Calendar.getDayOfMonth();       // 15
-    //   const dayOfYear = Calendar.getDayOfYear();     // 196 (July 15 = 196th day)
-    //   const totalDays = Calendar.getDayNumber();     // 621 (current day number)
-    //   const season = Calendar.getCurrentSeason();    // "Summer"
-    //   const events = Calendar.getTodayEvents();      // [{name: "Festival", ...}]
-    //   const upcoming = Calendar.getUpcomingEvents(7); // Events in next week
-    //   const fullDate = Calendar.getCurrentDate();    // "Tuesday, July 15, 2023"
+    // TIME MANIPULATION:
+    //   advanceTime(spec)       Skip time forward/backward
+    //                          Examples: "3h", "2d", "-4h", "2d, 3h, 30m"
+    //   setTime(hour, minute)   Set time on current day
+    //   setDay(dayNumber)       Jump to specific day
+    //   setActionsPerDay(n)     Update actions per day config
+    //   setHoursPerDay(n)       Update hours per day config
     //
-    // Time Manipulation Examples:
-    //   Calendar.advanceTime("3h");                     // Skip forward 3 hours
-    //   Calendar.advanceTime("2d");                     // Skip forward 2 days
-    //   Calendar.advanceTime("-4h");                    // Go back 4 hours
-    //   Calendar.advanceTime("2d, 3h, 30m");            // Skip 2 days, 3 hours, 30 minutes
-    //   Calendar.advanceTime("2h30m");                  // Skip 2 hours 30 minutes
-    //   Calendar.setTime(14, 30);                       // Set time to 14:30
-    //   Calendar.setDay(200);                           // Jump to day 200
-    //   Calendar.setDay(-30);                           // Jump to 30 days before start
-    //   Calendar.setActionsPerDay(300);                 // Change to 300 actions per day
-    //   Calendar.setHoursPerDay(20);                    // Change to 20-hour days
+    // STATE METHODS:
+    //   getState()              Returns current time state object
+    //   getConfig()             Returns configuration object
+    //
+    // CACHE METHODS:
+    //   clearEventCache()       Force reload event configuration
+    //   clearConfigCache()      Force reload time configuration
+    //   clearAllCaches()        Clear all cached data
+    //
+    // EVENT PROPERTIES:
+    //   Calendar.events         Array of events that occurred this turn
+    //                          Types: 'dayChanged', 'seasonChanged', 'timeOfDayChanged',
+    //                                 'eventDay', 'timeReversed', 'timeRangeEventStarted',
+    //                                 'timeRangeEventEnding', 'timeRangeEventEnded'
+    //
+    // =====================================
+    // EXAMPLES
+    // =====================================
+    //
+    // Basic Usage:
+    //   const time = Calendar.getCurrentTime();           // "14:30"
+    //   const date = Calendar.getCurrentDate();           // "Tuesday, July 15, 2023"
+    //   const events = Calendar.getTodayEvents();         // [{name: "Market Day", ...}]
+    //
+    // Time Manipulation:
+    //   Calendar.advanceTime("3h");                       // Skip 3 hours
+    //   Calendar.advanceTime("2d, 3h, 30m");             // Skip 2 days, 3.5 hours
+    //   Calendar.advanceTime("-1d");                      // Go back 1 day
+    //   Calendar.setTime(14, 30);                        // Set to 2:30 PM
+    //   Calendar.setDay(100);                            // Jump to day 100
+    //
+    // Event Checking:
+    //   if (Calendar.isEventDay()) {
+    //     const active = Calendar.getActiveTimeRangeEvents();
+    //     // Handle active events
+    //   }
+    //
+    //   // Check for state changes
+    //   for (const event of Calendar.events) {
+    //     if (event.type === 'dayChanged') {
+    //       // New day logic
+    //     }
+    //   }
+    //
+    // =====================================
     
     // Configuration Card Names
     const CONFIG_CARD = '[CALENDAR] Time Configuration';
@@ -105,7 +128,7 @@ function Calendar(hook, text) {
     // Module-level cache (valid for this turn only)
     let eventCache = null;
     let configCache = null;
-    let stateCache = null;
+    let timeDataCache = null;
     
     // ==========================
     // Core Functions
@@ -137,6 +160,16 @@ function Calendar(hook, text) {
                 config.actionsPerDay = parseInt(line.split(':')[1].trim());
             } else if (line.includes('Start Date:')) {
                 config.startDate = line.split(':')[1].trim();
+            } else if (line.includes('Starting Time:')) {
+                // Parse starting time from config
+                const timeStr = line.split(':').slice(1).join(':').trim();
+                const timeMatch = timeStr.match(/^(\d{1,2}):(\d{2})$/);
+                if (timeMatch) {
+                    config.startingTime = {
+                        hour: parseInt(timeMatch[1]),
+                        minute: parseInt(timeMatch[2])
+                    };
+                }
             } else if (line.includes('Hours Per Day:')) {
                 config.hoursPerDay = parseInt(line.split(':')[1].trim());
             }
@@ -296,71 +329,138 @@ function Calendar(hook, text) {
     }
     
     function loadTimeState() {
-        if (stateCache !== null) return stateCache;
+        if (timeDataCache !== null) return timeDataCache;
         
         const config = loadConfiguration();
         if (!config) return null;
         
         const stateCard = Utilities.storyCard.get(STATE_CARD);
         if (!stateCard) {
-            stateCache = createInitialState();
-            return stateCache;
+            timeDataCache = createInitialTimeState();
+            return timeDataCache;
         }
         
         const lines = stateCard.entry.split('\n');
-        const state = {
+        const timeData = {
             day: 0,
-            progress: 0,
+            dayProgress: 0.0,
             lastProcessedAction: -1
         };
         
         for (const line of lines) {
             if (line.startsWith('Day:')) {
-                state.day = parseInt(line.split(':')[1].trim()) || 0;
+                timeData.day = parseInt(line.split(':')[1].trim()) || 0;
+            } else if (line.startsWith('Day Progress:')) {
+                const progressMatch = line.match(/Day Progress:\s*([\d.]+)/);
+                if (progressMatch) timeData.dayProgress = parseFloat(progressMatch[1]);
             } else if (line.startsWith('Progress:')) {
-                const match = line.match(/Progress:\s*(\d+)/);
-                if (match) state.progress = parseInt(match[1]);
+                // Legacy support - convert old integer progress to dayProgress
+                const match = line.match(/Progress:\s*(\d+)\/\[?(\d+)\]?/);
+                if (match && !lines.some(l => l.startsWith('Day Progress:'))) {
+                    const progress = parseInt(match[1]);
+                    const actionsPerDay = parseInt(match[2]) || config.actionsPerDay;
+                    timeData.dayProgress = progress / actionsPerDay;
+                }
             } else if (line.startsWith('Last Processed Action:')) {
-                state.lastProcessedAction = parseInt(line.split(':')[1].trim());
+                timeData.lastProcessedAction = parseInt(line.split(':')[1].trim());
             }
         }
         
-        stateCache = state;
-        return state;
+        // Parse adjustments from description
+        timeData.adjustments = parseAdjustments(stateCard.description || '');
+        
+        // Ensure dayProgress is within valid range
+        timeData.dayProgress = Math.max(0, Math.min(0.999999, timeData.dayProgress));
+        
+        timeDataCache = timeData;
+        return timeData;
     }
     
-    function createInitialState() {
-        const state = {
+    function parseAdjustments(description) {
+        const adjustments = [];
+        const lines = description.split('\n');
+        let inAdjustmentSection = false;
+        
+        for (const line of lines) {
+            if (line.includes('## Time Adjustments')) {
+                inAdjustmentSection = true;
+                continue;
+            }
+            
+            if (inAdjustmentSection) {
+                // Stop at next section
+                if (line.startsWith('##') && !line.includes('Time Adjustments')) {
+                    break;
+                }
+                
+                // Parse adjustment lines: "- Turn X: type amount (±Y)"
+                const match = line.match(/^-\s*Turn\s*(\d+):\s*(\w+)\s*(.+?)\s*\(([+-][\d.]+)\)/);
+                if (match) {
+                    adjustments.push({
+                        turn: parseInt(match[1]),
+                        type: match[2],
+                        description: match[3].trim(),
+                        amount: parseFloat(match[4])
+                    });
+                }
+            }
+        }
+        
+        return adjustments;
+    }
+    
+    function createInitialTimeState() {
+        const config = loadConfiguration();
+        
+        let initialDayProgress = 0.0;
+        
+        // Check if starting time was already applied (one-time only)
+        if (config && config.startingTime && 
+            (typeof state === 'undefined' || !state.startingTimeApplied)) {
+            const { hour, minute } = config.startingTime;
+            if (hour >= 0 && hour < config.hoursPerDay && minute >= 0 && minute < 60) {
+                const totalMinutes = hour * 60 + minute;
+                initialDayProgress = totalMinutes / (config.hoursPerDay * 60);
+                
+                // Mark starting time as applied
+                if (typeof state !== 'undefined') {
+                    state.startingTimeApplied = true;
+                }
+                
+                if (debug) console.log(`${MODULE_NAME}: Starting at ${hour}:${String(minute).padStart(2, '0')} (one-time only)`);
+            }
+        }
+        
+        const timeData = {
             day: 0,
-            progress: 0,
-            lastProcessedAction: -1
+            dayProgress: initialDayProgress,
+            lastProcessedAction: -1,
+            adjustments: []
         };
-        saveTimeState(state);
-        return state;
+        
+        saveTimeState(timeData);
+        return timeData;
     }
     
-    function saveTimeState(state) {
-        if (!state) return;
+    function saveTimeState(timeData) {
+        if (!timeData) return;
         
         const config = loadConfiguration();
         if (!config) return;
         
-        const dayProgress = state.progress / config.actionsPerDay;
-        const timeInfo = calculateTimeOfDay(dayProgress, config.timePeriods, config.hoursPerDay);
-        const timeStr = progressToTime(dayProgress, config.hoursPerDay);
-        const calculatedDate = calculateDate(state.day, config.startDate, config);
+        const timeInfo = calculateTimeOfDay(timeData.dayProgress, config.timePeriods, config.hoursPerDay);
+        const timeStr = progressToTime(timeData.dayProgress, config.hoursPerDay);
+        const calculatedDate = calculateDate(timeData.day, config.startDate, config);
         
         let entry = (
             `# Time State` +
-            `\nProgress: ${state.progress}/[${config.actionsPerDay}]` +
             `\nTime: [${timeStr} ${timeInfo.period}]` +
-            `\nDay: ${state.day}` +
             `\nDate: [${calculatedDate}]`
         );
         
         // Add season if configured
         if (config.seasons) {
-            const yearInfo = getDayOfYear(state.day, config.startDate, config);
+            const yearInfo = getDayOfYear(timeData.day, config.startDate, config);
             const yearProgress = calculateYearProgress(yearInfo.dayOfYear, yearInfo.year, config);
             const season = calculateSeason(yearProgress, config.seasons);
             if (season !== 'Unknown') {
@@ -368,14 +468,31 @@ function Calendar(hook, text) {
             }
         }
         
-        entry += `\n\nLast Processed Action: ${state.lastProcessedAction}`;
+        // Add technical/persistent values at the bottom
+        entry += (
+            `\nDay: ${timeData.day}` +
+            `\nDay Progress: ${timeData.dayProgress.toFixed(6)}` +
+            `\nLast Processed Action: ${timeData.lastProcessedAction}`
+        );
+        
+        // Build description with adjustments
+        let description = '';
+        if (timeData.adjustments && timeData.adjustments.length > 0) {
+            description = `## Time Adjustments (Last 50)\n`;
+            // Keep only last 50 adjustments
+            const recentAdjustments = timeData.adjustments.slice(-50);
+            for (const adj of recentAdjustments) {
+                description += `- Turn ${adj.turn}: ${adj.type} ${adj.description} (${adj.amount >= 0 ? '+' : ''}${adj.amount.toFixed(6)})\n`;
+            }
+        }
         
         Utilities.storyCard.upsert({
             title: STATE_CARD,
-            entry: entry
+            entry: entry,
+            description: description
         });
         
-        stateCache = null;
+        timeDataCache = null;
     }
     
     // ==========================
@@ -561,20 +678,18 @@ function Calendar(hook, text) {
     function initializeAPI() {
         // Time Methods
         Calendar.getCurrentTime = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dayProgress = state.progress / config.actionsPerDay;
-            return progressToTime(dayProgress, config.hoursPerDay);
+            if (!timeData || !config) return null;
+            return progressToTime(timeData.dayProgress, config.hoursPerDay);
         };
         
         Calendar.getFormattedTime = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
+            if (!timeData || !config) return null;
             
-            const dayProgress = state.progress / config.actionsPerDay;
-            const timeStr = progressToTime(dayProgress, config.hoursPerDay);
+            const timeStr = progressToTime(timeData.dayProgress, config.hoursPerDay);
             
             if (config.hoursPerDay % 2 !== 0) return timeStr;
             
@@ -589,107 +704,103 @@ function Calendar(hook, text) {
         };
         
         Calendar.getTimeOfDay = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dayProgress = state.progress / config.actionsPerDay;
-            const timeInfo = calculateTimeOfDay(dayProgress, config.timePeriods, config.hoursPerDay);
+            if (!timeData || !config) return null;
+            const timeInfo = calculateTimeOfDay(timeData.dayProgress, config.timePeriods, config.hoursPerDay);
             return timeInfo.period;
         };
         
         Calendar.getDayProgress = () => {
-            const state = loadTimeState();
-            const config = loadConfiguration();
-            if (!state || !config) return null;
-            return state.progress / config.actionsPerDay;
+            const timeData = loadTimeState();
+            return timeData ? timeData.dayProgress : null;
         };
         
         // Date Methods
         Calendar.getCurrentDate = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            return calculateDate(state.day, config.startDate, config);
+            if (!timeData || !config) return null;
+            return calculateDate(timeData.day, config.startDate, config);
         };
         
         Calendar.getDayNumber = () => {
-            const state = loadTimeState();
-            return state ? state.day : null;
+            const timeData = loadTimeState();
+            return timeData ? timeData.day : null;
         };
         
         Calendar.getDayOfWeek = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dayOfWeekIndex = ((state.day % config.daysOfWeek.length) + config.daysOfWeek.length) % config.daysOfWeek.length;
+            if (!timeData || !config) return null;
+            const dayOfWeekIndex = ((timeData.day % config.daysOfWeek.length) + config.daysOfWeek.length) % config.daysOfWeek.length;
             return config.daysOfWeek[dayOfWeekIndex];
         };
         
         Calendar.getDayOfMonth = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
+            if (!timeData || !config) return null;
+            const dateInfo = calculateDateInfo(timeData.day, config.startDate, config);
             return dateInfo.day;
         };
         
         Calendar.getMonth = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
+            if (!timeData || !config) return null;
+            const dateInfo = calculateDateInfo(timeData.day, config.startDate, config);
             return config.months[dateInfo.month];
         };
         
         Calendar.getYear = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
+            if (!timeData || !config) return null;
+            const dateInfo = calculateDateInfo(timeData.day, config.startDate, config);
             return dateInfo.year;
         };
         
         Calendar.getDayOfYear = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const yearInfo = getDayOfYear(state.day, config.startDate, config);
+            if (!timeData || !config) return null;
+            const yearInfo = getDayOfYear(timeData.day, config.startDate, config);
             return yearInfo.dayOfYear + 1;
         };
         
         // Season Methods
         Calendar.getCurrentSeason = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config || !config.seasons) return null;
-            const yearInfo = getDayOfYear(state.day, config.startDate, config);
+            if (!timeData || !config || !config.seasons) return null;
+            const yearInfo = getDayOfYear(timeData.day, config.startDate, config);
             const yearProgress = calculateYearProgress(yearInfo.dayOfYear, yearInfo.year, config);
             return calculateSeason(yearProgress, config.seasons);
         };
         
         Calendar.getYearProgress = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return null;
-            const yearInfo = getDayOfYear(state.day, config.startDate, config);
+            if (!timeData || !config) return null;
+            const yearInfo = getDayOfYear(timeData.day, config.startDate, config);
             return calculateYearProgress(yearInfo.dayOfYear, yearInfo.year, config);
         };
         
         // Event Methods
         Calendar.getTodayEvents = () => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return [];
+            if (!timeData || !config) return [];
             
             const eventsList = loadEventDays();
             if (eventsList.length === 0) return [];
             
-            const dateInfo = calculateDateInfo(state.day, config.startDate, config);
+            const dateInfo = calculateDateInfo(timeData.day, config.startDate, config);
             const dayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
             
-            const dayProgress = state.progress / config.actionsPerDay;
             return dayEvents.map(event => {
-                const timeInfo = checkEventTimeRange(event, dayProgress, config.hoursPerDay);
+                const timeInfo = checkEventTimeRange(event, timeData.dayProgress, config.hoursPerDay);
                 return {
                     ...event,
                     timeInfo: timeInfo
@@ -703,9 +814,9 @@ function Calendar(hook, text) {
         };
         
         Calendar.getUpcomingEvents = (daysAhead = 30) => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return [];
+            if (!timeData || !config) return [];
             
             const eventsList = loadEventDays();
             if (eventsList.length === 0) return [];
@@ -713,7 +824,7 @@ function Calendar(hook, text) {
             const upcoming = [];
             
             for (let i = 1; i <= daysAhead; i++) {
-                const futureDay = state.day + i;
+                const futureDay = timeData.day + i;
                 const dateInfo = calculateDateInfo(futureDay, config.startDate, config);
                 
                 const dayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
@@ -735,9 +846,12 @@ function Calendar(hook, text) {
         
         // Time Manipulation Methods
         Calendar.advanceTime = (timeSpec) => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config || typeof timeSpec !== 'string') return false;
+            if (!timeData || !config || typeof timeSpec !== 'string') return false;
+            
+            // Get current action count for recording adjustment
+            const currentAction = getActionCount();
             
             let totalHours = 0;
             const parts = timeSpec.split(',').map(p => p.trim());
@@ -772,76 +886,114 @@ function Calendar(hook, text) {
             
             if (totalHours === 0) return false;
             
+            // Convert hours to day progress
             const progressToAdd = totalHours / config.hoursPerDay;
-            const actionsToAdd = Math.round(progressToAdd * config.actionsPerDay);
+            let newDayProgress = timeData.dayProgress + progressToAdd;
+            let newDay = timeData.day;
             
-            let newProgress = state.progress + actionsToAdd;
-            let newDay = state.day;
-            
-            while (newProgress >= config.actionsPerDay) {
-                newProgress -= config.actionsPerDay;
+            // Handle day rollovers
+            while (newDayProgress >= 1.0) {
+                newDayProgress -= 1.0;
                 newDay++;
             }
-            while (newProgress < 0) {
-                newProgress += config.actionsPerDay;
+            while (newDayProgress < 0) {
+                newDayProgress += 1.0;
                 newDay--;
             }
             
-            const newState = {
+            // Record adjustment
+            const adjustments = timeData.adjustments || [];
+            adjustments.push({
+                turn: currentAction !== null ? currentAction : timeData.lastProcessedAction,
+                type: 'advanceTime',
+                description: timeSpec,
+                amount: progressToAdd
+            });
+            
+            const newTimeData = {
                 day: newDay,
-                progress: newProgress,
-                lastProcessedAction: state.lastProcessedAction
+                dayProgress: newDayProgress,
+                lastProcessedAction: timeData.lastProcessedAction,
+                adjustments: adjustments
             };
             
-            saveTimeState(newState);
+            saveTimeState(newTimeData);
             if (debug) console.log(`${MODULE_NAME}: Advanced time by ${timeSpec}`);
             return true;
         };
         
         Calendar.setTime = (hour, minute = 0) => {
-            const state = loadTimeState();
+            const timeData = loadTimeState();
             const config = loadConfiguration();
-            if (!state || !config) return false;
+            if (!timeData || !config) return false;
             
             if (typeof hour !== 'number' || hour < 0 || hour >= config.hoursPerDay) return false;
             if (typeof minute !== 'number' || minute < 0 || minute >= 60) return false;
             
             const totalMinutes = hour * 60 + minute;
-            const dayProgress = totalMinutes / (config.hoursPerDay * 60);
-            const newProgress = Math.floor(dayProgress * config.actionsPerDay);
+            const newDayProgress = totalMinutes / (config.hoursPerDay * 60);
             
-            const newState = {
-                day: state.day,
-                progress: newProgress,
-                lastProcessedAction: state.lastProcessedAction
+            // Get current action count for recording adjustment
+            const currentAction = getActionCount();
+            
+            // Record adjustment
+            const progressDiff = newDayProgress - timeData.dayProgress;
+            const adjustments = timeData.adjustments || [];
+            adjustments.push({
+                turn: currentAction !== null ? currentAction : timeData.lastProcessedAction,
+                type: 'setTime',
+                description: `${hour}:${String(minute).padStart(2, '0')}`,
+                amount: progressDiff
+            });
+            
+            const newTimeData = {
+                day: timeData.day,
+                dayProgress: newDayProgress,
+                lastProcessedAction: timeData.lastProcessedAction,
+                adjustments: adjustments
             };
             
-            saveTimeState(newState);
+            saveTimeState(newTimeData);
             return true;
         };
         
         Calendar.setDay = (newDay) => {
-            const state = loadTimeState();
-            if (!state || typeof newDay !== 'number') return false;
+            const timeData = loadTimeState();
+            if (!timeData || typeof newDay !== 'number') return false;
             
-            const newState = {
+            const dayDiff = Math.floor(newDay) - timeData.day;
+            
+            // Get current action count for recording adjustment
+            const currentAction = getActionCount();
+            
+            // Record adjustment if day changed
+            const adjustments = timeData.adjustments || [];
+            if (dayDiff !== 0) {
+                adjustments.push({
+                    turn: currentAction !== null ? currentAction : timeData.lastProcessedAction,
+                    type: 'setDay',
+                    description: `day ${Math.floor(newDay)}`,
+                    amount: dayDiff  // Store as day difference
+                });
+            }
+            
+            const newTimeData = {
                 day: Math.floor(newDay),
-                progress: state.progress,
-                lastProcessedAction: state.lastProcessedAction
+                dayProgress: timeData.dayProgress,
+                lastProcessedAction: timeData.lastProcessedAction,
+                adjustments: adjustments
             };
             
-            saveTimeState(newState);
+            saveTimeState(newTimeData);
             return true;
         };
         
         Calendar.setActionsPerDay = (newActionsPerDay) => {
             const config = loadConfiguration();
-            const state = loadTimeState();
-            if (!config || !state) return false;
+            const timeData = loadTimeState();
+            if (!config || !timeData) return false;
             
             if (typeof newActionsPerDay !== 'number' || newActionsPerDay < 1) return false;
-            
-            const currentProgress = state.progress / config.actionsPerDay;
             
             const configCard = Utilities.storyCard.get(CONFIG_CARD);
             if (!configCard) return false;
@@ -855,21 +1007,15 @@ function Calendar(hook, text) {
             Utilities.storyCard.update(CONFIG_CARD, { entry: configText });
             configCache = null;
             
-            const newProgress = Math.floor(currentProgress * newActionsPerDay);
-            const newState = {
-                day: state.day,
-                progress: newProgress,
-                lastProcessedAction: state.lastProcessedAction
-            };
-            
-            saveTimeState(newState);
+            // No need to adjust dayProgress - it stays the same
+            saveTimeState(timeData);
             return true;
         };
         
         Calendar.setHoursPerDay = (newHoursPerDay) => {
             const config = loadConfiguration();
-            const state = loadTimeState();
-            if (!config || !state) return false;
+            const timeData = loadTimeState();
+            if (!config || !timeData) return false;
             
             if (typeof newHoursPerDay !== 'number' || newHoursPerDay < 1) return false;
             
@@ -885,7 +1031,7 @@ function Calendar(hook, text) {
             Utilities.storyCard.update(CONFIG_CARD, { entry: configText });
             configCache = null;
             
-            saveTimeState(state);
+            saveTimeState(timeData);
             return true;
         };
         
@@ -907,7 +1053,7 @@ function Calendar(hook, text) {
         Calendar.clearAllCaches = () => {
             eventCache = null;
             configCache = null;
-            stateCache = null;
+            timeDataCache = null;
             return true;
         };
     }
@@ -1387,6 +1533,7 @@ function Calendar(hook, text) {
             `# Time Configuration` +
             `\nActions Per Day: 200` +
             `\nStart Date: 11/06/2022` +
+            `\nStarting Time: 09:00` +
             `\nHours Per Day: 24` +
             `\n` +
             `\n## Time Periods` +
@@ -1550,12 +1697,13 @@ function Calendar(hook, text) {
     // ==========================
     
     function getActionCount() {
-        if (typeof state !== 'undefined' && state.actionCount !== undefined) {
-            return state.actionCount;
-        }
-        
+        // Use info.actionCount - the standard source in AI Dungeon
         if (typeof info !== 'undefined' && info.actionCount !== undefined) {
-            return info.actionCount;
+            const count = info.actionCount;
+            // Validate it's a finite number
+            if (typeof count === 'number' && isFinite(count)) {
+                return count;
+            }
         }
         
         return null;
@@ -1565,64 +1713,190 @@ function Calendar(hook, text) {
         const actionCount = getActionCount();
         if (actionCount === null) return null;
         
-        const state = loadTimeState();
+        const timeData = loadTimeState();
         const config = loadConfiguration();
         
-        if (!state || !config) {
-            if (debug) console.log(`${MODULE_NAME}: Cannot process actions without state and configuration`);
+        if (!timeData || !config) {
+            if (debug) console.log(`${MODULE_NAME}: Cannot process actions without time data and configuration`);
             return null;
         }
         
-        if (actionCount === state.lastProcessedAction) {
-            return null;
+        // Check if this action was already processed (repeated turn)
+        if (actionCount === timeData.lastProcessedAction) {
+            if (debug) console.log(`${MODULE_NAME}: Turn ${actionCount} is repeating, reverting adjustments`);
+            
+            // Find and revert any adjustments made at this turn
+            const adjustments = timeData.adjustments || [];
+            const adjustmentsAtThisTurn = adjustments.filter(adj => adj.turn === actionCount);
+            
+            if (adjustmentsAtThisTurn.length > 0) {
+                // Start from current time data
+                let revertedDayProgress = timeData.dayProgress;
+                let revertedDay = timeData.day;
+                
+                // Revert each adjustment
+                for (const adj of adjustmentsAtThisTurn) {
+                    if (adj.type === 'setDay') {
+                        revertedDay -= adj.amount;
+                    } else {
+                        revertedDayProgress -= adj.amount;
+                    }
+                }
+                
+                // Handle day boundaries after reverting
+                while (revertedDayProgress < 0) {
+                    revertedDayProgress += 1.0;
+                    revertedDay--;
+                }
+                while (revertedDayProgress >= 1.0) {
+                    revertedDayProgress -= 1.0;
+                    revertedDay++;
+                }
+                
+                // Remove the adjustments at this turn
+                const cleanedAdjustments = adjustments.filter(adj => adj.turn !== actionCount);
+                
+                // Save the reverted state
+                const revertedTimeData = {
+                    day: revertedDay,
+                    dayProgress: revertedDayProgress,
+                    lastProcessedAction: actionCount, // Keep it marked as processed
+                    adjustments: cleanedAdjustments
+                };
+                
+                saveTimeState(revertedTimeData);
+                
+                return {
+                    timeData: revertedTimeData,
+                    repeated: true,
+                    adjustmentsReverted: true
+                };
+            }
+            
+            // No adjustments to revert, just return current state
+            return {
+                timeData: timeData,
+                repeated: true,
+                adjustmentsReverted: false
+            };
         }
         
-        const actionsToProcess = actionCount - state.lastProcessedAction;
+        // Calculate action difference (works with negative action counts)
+        const actionDiff = actionCount - timeData.lastProcessedAction;
         
-        if (actionsToProcess < 0) {
-            return handleTimeReversal(actionCount, state, config);
+        // Check for time reversal (going backwards)
+        if (actionDiff < 0) {
+            return handleTimeReversal(actionCount, timeData, config);
         }
         
-        let newProgress = state.progress + actionsToProcess;
-        let newDay = state.day;
+        // Normal forward progress
+        const progressPerAction = 1.0 / config.actionsPerDay;
+        const progressToAdd = progressPerAction * actionDiff;
         
-        while (newProgress >= config.actionsPerDay) {
-            newProgress -= config.actionsPerDay;
+        let newDayProgress = timeData.dayProgress + progressToAdd;
+        let newDay = timeData.day;
+        let dayChanged = false;
+        
+        // Handle day rollovers
+        while (newDayProgress >= 1.0) {
+            newDayProgress -= 1.0;
             newDay++;
+            dayChanged = true;
         }
         
-        const newState = {
+        // Normalize dayProgress to prevent floating point accumulation
+        // when we've crossed a day boundary
+        if (dayChanged) {
+            // Round to 6 decimal places to clean up floating point errors
+            newDayProgress = Math.round(newDayProgress * 1000000) / 1000000;
+            
+            // Ensure it's within valid range
+            if (newDayProgress >= 1.0) {
+                newDayProgress = 0.999999;
+            } else if (newDayProgress < 0.0) {
+                newDayProgress = 0.0;
+            }
+        }
+        
+        const newTimeData = {
             day: newDay,
-            progress: newProgress,
-            lastProcessedAction: actionCount
+            dayProgress: newDayProgress,
+            lastProcessedAction: actionCount,
+            adjustments: timeData.adjustments || []
         };
         
-        saveTimeState(newState);
+        saveTimeState(newTimeData);
         
         return {
-            state: newState,
-            dayChanged: newDay !== state.day
+            timeData: newTimeData,
+            dayChanged: newDay !== timeData.day
         };
     }
     
-    function handleTimeReversal(targetAction, currentState, config) {
-        if (!config) return null;
+    function handleTimeReversal(targetAction, currentTimeData, config) {
+        if (!config || !currentTimeData) return null;
         
-        targetAction = Math.max(0, targetAction);
+        // Calculate the action difference (will be negative)
+        const actionDiff = targetAction - currentTimeData.lastProcessedAction;
+        const progressPerAction = 1.0 / config.actionsPerDay;
+        const progressDiff = progressPerAction * actionDiff;
         
-        const totalDays = Math.floor(targetAction / config.actionsPerDay);
-        const progress = targetAction % config.actionsPerDay;
+        // Apply the negative progress
+        let newDayProgress = currentTimeData.dayProgress + progressDiff;
+        let newDay = currentTimeData.day;
         
-        const newState = {
-            day: totalDays,
-            progress: progress,
-            lastProcessedAction: targetAction
+        // Also revert any adjustments that happened after the target action
+        const adjustments = currentTimeData.adjustments || [];
+        const cleanedAdjustments = adjustments.filter(adj => adj.turn <= targetAction);
+        
+        // Revert adjustments between target and current
+        const adjustmentsToRevert = adjustments.filter(
+            adj => adj.turn > targetAction && adj.turn <= currentTimeData.lastProcessedAction
+        );
+        
+        for (const adj of adjustmentsToRevert) {
+            if (adj.type === 'setDay') {
+                newDay -= adj.amount;
+            } else {
+                newDayProgress -= adj.amount;
+            }
+        }
+        
+        // Handle day boundaries
+        let dayChanged = false;
+        while (newDayProgress < 0) {
+            newDayProgress += 1.0;
+            newDay--;
+            dayChanged = true;
+        }
+        while (newDayProgress >= 1.0) {
+            newDayProgress -= 1.0;
+            newDay++;
+            dayChanged = true;
+        }
+        
+        // Normalize dayProgress when day changed
+        if (dayChanged) {
+            newDayProgress = Math.round(newDayProgress * 1000000) / 1000000;
+            
+            if (newDayProgress >= 1.0) {
+                newDayProgress = 0.999999;
+            } else if (newDayProgress < 0.0) {
+                newDayProgress = 0.0;
+            }
+        }
+        
+        const newTimeData = {
+            day: newDay,
+            dayProgress: newDayProgress,
+            lastProcessedAction: targetAction,
+            adjustments: cleanedAdjustments
         };
         
-        saveTimeState(newState);
+        saveTimeState(newTimeData);
         
         return {
-            state: newState,
+            timeData: newTimeData,
             reversed: true
         };
     }
@@ -1641,8 +1915,8 @@ function Calendar(hook, text) {
                 data: data
             });
             
-            if (eventType === 'eventDay' && data.state) {
-                this.dispatchedDays.add(data.state.day);
+            if (eventType === 'eventDay' && data.timeData) {
+                this.dispatchedDays.add(data.timeData.day);
             }
         },
         
@@ -1683,9 +1957,10 @@ function Calendar(hook, text) {
             }
             
             // Get previous time of day before processing
-            const previousState = loadTimeState();
-            const prevDayProgress = previousState ? previousState.progress / config.actionsPerDay : 0;
-            const prevTimeOfDay = calculateTimeOfDay(prevDayProgress, config.timePeriods, config.hoursPerDay).period;
+            const previousTimeData = loadTimeState();
+            const prevTimeOfDay = previousTimeData ? 
+                calculateTimeOfDay(previousTimeData.dayProgress, config.timePeriods, config.hoursPerDay).period :
+                'Unknown';
             
             const actionResult = processCurrentAction();
             
@@ -1695,29 +1970,28 @@ function Calendar(hook, text) {
                     eventDispatcher.dispatch('timeReversed', actionResult);
                 } else {
                     // Check for time of day change
-                    const currDayProgress = actionResult.state.progress / config.actionsPerDay;
-                    const currTimeOfDay = calculateTimeOfDay(currDayProgress, config.timePeriods, config.hoursPerDay).period;
+                    const currTimeOfDay = calculateTimeOfDay(actionResult.timeData.dayProgress, config.timePeriods, config.hoursPerDay).period;
                     
                     if (prevTimeOfDay !== currTimeOfDay && prevTimeOfDay !== 'Unknown' && currTimeOfDay !== 'Unknown') {
                         eventDispatcher.dispatch('timeOfDayChanged', {
                             previousPeriod: prevTimeOfDay,
                             currentPeriod: currTimeOfDay,
-                            state: actionResult.state
+                            timeData: actionResult.timeData
                         });
                     }
                     
                     if (actionResult.dayChanged) {
                         eventDispatcher.dispatch('dayChanged', {
-                            previousDay: previousState.day,
-                            currentDay: actionResult.state.day,
-                            state: actionResult.state
+                            previousDay: previousTimeData.day,
+                            currentDay: actionResult.timeData.day,
+                            timeData: actionResult.timeData
                         });
                         
                         // Check for season change
                         if (config.seasons) {
-                            const state = actionResult.state;
-                            const prevYearInfo = getDayOfYear(state.day - 1, config.startDate, config);
-                            const currYearInfo = getDayOfYear(state.day, config.startDate, config);
+                            const timeData = actionResult.timeData;
+                            const prevYearInfo = getDayOfYear(timeData.day - 1, config.startDate, config);
+                            const currYearInfo = getDayOfYear(timeData.day, config.startDate, config);
                             
                             const prevYearProgress = calculateYearProgress(prevYearInfo.dayOfYear, prevYearInfo.year, config);
                             const currYearProgress = calculateYearProgress(currYearInfo.dayOfYear, currYearInfo.year, config);
@@ -1729,35 +2003,32 @@ function Calendar(hook, text) {
                                 eventDispatcher.dispatch('seasonChanged', {
                                     previousSeason: prevSeason,
                                     currentSeason: currSeason,
-                                    state: actionResult.state
+                                    timeData: actionResult.timeData
                                 });
                             }
                         }
                     }
                     
                     // Check time-range events
-                    const prevProgress = previousState ? previousState.progress : 0;
-                    const currProgress = actionResult.state.progress;
+                    const prevProgress = previousTimeData ? previousTimeData.dayProgress : 0;
+                    const currProgress = actionResult.timeData.dayProgress;
                     
                     if (currProgress !== prevProgress) {
                         const eventsList = loadEventDays();
-                        const dateInfo = calculateDateInfo(actionResult.state.day, config.startDate, config);
+                        const dateInfo = calculateDateInfo(actionResult.timeData.day, config.startDate, config);
                         const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-                        
-                        const prevDayProgress = prevProgress / config.actionsPerDay;
-                        const currDayProgress = currProgress / config.actionsPerDay;
                         
                         for (const event of todayEvents) {
                             if (!event.timeRanges) continue;
                             
-                            const prevTime = checkEventTimeRange(event, prevDayProgress, config.hoursPerDay);
-                            const currTime = checkEventTimeRange(event, currDayProgress, config.hoursPerDay);
+                            const prevTime = checkEventTimeRange(event, prevProgress, config.hoursPerDay);
+                            const currTime = checkEventTimeRange(event, currProgress, config.hoursPerDay);
                             
                             if (!prevTime.active && currTime.active) {
                                 eventDispatcher.dispatch('timeRangeEventStarted', {
                                     event: event,
                                     timeRange: currTime.currentRange,
-                                    state: actionResult.state
+                                    timeData: actionResult.timeData
                                 });
                             }
                             
@@ -1766,14 +2037,14 @@ function Calendar(hook, text) {
                                 eventDispatcher.dispatch('timeRangeEventEnding', {
                                     event: event,
                                     minutesRemaining: currTime.minutesRemaining,
-                                    state: actionResult.state
+                                    timeData: actionResult.timeData
                                 });
                             }
                             
                             if (prevTime.active && !currTime.active) {
                                 eventDispatcher.dispatch('timeRangeEventEnded', {
                                     event: event,
-                                    state: actionResult.state
+                                    timeData: actionResult.timeData
                                 });
                             }
                         }
@@ -1782,18 +2053,18 @@ function Calendar(hook, text) {
             }
             
             // Check for events on current day
-            const currentState = loadTimeState();
-            if (currentState && !eventDispatcher.hasDispatchedForDay(currentState.day)) {
+            const currentTimeData = loadTimeState();
+            if (currentTimeData && !eventDispatcher.hasDispatchedForDay(currentTimeData.day)) {
                 const eventsList = loadEventDays();
                 if (eventsList.length > 0) {
-                    const dateInfo = calculateDateInfo(currentState.day, config.startDate, config);
+                    const dateInfo = calculateDateInfo(currentTimeData.day, config.startDate, config);
                     const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
                     
                     if (todayEvents.length > 0) {
                         eventDispatcher.dispatch('eventDay', {
                             events: todayEvents,
-                            date: calculateDate(currentState.day, config.startDate, config),
-                            state: currentState
+                            date: calculateDate(currentTimeData.day, config.startDate, config),
+                            timeData: currentTimeData
                         });
                     }
                 }
@@ -1803,64 +2074,6 @@ function Calendar(hook, text) {
             Calendar.events = eventDispatcher.getEvents();
             
             initializeAPI();
-            
-            // Also add event-related API methods
-            Calendar.getTodayEvents = () => {
-                const state = loadTimeState();
-                const config = loadConfiguration();
-                if (!state || !config) return [];
-                
-                const eventsList = loadEventDays();
-                if (eventsList.length === 0) return [];
-                
-                const dateInfo = calculateDateInfo(state.day, config.startDate, config);
-                const dayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-                
-                const dayProgress = state.progress / config.actionsPerDay;
-                return dayEvents.map(event => {
-                    const timeInfo = checkEventTimeRange(event, dayProgress, config.hoursPerDay);
-                    return {
-                        ...event,
-                        timeInfo: timeInfo
-                    };
-                });
-            };
-            
-            Calendar.getActiveTimeRangeEvents = () => {
-                const todayEvents = Calendar.getTodayEvents();
-                return todayEvents.filter(event => event.timeInfo && event.timeInfo.active);
-            };
-            
-            Calendar.getUpcomingEvents = (daysAhead = 30) => {
-                const state = loadTimeState();
-                const config = loadConfiguration();
-                if (!state || !config) return [];
-                
-                const eventsList = loadEventDays();
-                if (eventsList.length === 0) return [];
-                
-                const upcoming = [];
-                
-                for (let i = 1; i <= daysAhead; i++) {
-                    const futureDay = state.day + i;
-                    const dateInfo = calculateDateInfo(futureDay, config.startDate, config);
-                    
-                    const dayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-                    
-                    if (dayEvents.length > 0) {
-                        upcoming.push({
-                            daysUntil: i,
-                            date: calculateDate(futureDay, config.startDate, config),
-                            events: dayEvents
-                        });
-                    }
-                }
-                
-                return upcoming;
-            };
-            
-            Calendar.getAllEvents = () => loadEventDays();
-            Calendar.isEventDay = () => Calendar.getTodayEvents().length > 0;
             
             return;
             
