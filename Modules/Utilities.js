@@ -2,7 +2,7 @@ const Utilities = (function() {
     'use strict';
     
     // =====================================
-    // API DOCUMENTATION
+    // UTILITIES API DOCUMENTATION
     // =====================================
     
     /**
