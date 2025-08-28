@@ -92,7 +92,7 @@ function GiveMeHeaders(text) {
             level4: {},  // #### headers
             level5: {},  // ##### headers
             uncategorizedHeader: 'General',  // Default
-            uncategorizedPriority: 80,
+            uncategorizedPriority: 0,
             sortUnlisted: true
         };
         
