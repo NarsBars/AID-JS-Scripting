@@ -6,6 +6,36 @@ const Utilities = (function() {
     // =====================================
     
     /**
+     * TABLE OF CONTENTS
+     * =================
+     * 
+     * Core Modules:
+     * - expression: Expression parser for evaluating conditional logic
+     * - plainText: Parse and format structured plain text data
+     * - string: Text manipulation and conversion utilities
+     * - math: Mathematical operations including dice rolling
+     * - collection: Array and object manipulation utilities
+     * 
+     * Formatting:
+     * - format: Number and string formatting utilities
+     * 
+     * AI Dungeon Specific:
+     * - storyCard: Story Card operations (get, find, add, update, remove, upsert)
+     * - history: Access and search action history
+     * - context: Extract and parse context information
+     * 
+     * Data Processing:
+     * - parsing: Parse various text formats (pipe/colon delimited, key=value, etc.)
+     * - config: Configuration management using Story Cards
+     * 
+     * Advanced:
+     * - functional: Functional programming utilities (compose, memoize, etc.)
+     * - regex: Regex compilation and caching system
+     * - cache: Turn-based cache storage
+     * - patterns: Common precompiled regex patterns
+     */
+    
+    /**
      * EXPRESSION PARSER API
      * =====================
      * General-purpose expression parser for evaluating string expressions
@@ -56,18 +86,13 @@ const Utilities = (function() {
      *   state.inventory.includes("key")
      *   state.items.filter(i => i.type == "weapon").length > 0
      *   state.quests.some(q => q.active && q.level <= state.level)
-     *   
-     * Story Card Key Examples:
-     *   $E:state.health < 20
-     *   $E:near("boss", "defeated", 100) && state.level >= 10
-     *   $E:fuzzy(state.lastWord, "attack") || fuzzy(state.lastWord, "fight")
      */
     
     /**
      * PLAIN TEXT PARSER API
      * =====================
      * Parse and format structured plain text data using a custom format:
-     * {# Entity Name
+     * {# Main Header
      * ## Section Name
      * Key: Value
      * - List items
@@ -77,7 +102,7 @@ const Utilities = (function() {
      * PARSING METHODS:
      * 
      * parseEncapsulated(text: string) -> {name: string, sections: Object}|null
-     *   Parses text in {# Name ... } format into structured data
+     *   Parses text in {# Header ... } format into structured data
      *   Example: Utilities.plainText.parseEncapsulated('{# Config\n## Settings\nDebug: true}')
      *   Returns: {name: 'Config', sections: {settings: {debug: true}}}
      *   
@@ -104,13 +129,13 @@ const Utilities = (function() {
      * FORMATTING METHODS:
      * 
      * formatEncapsulated(data: Object) -> string
-     *   Formats an object back into {# Name ... } format
+     *   Formats an object back into {# Header ... } format
      *   Example: Utilities.plainText.formatEncapsulated({name: 'Config', sections: {...}})
      *   
      * formatList(items: Array) -> string
-     *   Formats an array into a bullet list
-     *   Example: Utilities.plainText.formatList(['First', 'Second'])
-     *   Returns: '- First\n- Second'
+     *   Formats array into a bullet list with smart object handling
+     *   Example: Utilities.plainText.formatList([{name: 'Potion', quantity: 5}])
+     *   Returns: '- Potion x5'
      *   
      * formatTable(data: Array|Object) -> string
      *   Formats data into a markdown table
@@ -143,10 +168,6 @@ const Utilities = (function() {
      *   Truncates string to max length with optional suffix (default: '...')
      *   Example: Utilities.string.truncate('Long text here', 8) // 'Long ...'
      *   
-     * pad(str: string, length: number, char?: string, direction?: 'left'|'right') -> string
-     *   Pads string to specified length (default: space, left)
-     *   Example: Utilities.string.pad('5', 3, '0', 'left') // '005'
-     *   
      * sanitize(str: string, allowedChars?: string) -> string
      *   Removes special characters, keeping only alphanumeric + allowed
      *   Example: Utilities.string.sanitize('Hello@World!', '@') // 'Hello@World'
@@ -156,8 +177,10 @@ const Utilities = (function() {
      *   Example: Utilities.string.extractNumbers('Order 66 costs $25.50') // [66, 25.50]
      *   
      * parseBoolean(str: string) -> boolean
-     *   Converts string to boolean ('true', 'yes', '1', 'on', 'enabled' = true)
+     *   Converts string to boolean (defaults to false unless explicitly true)
+     *   True values: 'true', 'yes', 'y', '1', 'on', 'enabled'
      *   Example: Utilities.string.parseBoolean('yes') // true
+     *   Example: Utilities.string.parseBoolean('maybe') // false
      *   
      * levenshteinDistance(str1: string, str2: string) -> number
      *   Calculates edit distance between two strings
@@ -183,10 +206,6 @@ const Utilities = (function() {
      * tokenize(text: string) -> string[]
      *   Splits text into tokens (words and punctuation)
      *   Example: Utilities.string.tokenize("Hello, world!") // ["Hello", ",", "world", "!"]
-     *   
-     * template(str: string, data: Object) -> string
-     *   Simple string templating with ${key} syntax
-     *   Example: Utilities.string.template('Hello ${name}!', {name: 'World'}) // "Hello World!"
      */
     
     /**
@@ -379,37 +398,6 @@ const Utilities = (function() {
      */
     
     /**
-     * VALIDATION UTILITIES API
-     * ========================
-     * Type checking and validation functions
-     * 
-     * isString(value: any) -> boolean
-     * isNumber(value: any) -> boolean  
-     * isArray(value: any) -> boolean
-     * isObject(value: any) -> boolean
-     *   Basic type checking functions
-     *   Note: isObject returns true for objects but false for arrays/null
-     *   
-     * isEmpty(value: any) -> boolean
-     *   Checks if value is empty (null, undefined, [], {}, '')
-     *   Example: Utilities.validation.isEmpty([]) // true
-     *   Example: Utilities.validation.isEmpty({a: 1}) // false
-     *   
-     * inRange(value: number, min: number, max: number) -> boolean
-     *   Checks if number is within inclusive range
-     *   Example: Utilities.validation.inRange(5, 1, 10) // true
-     *   
-     * matches(str: string, pattern: RegExp) -> boolean
-     *   Tests string against regex pattern
-     *   Example: Utilities.validation.matches('ABC123', /^[A-Z]+\d+$/) // true
-     *   
-     * isValidEntity(title: string) -> boolean
-     *   Checks if string matches entity format: [TYPE] Name
-     *   Example: Utilities.validation.isValidEntity('[USER] John') // true
-     *   Example: Utilities.validation.isValidEntity('Just a name') // false
-     */
-    
-    /**
      * FORMAT UTILITIES API
      * ====================
      * Number and string formatting utilities
@@ -418,90 +406,74 @@ const Utilities = (function() {
      *   Formats number with thousands separators
      *   Example: Utilities.format.formatNumber(1234567) // '1,234,567'
      *   
-     * formatCurrency(amount: number, symbol?: string, position?: string) -> string
-     *   Formats number as currency with symbol (default: '$' prepended)
-     *   Example: Utilities.format.formatCurrency(1000) // '$ 1,000'
-     *   Example: Utilities.format.formatCurrency(50, '€', 'append') // '50 €'
+     * formatWithSymbol(value: number, symbol?: string, position?: string) -> string
+     *   Formats number with a symbol (commonly used for currency)
+     *   Example: Utilities.format.formatWithSymbol(1000) // '$ 1,000'
+     *   Example: Utilities.format.formatWithSymbol(50, '€', 'append') // '50 €'
      *   
      * formatPercentage(value: number, decimals?: number) -> string
      *   Formats decimal as percentage
      *   Example: Utilities.format.formatPercentage(0.85, 1) // '85.0%'
      *   
-     * formatTime(hour: number, minute?: number) -> string
-     *   Formats as HH:MM time
+     * formatTime(hour: number, minute?: number, second?: number, format?: string) -> string
+     *   Formats time with configurable output format
+     *   Format options: 'HH:MM' (default), 'HH:MM:SS', 'H:MM', 'H:MM:SS'
      *   Example: Utilities.format.formatTime(9, 5) // '09:05'
+     *   Example: Utilities.format.formatTime(14, 30, 45, 'HH:MM:SS') // '14:30:45'
+     *   Example: Utilities.format.formatTime(9, 5, 0, 'H:MM') // '9:05'
      *   
      * formatDuration(seconds: number) -> string
      *   Formats seconds as human-readable duration
      *   Example: Utilities.format.formatDuration(3665) // '1h 1m 5s'
      *   
-     * formatHealthBar(current: number, max: number, width?: number) -> string
-     *   Creates ASCII health bar visualization
-     *   Example: Utilities.format.formatHealthBar(30, 100, 10) // '[███-------]'
+     * formatBar(current: number, max: number, width?: number, char?: string) -> string
+     *   Creates ASCII progress bar visualization
+     *   Example: Utilities.format.formatBar(30, 100, 10) // '[███-------]'
+     *   Example: Utilities.format.formatBar(7, 10, 20, '*') // '[**************------]'
      *   
      * formatList(items: string[], bullet?: string) -> string
      *   Formats array as bullet list (default bullet: '•')
      *   Example: Utilities.format.formatList(['First', 'Second']) // '• First\n• Second'
      */
     
-    /**
-     * ENTITY UTILITIES API
-     * ====================
-     * Entity parsing and management ([TYPE] Name format)
-     * 
-     * parseEntity(title: string) -> {type: string, name: string, fullTitle: string}|null
-     *   Parses entity title into components
-     *   Example: Utilities.entity.parseEntity('[ITEM] Golden Key')
-     *   Returns: {type: 'ITEM', name: 'Golden Key', fullTitle: '[ITEM] Golden Key'}
-     *   
-     * formatEntity(type: string, name: string) -> string
-     *   Creates properly formatted entity title
-     *   Example: Utilities.entity.formatEntity('LOCATION', 'Central Plaza') // '[LOCATION] Central Plaza'
-     *   
-     * extractEntities(text: string) -> Array
-     *   Finds all entity references in text
-     *   Returns: Array of {type, name, fullMatch, index}
-     *   Example: Utilities.entity.extractEntities('The [USER] Alice found [ITEM] Blue Gem')
-     *   
-     * isPlayer(entity: string|Object) -> boolean
-     * isNPC(entity: string|Object) -> boolean
-     * isMonster(entity: string|Object) -> boolean
-     * isItem(entity: string|Object) -> boolean
-     *   Type checking functions for entities
-     *   Example: Utilities.entity.isItem('[ITEM] Map') // true
-     *   
-     * generateId(type: string, name: string, seed?: string) -> string
-     *   Generates deterministic unique ID for entity
-     *   Example: Utilities.entity.generateId('USER', 'Alice', 'session1')
-     *   Returns: 'user_alice_session1_84729384'
-     */
-    
-    /**
-     * COMMAND UTILITIES API
-     * =====================
-     * Command parsing and handling utilities
-     * 
-     * parseCommand(text: string) -> {command: string, args: string[], flags: Object}|null
-     *   Parses command syntax like "/give sword --enchanted --quantity=3"
-     *   Example: Utilities.command.parseCommand('/give sword --enchanted')
-     *   Returns: {command: 'give', args: ['sword'], flags: {enchanted: true}}
-     *   
-     * parseAlias(command: string, aliases: Object) -> string
-     *   Resolves command aliases to their full command names
-     *   Example: Utilities.command.parseAlias('inv', {inv: 'inventory', i: 'inventory'})
-     *   Returns: 'inventory'
-     *   
-     * validateCommand(command: Object, schema: Object) -> {valid: boolean, errors: string[]}
-     *   Validates parsed command against a schema
-     *   Example: Utilities.command.validateCommand(cmd, {minArgs: 1, maxArgs: 2})
-     *   Returns: {valid: true, errors: []}
-     */
     
     /**
      * PARSING UTILITIES API
      * =====================
-     * General-purpose parsing utilities
+     * General-purpose parsing utilities for various text formats
      * 
+     * 
+     * parseDelimited(text: string, itemDelimiter: string, keyValueDelimiter: string, options?: Object) -> Object
+     *   Unified delimiter parser - handles all delimited formats
+     *   Options: removeBraces, parseNumbers, skipComments, toLowerCase
+     *   Example: Utilities.parsing.parseDelimited('a:1|b:2', '|', ':')
+     *   Returns: {a: 1, b: 2}
+     *   
+     * parsePipeDelimited(text: string) -> Object
+     *   Parse pipe-delimited key-value pairs
+     *   Example: Utilities.parsing.parsePipeDelimited('VITALITY: 10 | STRENGTH: 9')
+     *   Returns: {vitality: 10, strength: 9}
+     *   
+     * parseBracedList(text: string) -> Object
+     *   Parse braced list format
+     *   Example: Utilities.parsing.parseBracedList('{gold:500, health_potion:2}')
+     *   Returns: {gold: 500, health_potion: 2}
+     *   
+     * parseEqualsValue(text: string) -> Object
+     *   Parse equals-separated values with optional descriptions
+     *   Example: Utilities.parsing.parseEqualsValue('john_smith=50 [Friendly merchant]')
+     *   Returns: {john_smith: 50}
+     *   
+     * parseColonKeyValue(text: string) -> Object
+     *   Parse colon-separated key-value pairs (one per line)
+     *   Example: Utilities.parsing.parseColonKeyValue('name: John\nage: 25')
+     *   Returns: {name: 'John', age: 25}
+     *   
+     * parseLines(text: string, skipEmpty?: boolean, skipComments?: boolean) -> Array<string>
+     *   Parse structured text with comment filtering
+     *   Example: Utilities.parsing.parseLines('line1\n// comment\nline2')
+     *   Returns: ['line1', 'line2']
+     *   
      * parseKeyValuePairs(text: string, delimiter?: string) -> Object
      *   Parses key=value pairs from text
      *   Example: Utilities.parsing.parseKeyValuePairs('name=John age=25 active=true')
@@ -511,41 +483,56 @@ const Utilities = (function() {
      *   Parses range expressions like "10-20", "5 to 10"
      *   Example: Utilities.parsing.parseRange('10-20')
      *   Returns: {min: 10, max: 20}
-     *   
-     * parseJSON(text: string, fallback?: any) -> any
-     *   Safely parses JSON with optional fallback
-     *   Example: Utilities.parsing.parseJSON('{"a":1}', {})
-     *   Returns: {a: 1} or fallback on error
      */
     
     /**
-     * TURN TRACKING UTILITIES API
+     * CONFIGURATION UTILITIES API
      * ===========================
-     * Simple turn tracking for general purposes
+     * Centralized configuration management using Story Cards
      * 
-     * getCurrentTurn() -> number
-     *   Returns the current turn number
-     *   Example: const turn = Utilities.turn.getCurrentTurn()
+     * load(cardTitle: string, parser?: Function, onCreate?: Function, cacheResult?: boolean) -> Object|null
+     *   Load and cache a configuration from a Story Card
+     *   Example: Utilities.config.load('[RPG] Config')
+     *   Returns: Parsed configuration object or null
      *   
-     * since(turn: number) -> number
-     *   Returns turns elapsed since specific turn
-     *   Example: const age = Utilities.turn.since(createdTurn)
+     * loadSectioned(cardTitle: string, sectionSeparator?: string) -> Object
+     *   Load configuration with sections (like [RPG_RUNTIME] Variables format)
+     *   Example: Utilities.config.loadSectioned('[RPG_RUNTIME] Variables', '# ')
+     *   Returns: {section1: content, section2: content, ...}
      *   
-     * mark(key: string) -> number
-     *   Marks current turn with a key and returns the turn number
-     *   Example: const saveTurn = Utilities.turn.mark('last_save')
+     * getValue(cardTitle: string, key: string, defaultValue?: any) -> any
+     *   Get a value from a configuration card (supports dot notation)
+     *   Example: Utilities.config.getValue('[RPG] Config', 'player.health', 100)
+     *   Returns: The configuration value or default
      *   
-     * getMark(key: string) -> number|null
-     *   Gets the turn number for a mark
-     *   Example: const lastSave = Utilities.turn.getMark('last_save')
+     * setValue(cardTitle: string, key: string, value: any) -> boolean
+     *   Update a configuration value and save to Story Card
+     *   Example: Utilities.config.setValue('[RPG] Config', 'player.level', 5)
+     *   Returns: Success status
      *   
-     * elapsed(key: string) -> number
-     *   Returns turns elapsed since mark (Infinity if not marked)
-     *   Example: const turnsSince = Utilities.turn.elapsed('last_save')
+     * clearCache(cardTitle?: string) -> void
+     *   Clear configuration cache (specific card or all)
+     *   Example: Utilities.config.clearCache('[RPG] Config')
      *   
-     * clear(key?: string) -> void
-     *   Clears specific mark or all marks
-     *   Example: Utilities.turn.clear('last_save')
+     * exists(cardTitle: string) -> boolean
+     *   Check if a configuration exists
+     *   Example: Utilities.config.exists('[RPG] Config')
+     *   Returns: true if the Story Card exists
+     */
+    
+    /**
+     * CACHE MANAGEMENT API
+     * ====================
+     * Cache systems for performance optimization
+     * 
+     * clearAll() -> void
+     *   Clear all caches (regex and turn-based)
+     *   Useful for memory management or testing
+     *   Example: Utilities.clearAll()
+     *   
+     * regex - RegEx cache system
+     * cache - Turn-based cache system
+     * patterns - Common regex patterns
      */
     
     /**
@@ -571,11 +558,6 @@ const Utilities = (function() {
      *   Returns curried version of function
      *   Example: const add = Utilities.functional.curry((a, b, c) => a + b + c);
      *   add(1)(2)(3) // 6
-     *   
-     * partial(fn: Function, ...args) -> Function
-     *   Partially applies arguments to function
-     *   Example: const add5 = Utilities.functional.partial(add, 5);
-     *   add5(10) // 15
      *   
      * once(fn: Function) -> Function
      *   Ensures function is called only once
@@ -621,29 +603,22 @@ const Utilities = (function() {
      * upsert(cardData: Object) -> boolean
      *   Updates existing card or creates new one if not found
      *   Example: Utilities.storyCard.upsert({title: '[STATE] Current', entry: '90 Volts'})
-     *   
-     * findByExpression(expression: string, text?: string) -> card[]
-     *   Finds cards with keys matching expression
-     *   Example: Utilities.storyCard.findByExpression('$E:state.health < 20')
-     *   
-     * getActiveCards(text?: string) -> Array<{card, matchedKey, priority}>
-     *   Gets all cards with expression keys that currently match
-     *   Example: const active = Utilities.storyCard.getActiveCards()
      */
     
     /**
      * HISTORY UTILITIES API
      * =====================
      * Access and search AI Dungeon action history
+     * Note: AI Dungeon limits history to maximum 100 actions
      * 
      * readPastAction(lookBack: number) -> {text: string, type: string}
-     *   Reads action from history (0 = most recent)
+     *   Reads action from history (0 = most recent, max 99)
      *   Example: Utilities.history.readPastAction(0) // {text: 'Open the door', type: 'do'}
      *   
      * searchHistory(pattern: string|RegExp, maxLookBack?: number) -> Array
-     *   Searches history for pattern matches
+     *   Searches history for pattern matches (maxLookBack capped at 100)
      *   @param pattern - String (case-insensitive) or RegExp to search for
-     *   @param maxLookBack - How many actions to search (default: 10)
+     *   @param maxLookBack - How many actions to search (default: 10, max: 100)
      *   Returns: Array of {index, action, match}
      *   Example: Utilities.history.searchHistory('key', 20)
      *   Example: Utilities.history.searchHistory(/found \d+ items/i, 50)
@@ -2163,17 +2138,6 @@ const Utilities = (function() {
             return str.substring(0, maxLength - suffix.length) + suffix;
         },
         
-        pad(str, length, char = ' ', direction = 'left') {
-            // Use native padStart/padEnd when possible
-            str = String(str);
-            if (char === ' ' && char.length === 1) {
-                return direction === 'left' ? str.padStart(length) : str.padEnd(length);
-            }
-            // Fallback for multi-char padding
-            const padding = char.repeat(Math.max(0, length - str.length));
-            return direction === 'left' ? padding + str : str + padding;
-        },
-        
         sanitize(str, allowedChars = '') {
             const pattern = new RegExp(`[^a-zA-Z0-9\\s${allowedChars}]`, 'g');
             return str.replace(pattern, '');
@@ -2185,13 +2149,10 @@ const Utilities = (function() {
         },
         
         parseBoolean(str) {
-            if (str === true) return true;
-            if (str === false) return false;
+            if (typeof str === 'boolean') return str;
             if (str == null) return false;
-            
-            const normalized = String(str).toLowerCase().trim();
-            
-            return ['true', 't', 'yes', 'y', '1', 'on', 'enabled', 'enable'].includes(normalized);
+            const s = String(str).toLowerCase().trim();
+            return ['true', '1', 'yes', 'y', 'on', 'enabled'].includes(s);
         },
         
         levenshteinDistance(str1, str2) {
@@ -2277,12 +2238,6 @@ const Utilities = (function() {
         
         tokenize(text) {
             return text.match(/\w+|[^\w\s]/g) || [];
-        },
-        
-        template(str, data) {
-            return str.replace(/\${(\w+)}/g, (match, key) => {
-                return data.hasOwnProperty(key) ? String(data[key]) : match;
-            });
         },
 
         splitBySentences(text) {
@@ -2771,71 +2726,6 @@ const Utilities = (function() {
     };
     
     // =====================================
-    // VALIDATION UTILITIES
-    // =====================================
-    const ValidationUtils = {
-        isString(value) {
-            return typeof value === 'string';
-        },
-        
-        isNumber(value) {
-            return typeof value === 'number' && !isNaN(value);
-        },
-        
-        isInteger(value) {
-            return Number.isInteger(value);
-        },
-        
-        isArray(value) {
-            return Array.isArray(value);
-        },
-        
-        isObject(value) {
-            return value !== null && typeof value === 'object' && !Array.isArray(value);
-        },
-        
-        isFunction(value) {
-            return typeof value === 'function';
-        },
-        
-        isEmpty(value) {
-            if (value == null) return true;
-            if (Array.isArray(value) || typeof value === 'string') return value.length === 0;
-            if (typeof value === 'object') return Object.keys(value).length === 0;
-            return false;
-        },
-        
-        inRange(value, min, max) {
-            return value >= min && value <= max;
-        },
-        
-        hasMinLength(str, minLength) {
-            return str.length >= minLength;
-        },
-        
-        hasMaxLength(str, maxLength) {
-            return str.length <= maxLength;
-        },
-        
-        matches(str, pattern) {
-            return pattern.test(str);
-        },
-        
-        isValidEntity(title) {
-            return /^\[([A-Z]+)\]\s+(.+)$/.test(title);
-        },
-        
-        sanitizeNumber(value, defaultValue = 0) {
-            const num = Number(value);
-            return isNaN(num) ? defaultValue : num;
-        },
-        
-        sanitizeString(value, defaultValue = '') {
-            return typeof value === 'string' ? value : defaultValue;
-        }
-    };
-    
-    // =====================================
     // FORMAT UTILITIES
     // =====================================
     const FormatUtils = {
@@ -2843,15 +2733,15 @@ const Utilities = (function() {
             return num.toFixed(decimals).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
         },
         
-        formatCurrency(amount, symbol = '$', position = 'prepend', includeSpace = true) {
-            const formattedAmount = this.formatNumber(amount);
+        formatWithSymbol(value, symbol = '$', position = 'prepend', includeSpace = true) {
+            const formattedValue = this.formatNumber(value);
             const space = includeSpace ? ' ' : '';
             
             if (position === 'append' || position === 'after') {
-                return `${formattedAmount}${space}${symbol}`;
+                return `${formattedValue}${space}${symbol}`;
             } else {
                 // Default to prepend
-                return `${symbol}${space}${formattedAmount}`;
+                return `${symbol}${space}${formattedValue}`;
             }
         },
         
@@ -2859,10 +2749,21 @@ const Utilities = (function() {
             return `${(value * 100).toFixed(decimals)}%`;
         },
         
-        formatTime(hour, minute = 0) {
-            const h = String(hour).padStart(2, '0');
+        formatTime(hour, minute = 0, second = null, format = 'HH:MM') {
+            const padHour = format.startsWith('HH');
+            const includeSeconds = format.includes(':SS');
+            
+            const h = padHour ? String(hour).padStart(2, '0') : String(hour);
             const m = String(minute).padStart(2, '0');
-            return `${h}:${m}`;
+            
+            let result = `${h}:${m}`;
+            
+            if (includeSeconds) {
+                const s = String(second || 0).padStart(2, '0');
+                result += `:${s}`;
+            }
+            
+            return result;
         },
         
         formatDuration(seconds) {
@@ -2878,12 +2779,12 @@ const Utilities = (function() {
             return parts.join(' ');
         },
         
-        formatHealthBar(current, max, width = 20) {
+        formatBar(current, max, width = 20, char = '\u2588') {
             const percentage = Math.max(0, Math.min(1, current / max));
             const filled = Math.round(width * percentage);
             const empty = width - filled;
             
-            return `[${'\u2588'.repeat(filled)}${'-'.repeat(empty)}]`;
+            return `[${char.repeat(filled)}${'-'.repeat(empty)}]`;
         },
         
         formatList(items, bullet = '•') {
@@ -2892,150 +2793,6 @@ const Utilities = (function() {
         
         formatNumberedList(items) {
             return items.map((item, i) => `${i + 1}. ${item}`).join('\n');
-        }
-    };
-    
-    // =====================================
-    // ENTITY UTILITIES
-    // =====================================
-    const EntityUtils = {
-        parseEntity(title) {
-            const match = title.match(/^\[([A-Z]+)\]\s+(.+)$/);
-            if (!match) return null;
-            
-            return {
-                type: match[1],
-                name: match[2],
-                fullTitle: title
-            };
-        },
-        
-        formatEntity(type, name) {
-            return `[${type.toUpperCase()}] ${name}`;
-        },
-        
-        extractEntities(text) {
-            const pattern = /\[([A-Z]+)\]\s+([^[\]]+)/g;
-            const matches = [];
-            let match;
-            
-            while ((match = pattern.exec(text)) !== null) {
-                matches.push({
-                    type: match[1],
-                    name: match[2],
-                    fullMatch: match[0],
-                    index: match.index
-                });
-            }
-            
-            return matches;
-        },
-        
-        isPlayer(entity) {
-            const parsed = typeof entity === 'string' ? this.parseEntity(entity) : entity;
-            return parsed && parsed.type === 'PLAYER';
-        },
-        
-        isNPC(entity) {
-            const parsed = typeof entity === 'string' ? this.parseEntity(entity) : entity;
-            return parsed && parsed.type === 'NPC';
-        },
-        
-        isMonster(entity) {
-            const parsed = typeof entity === 'string' ? this.parseEntity(entity) : entity;
-            return parsed && parsed.type === 'MONSTER';
-        },
-        
-        isItem(entity) {
-            const parsed = typeof entity === 'string' ? this.parseEntity(entity) : entity;
-            return parsed && parsed.type === 'ITEM';
-        },
-        
-        generateId(type, name, seed = '') {
-            const base = `${type}_${name}_${seed}`.toLowerCase().replace(/\s+/g, '_');
-            return `${base}_${MathUtils.hash(base)}`;
-        }
-    };
-    
-    // =====================================
-    // COMMAND UTILITIES
-    // =====================================
-    const CommandUtils = {
-        parseCommand(text) {
-            const match = text.match(/^\/(\w+)(?:\s+(.+))?$/);
-            if (!match) return null;
-            
-            const command = match[1].toLowerCase();
-            const remainder = match[2] || '';
-            
-            const args = [];
-            const flags = {};
-            
-            // Parse tokens, handling quoted strings
-            const tokens = remainder.match(/(?:[^\s"]+|"[^"]*")+/g) || [];
-            
-            for (const token of tokens) {
-                if (token.startsWith('--')) {
-                    const flagMatch = token.match(/^--([^=]+)(?:=(.+))?$/);
-                    if (flagMatch) {
-                        const flagName = flagMatch[1];
-                        const flagValue = flagMatch[2] || true;
-                        
-                        // Parse flag values
-                        if (typeof flagValue === 'string') {
-                            if (flagValue === 'true') flags[flagName] = true;
-                            else if (flagValue === 'false') flags[flagName] = false;
-                            else if (/^\d+$/.test(flagValue)) flags[flagName] = parseInt(flagValue);
-                            else if (/^\d*\.\d+$/.test(flagValue)) flags[flagName] = parseFloat(flagValue);
-                            else flags[flagName] = flagValue;
-                        } else {
-                            flags[flagName] = flagValue;
-                        }
-                    }
-                } else {
-                    // Remove quotes from arguments
-                    args.push(token.replace(/^"(.*)"$/, '$1'));
-                }
-            }
-            
-            return { command, args, flags };
-        },
-        
-        parseAlias(command, aliases) {
-            return aliases[command] || command;
-        },
-        
-        validateCommand(command, schema) {
-            const errors = [];
-            
-            if (schema.minArgs !== undefined && command.args.length < schema.minArgs) {
-                errors.push(`Requires at least ${schema.minArgs} argument(s)`);
-            }
-            
-            if (schema.maxArgs !== undefined && command.args.length > schema.maxArgs) {
-                errors.push(`Accepts at most ${schema.maxArgs} argument(s)`);
-            }
-            
-            if (schema.requiredFlags) {
-                for (const flag of schema.requiredFlags) {
-                    if (!(flag in command.flags)) {
-                        errors.push(`Missing required flag: --${flag}`);
-                    }
-                }
-            }
-            
-            if (schema.allowedFlags) {
-                for (const flag in command.flags) {
-                    if (!schema.allowedFlags.includes(flag)) {
-                        errors.push(`Unknown flag: --${flag}`);
-                    }
-                }
-            }
-            
-            return {
-                valid: errors.length === 0,
-                errors: errors
-            };
         }
     };
     
@@ -3087,50 +2844,248 @@ const Utilities = (function() {
             return null;
         },
         
-        parseJSON(text, fallback = null) {
-            try {
-                return JSON.parse(text);
-            } catch (error) {
-                return fallback;
+        parseDelimited(text, itemDelimiter, keyValueDelimiter, options = {}) {
+            const result = {};
+            const { 
+                removeBraces = false, 
+                parseNumbers = true,
+                skipComments = false,
+                toLowerCase = true 
+            } = options;
+            
+            // Remove braces if needed
+            let content = removeBraces ? text.replace(/^\{|\}$/g, '').trim() : text;
+            if (!content) return result;
+            
+            // Split by item delimiter
+            const items = itemDelimiter === '\n' ? 
+                content.split('\n') : 
+                content.split(itemDelimiter).map(i => i.trim());
+            
+            for (const item of items) {
+                const trimmed = item.trim();
+                if (!trimmed) continue;
+                if (skipComments && (trimmed.startsWith('//') || trimmed.startsWith('#'))) continue;
+                
+                // Parse key-value pair
+                const parts = trimmed.split(keyValueDelimiter);
+                if (parts.length >= 2) {
+                    let key = parts[0].trim();
+                    if (toLowerCase) {
+                        key = key.toLowerCase().replace(/\s+/g, '_');
+                    }
+                    
+                    let value = parts.slice(1).join(keyValueDelimiter).trim();
+                    
+                    // Remove optional descriptions in brackets
+                    value = value.replace(/\s*\[.*\]$/, '');
+                    
+                    // Parse numbers if enabled
+                    if (parseNumbers) {
+                        const numValue = parseFloat(value);
+                        value = isNaN(numValue) ? value : numValue;
+                    }
+                    
+                    result[key] = value;
+                }
             }
+            
+            return result;
+        },
+        
+        parsePipeDelimited(text) {
+            return this.parseDelimited(text, '|', ':');
+        },
+        
+        parseBracedList(text) {
+            return this.parseDelimited(text, ',', ':', { removeBraces: true, toLowerCase: false });
+        },
+        
+        parseEqualsValue(text) {
+            return this.parseDelimited(text, '\n', '=');
+        },
+        
+        parseColonKeyValue(text) {
+            return this.parseDelimited(text, '\n', ':', { skipComments: true });
+        },
+        
+        parseLines(text, skipEmpty = true, skipComments = true) {
+            const lines = text.split('\n');
+            const result = [];
+            
+            for (const line of lines) {
+                const trimmed = line.trim();
+                
+                if (skipEmpty && !trimmed) continue;
+                if (skipComments && (trimmed.startsWith('//') || trimmed.startsWith('#'))) continue;
+                
+                result.push(trimmed);
+            }
+            
+            return result;
         }
     };
     
     // =====================================
-    // TURN TRACKING UTILITIES
+    // CONFIGURATION MANAGEMENT
     // =====================================
-    const TurnUtils = {
-        marks: new Map(),
+    const ConfigUtils = {
+        // Cache for loaded configurations
+        cache: new Map(),
         
-        getCurrentTurn() {
-            return typeof info !== 'undefined' && info.actionCount || 0;
-        },
-        
-        since(turn) {
-            return this.getCurrentTurn() - turn;
-        },
-        
-        mark(key) {
-            const turn = this.getCurrentTurn();
-            this.marks.set(key, turn);
-            return turn;
-        },
-        
-        getMark(key) {
-            return this.marks.get(key) || null;
-        },
-        
-        elapsed(key) {
-            const marked = this.marks.get(key);
-            return marked !== undefined ? this.since(marked) : Infinity;
-        },
-        
-        clear(key = null) {
-            if (key === null) {
-                this.marks.clear();
-            } else {
-                this.marks.delete(key);
+        load(cardTitle, parser = null, onCreate = null, cacheResult = true) {
+            // Check cache first
+            if (cacheResult && this.cache.has(cardTitle)) {
+                return this.cache.get(cardTitle);
             }
+            
+            // Load the card
+            let card = StoryCardOps.get(cardTitle);
+            
+            // Create default if needed and card doesn't exist
+            if (!card && onCreate) {
+                onCreate();
+                card = StoryCardOps.get(cardTitle);
+            }
+            
+            // Return null if still no card
+            if (!card) {
+                return null;
+            }
+            
+            // Parse the configuration
+            const fullText = (card.entry || '') + '\n' + (card.description || '');
+            const config = parser ? parser(fullText) : ParsingUtils.parseColonKeyValue(fullText);
+            
+            // Cache if requested
+            if (cacheResult) {
+                this.cache.set(cardTitle, config);
+            }
+            
+            return config;
+        },
+        
+        loadSectioned(cardTitle, sectionSeparator = '# ') {
+            const cacheKey = `${cardTitle}:sectioned`;
+            
+            // Check cache
+            if (this.cache.has(cacheKey)) {
+                return this.cache.get(cacheKey);
+            }
+            
+            const card = StoryCardOps.get(cardTitle);
+            if (!card) return {};
+            
+            const fullText = (card.entry || '') + '\n' + (card.description || '');
+            const lines = fullText.split('\n');
+            const config = {};
+            let currentSection = null;
+            let sectionContent = [];
+            
+            for (const line of lines) {
+                const trimmed = line.trim();
+                
+                // Skip comments
+                if (trimmed.startsWith('//')) continue;
+                
+                // Check for section header
+                if (trimmed.startsWith(sectionSeparator)) {
+                    // Save previous section
+                    if (currentSection) {
+                        config[currentSection] = sectionContent.join('\n').trim();
+                    }
+                    
+                    // Start new section
+                    currentSection = trimmed.substring(sectionSeparator.length).trim();
+                    sectionContent = [];
+                } else if (currentSection) {
+                    sectionContent.push(line);
+                }
+            }
+            
+            // Save last section
+            if (currentSection) {
+                config[currentSection] = sectionContent.join('\n').trim();
+            }
+            
+            this.cache.set(cacheKey, config);
+            return config;
+        },
+        
+        getValue(cardTitle, key, defaultValue = null) {
+            const config = this.load(cardTitle);
+            if (!config) return defaultValue;
+            
+            // Support nested keys with dot notation
+            const keys = key.split('.');
+            let value = config;
+            
+            for (const k of keys) {
+                if (value && typeof value === 'object' && k in value) {
+                    value = value[k];
+                } else {
+                    return defaultValue;
+                }
+            }
+            
+            return value;
+        },
+        
+        setValue(cardTitle, key, value) {
+            const card = StoryCardOps.get(cardTitle);
+            if (!card) return false;
+            
+            // Load current config
+            const config = this.load(cardTitle, null, null, false) || {};
+            
+            // Update value (support dot notation)
+            const keys = key.split('.');
+            let target = config;
+            
+            for (let i = 0; i < keys.length - 1; i++) {
+                const k = keys[i];
+                if (!(k in target) || typeof target[k] !== 'object') {
+                    target[k] = {};
+                }
+                target = target[k];
+            }
+            
+            target[keys[keys.length - 1]] = value;
+            
+            // Convert back to text format
+            const lines = [];
+            const formatConfig = (obj, prefix = '') => {
+                for (const [k, v] of Object.entries(obj)) {
+                    if (typeof v === 'object' && !Array.isArray(v)) {
+                        formatConfig(v, prefix + k + '.');
+                    } else {
+                        lines.push(`${prefix}${k}: ${JSON.stringify(v)}`);
+                    }
+                }
+            };
+            
+            formatConfig(config);
+            
+            // Update card
+            StoryCardOps.update(cardTitle, { entry: lines.join('\n') });
+            
+            // Clear cache
+            this.cache.delete(cardTitle);
+            
+            return true;
+        },
+        
+        clearCache(cardTitle = null) {
+            if (cardTitle) {
+                this.cache.delete(cardTitle);
+                this.cache.delete(`${cardTitle}:sectioned`);
+            } else {
+                this.cache.clear();
+            }
+        },
+        
+        exists(cardTitle) {
+            return StoryCardOps.get(cardTitle) !== null;
         }
     };
     
@@ -3172,12 +3127,6 @@ const Utilities = (function() {
                 return function(...nextArgs) {
                     return curried.apply(this, args.concat(nextArgs));
                 };
-            };
-        },
-        
-        partial(fn, ...partialArgs) {
-            return function(...args) {
-                return fn.apply(this, partialArgs.concat(args));
             };
         },
         
@@ -3525,6 +3474,10 @@ const Utilities = (function() {
         readPastAction(lookBack) {
             const action = (function() {
                 if (Array.isArray(history)) {
+                    // Check if lookBack exceeds available history
+                    if (lookBack >= history.length) {
+                        return null;
+                    }
                     return (history[(function() {
                         const index = history.length - 1 - Math.abs(lookBack);
                         if (index < 0) {
@@ -3547,7 +3500,11 @@ const Utilities = (function() {
             const matches = [];
             const regex = pattern instanceof RegExp ? pattern : new RegExp(pattern, 'i');
             
-            for (let i = 0; i < maxLookBack; i++) {
+            // Cap at actual history length
+            const searchLimit = Array.isArray(history) ? 
+                Math.min(maxLookBack, history.length) : 0;
+            
+            for (let i = 0; i < searchLimit; i++) {
                 const action = this.readPastAction(i);
                 if (action.text && regex.test(action.text)) {
                     matches.push({
@@ -3592,31 +3549,11 @@ const Utilities = (function() {
     // COMMON PATTERNS
     // =====================================
     const CommonPatterns = {
-        // Entity patterns
-        entityTitle: /^\[([A-Z]+)\]\s+(.+)$/,
-        entityReference: /\[([A-Z]+)\]\s+([^[\]]+)/g,
-        capitalizedName: /\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b/g,
-        
         // Number patterns
         integer: /-?\d+/g,
         decimal: /-?\d+\.?\d*/g,
         percentage: /(\d+(?:\.\d+)?)\s*%/g,
         range: /(\d+)\s*[-\/]\s*(\d+)/,
-        
-        // Game/Action patterns
-        damage: /(\d+)\s+damage\b/gi,
-        healing: /(?:healed?|restored?)\s+(\d+)\s+(?:HP|health)/gi,
-        critical: /\b(?:critical|crit)\s+(?:hit|strike)\b/gi,
-        
-        // Item patterns
-        itemQuantity: /(.+?)\s+x(\d+)$/i,
-        itemEnhancement: /(.+?)\s*\+(\d+)$/,
-        currency: /(\d+)\s*col\b/gi,
-        rarity: /\b(Common|Uncommon|Rare|Epic|Legendary)\b/gi,
-        
-        // Command patterns
-        command: /^\/(\w+)(?:\s+(.+))?$/,
-        mention: /@(\w+)/g,
         
         // Text structure patterns
         encapsulation: /^\{#\s*(.+?)\s*\n([\s\S]*)\}$/,
@@ -3643,7 +3580,7 @@ const Utilities = (function() {
     const turnCache = new TurnCache();
     
     // Freeze the API to prevent modification
-    return Object.freeze({
+    const UtilitiesAPI = Object.freeze({
         // Core APIs
         expression: ExpressionParser,
         plainText: PlainTextParser,
@@ -3651,12 +3588,9 @@ const Utilities = (function() {
         context: ContextUtils,
         math: MathUtils,
         collection: CollectionUtils,
-        validation: ValidationUtils,
         format: FormatUtils,
-        entity: EntityUtils,
-        command: CommandUtils,
         parsing: ParsingUtils,
-        turn: TurnUtils,
+        config: ConfigUtils,
         functional: FunctionalUtils,
         storyCard: StoryCardOps,
         history: HistoryUtils,
@@ -3666,15 +3600,17 @@ const Utilities = (function() {
         cache: turnCache,
         patterns: CommonPatterns,
         
-        /**
-         * Clear all caches (regex and turn-based)
-         * Useful for memory management or testing
-         */
         clearAll() {
             this.regex.clear();
             this.cache.clear();
-            this.turn.clear();
             ExpressionParser.clearCache();
         }
     });
+    
+    // Export for Node.js
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = UtilitiesAPI;
+    }
+    
+    return UtilitiesAPI;
 })();
