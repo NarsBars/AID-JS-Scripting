@@ -8,7 +8,7 @@ function GenerationWizard(hook, text) {
     // Constants
     // ==========================
     const PROGRESS_CARD = '[ENTITY_GEN] In Progress';
-    const TEMPLATE_PREFIX = '[ENTITY_TEMPLATE]';
+    const TEMPLATE_PREFIX = '[GW Template]';
     const CONFIG_AND_PROMPTS_CARD = '[GENERATION_CONFIG]';
     const HIDDEN_OUTPUT = '\n<<<The GM is thinking, please hit continue... (Use `/GW abort` if needed, this prompting is still being worked on)>>>\n';
     const COMPLETION_MESSAGE = '\n<<<Generation complete, please hit continue>>>\n';
@@ -198,6 +198,138 @@ function GenerationWizard(hook, text) {
         }
         
         return prompt;
+    }
+    
+    // ==========================
+    // Location Data Transformation
+    // ==========================
+    function createLocationFromData(collectedData, metadata) {
+        const name = collectedData.NAME || 'Unknown_Location';
+        const formattedName = name.replace(/\s+/g, '_');
+        
+        // Build type string from fields
+        let typeString = '';
+        if (collectedData.LOCATION_TYPE) typeString += `Type: ${collectedData.LOCATION_TYPE}`;
+        if (collectedData.TERRAIN) typeString += ` | Terrain: ${collectedData.TERRAIN}`;
+        
+        // TODO: Could add implicit danger tags based on LOCATION_TYPE
+        // Settlement/Safezone = Safe
+        // Wilderness/Landmark = Medium
+        // Dungeon/Ruins = Dangerous
+        
+        // Build pathways section (no header here, added in locationEntry)
+        let pathwaysSection = '';
+        
+        // Add return path if we know where we came from
+        if (metadata && metadata.from && metadata.direction) {
+            const oppositeDir = getOppositeDirection(metadata.direction);
+            pathwaysSection += `- ${oppositeDir}: ${metadata.from}\n`;
+        }
+        
+        // Add unexplored paths for other directions
+        const allDirections = ['North', 'South', 'East', 'West'];
+        for (const dir of allDirections) {
+            if (!metadata || !metadata.direction || dir !== getOppositeDirection(metadata.direction)) {
+                pathwaysSection += `- ${dir}: (unexplored)\n`;
+            }
+        }
+        
+        // Dynamically determine location header based on player's floor
+        let locationHeaders = '<$# Locations>';
+        if (typeof GameState !== 'undefined' && GameState.getPlayerName && GameState.loadCharacter) {
+            const playerName = GameState.getPlayerName();
+            if (playerName) {
+                const player = GameState.loadCharacter(playerName);
+                if (player && player.location) {
+                    // Try to extract floor from player's location (e.g., "Floor_2_Town" or check runtime)
+                    const currentFloor = GameState.getRuntimeValue ? 
+                        (GameState.getRuntimeValue('current_floor') || 1) : 1;
+                    
+                    // Convert floor number to words for header
+                    const floorWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
+                    let floorName;
+                    if (currentFloor >= 0 && currentFloor < floorWords.length) {
+                        floorName = 'Floor ' + floorWords[currentFloor];
+                    } else {
+                        floorName = 'Floor ' + currentFloor;
+                    }
+                    locationHeaders = '<$# Locations>\n<$## ' + floorName + '>';
+                }
+            }
+            
+            // Allow override via runtime variable if set
+            const customHeader = GameState.getRuntimeValue ? GameState.getRuntimeValue('location_header') : null;
+            if (customHeader) {
+                locationHeaders = customHeader; // User override takes precedence
+            }
+        }
+        
+        // Build the location entry
+        const locationEntry = (
+            locationHeaders + '\n' +
+            '## **' + formattedName + '**\n' +
+            typeString + '\n' +
+            '### Description\n' +
+            (collectedData.DESCRIPTION || 'An unexplored location.') + '\n' +
+            '### Pathways\n' +
+            pathwaysSection
+        );
+        
+        // Create the card
+        const snakeCased = formattedName.toLowerCase();  // Already has underscores
+        const spacedName = formattedName.replace(/_/g, ' ');
+        
+        const card = {
+            title: `[LOCATION] ${formattedName}`,
+            type: 'Location',
+            keys: `${snakeCased}, ${spacedName}`,  // Keys as comma-separated string
+            entry: locationEntry,
+            description: `Generated on turn ${info?.actionCount || 0}`
+        };
+        
+        Utilities.storyCard.add(card);
+        
+        // Update the connecting location's pathways if needed
+        if (metadata && metadata.from && metadata.direction) {
+            updateLocationPathway(metadata.from, metadata.direction, formattedName);
+        }
+        
+        if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName}`);
+        
+        // Signal completion if GameState has a handler
+        if (typeof GameState !== 'undefined' && GameState.completeLocationGeneration) {
+            GameState.completeLocationGeneration(formattedName, metadata);
+        }
+    }
+    
+    function getOppositeDirection(direction) {
+        const opposites = {
+            'north': 'South',
+            'south': 'North',
+            'east': 'West',
+            'west': 'East'
+        };
+        return opposites[direction.toLowerCase()] || direction;
+    }
+    
+    function updateLocationPathway(locationName, direction, destinationName) {
+        const card = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
+        if (!card) return;
+        
+        // Parse current entry
+        let entry = card.entry || '';
+        
+        // Find and update the pathway line
+        const dirCapitalized = direction.charAt(0).toUpperCase() + direction.slice(1).toLowerCase();
+        const pathwayRegex = new RegExp(`^- ${dirCapitalized}: .*$`, 'm');
+        
+        if (entry.match(pathwayRegex)) {
+            entry = entry.replace(pathwayRegex, `- ${dirCapitalized}: ${destinationName}`);
+        }
+        
+        Utilities.storyCard.update(card.title, { entry: entry });
+        
+        if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
     }
     
     // ==========================
@@ -882,8 +1014,8 @@ function GenerationWizard(hook, text) {
                     return { active: true, text: text };
                 }
                 
-                // For quests and NPCs, use batched collection
-                if (progress.entityType === 'Quest' || progress.entityType === 'NPC') {
+                // For quests, NPCs, and Locations, use batched collection
+                if (progress.entityType === 'Quest' || progress.entityType === 'NPC' || progress.entityType === 'Location') {
                     // Get fields that need to be collected
                     const activeFields = progress.templateFields.filter(field => 
                         !progress.collectedData.hasOwnProperty(field.name)
@@ -927,7 +1059,7 @@ function GenerationWizard(hook, text) {
                         });
                         
                         progress.expectingBatch = true;
-                    } else {
+                    } else if (progress.entityType === 'Quest') {
                         // Quest logic
                         batchPrompt = generateQuestBatchPrompt(
                             activeFields,
@@ -937,6 +1069,25 @@ function GenerationWizard(hook, text) {
                             progress.collectedData
                         );
                         progress.expectingQuestBatch = true;
+                    } else {
+                        // Other entity types (like Location) - just use field list
+                        let fieldList = '';
+                        for (const field of activeFields) {
+                            let fieldDescription = field.prompt || field.type;
+                            
+                            // If it's a choice field, show the options
+                            if (field.type === 'choice' && field.params) {
+                                fieldDescription = `(${field.params})`;
+                            }
+                            
+                            fieldList += `${field.name}: ${fieldDescription}\n`;
+                        }
+                        
+                        batchPrompt = generatePrompt('Field Collection', {
+                            ENTITY_TYPE: progress.entityType,
+                            FIELD_LIST: fieldList
+                        });
+                        progress.expectingBatch = true;
                     }
                     
                     // Store which fields we're asking about
@@ -989,10 +1140,13 @@ function GenerationWizard(hook, text) {
                     const template = loadTemplate(progress.entityType);
                     if (template) {
                         const finalText = processTemplate(template, progress.collectedData);
-                        // Pass triggerName along with collectedData
+                        // Pass triggerName and metadata along with collectedData
                         const dataWithTrigger = { ...progress.collectedData };
                         if (progress.triggerName) {
                             dataWithTrigger.triggerName = progress.triggerName;
+                        }
+                        if (progress.metadata) {
+                            dataWithTrigger.metadata = progress.metadata;
                         }
                         createEntityCard(progress.entityType, finalText, dataWithTrigger);
                     }
@@ -1001,9 +1155,10 @@ function GenerationWizard(hook, text) {
                     return { active: false }; // Let normal output through on completion
                 }
                 
-                // Handle batch response for Quest or NPC
+                // Handle batch response for Quest, NPC, or Location
                 if ((progress.entityType === 'Quest' && progress.expectingQuestBatch) || 
-                    (progress.entityType === 'NPC' && progress.expectingBatch)) {
+                    (progress.entityType === 'NPC' && progress.expectingBatch) ||
+                    (progress.entityType === 'Location' && progress.expectingBatch)) {
                     let allFieldsCollected = true;
                     
                     if (debug) {
@@ -1395,13 +1550,13 @@ function GenerationWizard(hook, text) {
                 cardTitle = `[BOSS] ${name}`;
                 cardType = 'boss';
                 break;
+            case 'LOCATION':
+                // Create location card using collectedData (not progress which isn't available here)
+                return createLocationFromData(collectedData, collectedData.metadata);
+                break;
             case 'ITEM':
                 cardTitle = `[ITEM] ${name}`;
                 cardType = 'item';
-                break;
-            case 'LOCATION':
-                cardTitle = `[LOCATION] ${name}`;
-                cardType = 'location';
                 break;
             case 'QUEST':
                 cardTitle = `[QUEST] ${name}`;
@@ -1446,7 +1601,7 @@ function GenerationWizard(hook, text) {
     function createDefaultTemplates() {
         // NPC Template (creates [CHARACTER] cards)
         Utilities.storyCard.add({
-            title: '[ENTITY_TEMPLATE] NPC',
+            title: '[GW Template] NPC',
             type: 'data',
             entry: (
                 `## **{{NAME}}**{{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
@@ -1488,9 +1643,32 @@ function GenerationWizard(hook, text) {
             ),
         });
         
+        // Location Template
+        Utilities.storyCard.add({
+            title: '[GW Template] Location',
+            type: 'data',
+            entry: (
+                `<$# Locations>\n` +
+                `## **{{NAME}}**\n` +
+                `Type: {{LOCATION_TYPE}} | Terrain: {{TERRAIN}}\n` +
+                `### Description\n` +
+                `{{DESCRIPTION}}\n` +
+                `### Pathways\n` +
+                `{{PATHWAYS}}`
+            ),
+            description: (
+                `// Location Generation\n` +
+                `NAME: required, text, Location name (e.g., Dark_Forest, Mountain_Pass)\n` +
+                `LOCATION_TYPE: required, choice[Settlement|Safezone|Wilderness|Dungeon|Landmark|Ruins], Primary location type\n` +
+                `TERRAIN: required, text, Terrain type (e.g., Plains, Forest, Cobblestone Plaza, etc.)\n` +
+                `ATMOSPHERE: required, text, 2-3 words for inherent mood/vibe (e.g., "dark and ominous", "bustling and lively" - NOT current events/scene)\n` +
+                `DESCRIPTION: required, text, 2-3 sentences about the location's permanent characteristics (NOT current scene/events/people present)`
+            )
+        });
+        
         // Quest Template
         Utilities.storyCard.add({
-            title: '[ENTITY_TEMPLATE] Quest',
+            title: '[GW Template] Quest',
             type: 'data',
             entry: (
                 `<\$# Quests><\$## Active Quests>\n` +
@@ -1976,6 +2154,49 @@ function GenerationWizard(hook, text) {
             if (debug) console.log(`${MODULE_NAME}: Started entity classification for ${entityData.name}`);
             return true;
         };
+        
+        // Generic start generation method for any entity type
+        GenerationWizard.startGeneration = function(entityType, triggerName, initialData) {
+            if (!entityType) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid entity type`);
+                return false;
+            }
+            
+            if (isGenerationActive()) {
+                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
+                return false;
+            }
+            
+            // Check if template exists
+            const template = loadTemplate(entityType);
+            if (!template) {
+                if (debug) console.log(`${MODULE_NAME}: Template not found for ${entityType}`);
+                return false;
+            }
+            
+            // Parse template fields
+            let templateFields = parseTemplateFields(template.description);
+            
+            // Create progress object
+            const progress = {
+                entityType: entityType,
+                entityName: initialData?.NAME || triggerName || 'Unknown',
+                triggerName: triggerName,
+                stage: 'generation',
+                collectedData: initialData || {},
+                templateFields: templateFields,
+                metadata: initialData?.metadata || {},
+                completed: false,
+                currentBatch: null,
+                branchResolved: true,
+                startTurn: info?.actionCount || 0,
+                expectingBatch: entityType === 'NPC' || entityType === 'Location'
+            };
+            
+            saveProgress(progress);
+            if (debug) console.log(`${MODULE_NAME}: Started ${entityType} generation`);
+            return true;
+        };
     }
     
     // Handle hook-based initialization
@@ -1984,7 +2205,7 @@ function GenerationWizard(hook, text) {
     }
     
     // Create default templates on first run
-    if (!Utilities.storyCard.get('[ENTITY_TEMPLATE] NPC')) {
+    if (!Utilities.storyCard.get('[GW Template] NPC')) {
         createDefaultTemplates();
     }
     

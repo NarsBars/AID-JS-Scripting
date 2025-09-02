@@ -14,6 +14,47 @@ function GameState(hook, text) {
     const GETTER_PATTERN = /get_[a-z_]+\s*\([^)]*\)/gi;
     
     // ==========================
+    // Location Helper Functions
+    // ==========================
+    function getOppositeDirection(direction) {
+        const opposites = {
+            'north': 'South',
+            'south': 'North',
+            'east': 'West',
+            'west': 'East',
+            'inside': 'Outside',
+            'outside': 'Inside'
+        };
+        return opposites[direction.toLowerCase()] || direction;
+    }
+    
+    function updateLocationPathway(locationName, direction, destinationName) {
+        const card = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
+        if (!card) {
+            if (debug) console.log(`${MODULE_NAME}: Location card not found: ${locationName}`);
+            return;
+        }
+        
+        // Parse current entry
+        let entry = card.entry || '';
+        
+        // Find and update the pathway line
+        const dirCapitalized = direction.charAt(0).toUpperCase() + direction.slice(1).toLowerCase();
+        const pathwayRegex = new RegExp(`^- ${dirCapitalized}: .*$`, 'm');
+        
+        if (entry.match(pathwayRegex)) {
+            entry = entry.replace(pathwayRegex, `- ${dirCapitalized}: ${destinationName}`);
+        } else {
+            // TODO: Add pathway if it doesn't exist in the expected format
+            if (debug) console.log(`${MODULE_NAME}: Could not find pathway line for ${dirCapitalized}`);
+        }
+        
+        Utilities.storyCard.update(card.title, { entry: entry });
+        
+        if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
+    }
+    
+    // ==========================
     // Runtime Variables System
     // ==========================
     let runtimeVariablesCache = null;
@@ -229,30 +270,50 @@ function GameState(hook, text) {
         const currentEntryLength = dataCard.entry.length;
         const currentDescLength = dataCard.description.length;
         
-        // Prefer entry first, then description if entry is getting large
-        if (currentEntryLength < 10000) {
+        // Use entry first until ~1500 chars, then use description up to 10000
+        if (currentEntryLength < 1500) {
             const updatedEntry = dataCard.entry + (dataCard.entry ? '\n\n' : '') + newEntries.join('\n\n');
             Utilities.storyCard.update('[RPG_RUNTIME] DATA 1', {entry: updatedEntry});
-        } else {
+        } else if (currentDescLength < 10000) {
             const updatedDesc = dataCard.description + '\n\n' + newEntries.join('\n\n');
             Utilities.storyCard.update('[RPG_RUNTIME] DATA 1', {description: updatedDesc});
+        } else {
+            // Both entry and description are full, need DATA 2
+            // TODO: Auto-create DATA 2 card and add variables there
+            if (debug) console.log(`${MODULE_NAME}: DATA 1 card is full, need to implement DATA 2 creation`);
         }
         
         if (debug) console.log(`${MODULE_NAME}: Initialized ${missingVars.length} runtime variables`);
     }
     
     function loadRuntimeTools() {
-        const toolsCard = Utilities.storyCard.get('[RPG_RUNTIME] TOOLS');
-        if (!toolsCard) {
-            if (debug) console.log(`${MODULE_NAME}: No runtime tools card found`);
+        // Load all TOOLS cards (TOOLS, TOOLS 2, TOOLS 3, etc.)
+        const toolsCards = [];
+        
+        // Check for base TOOLS card (no number)
+        const baseCard = Utilities.storyCard.get('[RPG_RUNTIME] TOOLS');
+        if (baseCard) toolsCards.push(baseCard);
+        
+        // Check for additional TOOLS cards (2 through 10)
+        for (let i = 2; i <= 10; i++) {
+            const numberedCard = Utilities.storyCard.get('[RPG_RUNTIME] TOOLS ' + i);
+            if (numberedCard) toolsCards.push(numberedCard);
+        }
+        
+        if (toolsCards.length === 0) {
+            if (debug) console.log(`${MODULE_NAME}: No runtime tools cards found`);
             return;
         }
         
         try {
-            // Combine entry and description for more space
-            const fullCode = (toolsCard.entry || '') + '\n' + (toolsCard.description || '');
+            // Combine all cards' entries and descriptions
+            let fullCode = '';
+            for (const card of toolsCards) {
+                fullCode += (card.entry || '') + '\n' + (card.description || '') + ',\n';
+            }
             
-            // Wrap in object literal and eval
+            // Remove trailing comma and wrap in object literal
+            fullCode = fullCode.replace(/,\s*$/, '');
             const code = `({${fullCode}})`;
             const customTools = eval(code);
             
@@ -2905,18 +2966,19 @@ function GameState(hook, text) {
         }
         
         const defaultText = (
-            `[**Current Scene** Current Location: get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
+            `[**Current Scene** Floor get_current_floor() | get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
             `**Available Tools:**\n` +
-            `• Location: update_location(name, place) discover_location(place)\n` +
+            `• Location: update_location(name, place) discover_location(character, place, direction) connect_locations(placeA, placeB, direction)\n` +
+            `  - Directions: north, south, east, west, inside (enter), outside (exit)\n` +
+            `• SAO: advance_to_floor(character, floor) set_current_floor(floor) complete_floor(floor)\n` +
             `• Time: advance_time(hours, minutes)\n` +
-            `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty) use_consumable(name, item, qty)\n` +
+            `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty)\n` +
             `• Relations: update_relationship(name1, name2, points)\n` +
-            `• Quests: offer_quest(quest_giver, quest_name, quest_type) accept_quest(player_name, quest_name, quest_giver, quest_type) update_quest(player_name, quest_name, stage_number) complete_quest(player_name, quest_name) abandon_quest(player_name, quest_name)\n` +
-            `• Level XP: add_levelxp(name, amount)\n` +
-            `• Skill XP: add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
-            `• Attributes: update_attribute(name, attribute, value)\n` +
-            `• Core Stats: update_health(name, current, max) update_max_health(name, value)\n` +
-            `• Combat: deal_damage(source, target, amount) death(name)]`
+            `• Quests: offer_quest(npc, quest, type) update_quest(player, quest, stage) complete_quest(player, quest)\n` +
+            `• Progression: add_levelxp(name, amount) add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
+            `• Stats: update_attribute(name, attribute, value) update_health(name, current, max)\n` +
+            `• Combat: deal_damage(source, target, amount) death(name)\n` +
+            `**Instructions:** Use tools naturally in narrative. Discover new locations as characters explore. Track all exchanges and progression.]`
         );
         
         Utilities.storyCard.add({
@@ -3400,6 +3462,20 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
+            // ONLY validate against schema - data-driven!
+            const schema = loadRPGSchema();
+            
+            if (!schema.attributes || Object.keys(schema.attributes).length === 0) {
+                if (debug) console.log(`${MODULE_NAME}: No attributes defined in [RPG_SCHEMA] Attributes card`);
+                return 'malformed';
+            }
+            
+            const schemaAttrs = Object.keys(schema.attributes).map(a => a.toLowerCase());
+            if (!schemaAttrs.includes(attrName)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid attribute '${attrName}' - must be one of: ${schemaAttrs.join(', ')}`);
+                return 'malformed';
+            }
+            
             const characters = loadAllCharacters();
             const character = characters[characterName];
             
@@ -3470,13 +3546,187 @@ function GameState(hook, text) {
             return 'executed';
         },
         
-        discover_location: function(locationName) {
-            if (!locationName) return 'malformed';
+        discover_location: function(characterName, locationName, direction) {
+            // Validate inputs
+            if (!characterName || !locationName || !direction) return 'malformed';
             
-            locationName = String(locationName).toLowerCase().replace(/\s+/g, '_');
-            if (debug) console.log(`${MODULE_NAME}: TODO - discover_location: ${locationName}`);
+            characterName = String(characterName).toLowerCase();
+            locationName = String(locationName).replace(/\s+/g, '_');
+            direction = String(direction).toLowerCase();
+            
+            // Validate direction (cardinal directions + inside/outside for nested locations)
+            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
+            if (!validDirections.includes(direction)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${direction}. Valid: ${validDirections.join(', ')}`);
+                return 'malformed';
+            }
+            
+            // Get character's current location
+            const characters = loadAllCharacters();
+            const character = characters[characterName];
+            
+            if (!character) {
+                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                return 'malformed';
+            }
+            
+            const currentLocation = character.location;
+            
+            // Check if location already exists
+            const existingLocation = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
+            if (existingLocation) {
+                if (debug) console.log(`${MODULE_NAME}: Location ${locationName} already exists - use connect_locations instead`);
+                return 'malformed';
+            }
+            
+            // Dynamically determine location header based on player's floor
+            let locationHeaders = '<$# Locations>';
+            
+            // First, check the player's current floor
+            // Find the first [PLAYER] card
+            const playerCard = Utilities.storyCard.find(card => {
+                return card.title && card.title.startsWith('[PLAYER]');
+            }, false);
+            
+            let playerName = null;
+            if (playerCard) {
+                const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
+                if (match) {
+                    playerName = match[1].trim();
+                }
+            }
+            
+            if (playerName) {
+                const allChars = loadAllCharacters();
+                const player = allChars[playerName.toLowerCase()];
+                if (player) {
+                    // Get current floor from runtime or default to 1
+                    const currentFloor = getRuntimeValue('current_floor') || 1;
+                    
+                    // Convert floor number to words for header
+                    const floorWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
+                    let floorName;
+                    if (currentFloor >= 0 && currentFloor < floorWords.length) {
+                        floorName = 'Floor ' + floorWords[currentFloor];
+                    } else {
+                        floorName = 'Floor ' + currentFloor;
+                    }
+                    locationHeaders = '<$# Locations>\n<$## ' + floorName + '>';
+                }
+            }
+            
+            // Allow override via runtime variable if set
+            const customHeader = getRuntimeValue('location_header');
+            if (customHeader) {
+                locationHeaders = customHeader; // User override takes precedence
+            }
+            
+            // Create basic location card (will be enhanced by generation)
+            // For inside/outside locations, adjust pathways accordingly
+            let pathwaysList;
+            if (direction === 'inside') {
+                // Interior location - minimal pathways
+                pathwaysList = (
+                    '- Outside: ' + currentLocation + '\n' +
+                    '- Inside: (unexplored)'  // For buildings with multiple rooms
+                );
+            } else if (direction === 'outside') {
+                // Exterior location from interior - include all directions
+                pathwaysList = (
+                    '- Inside: ' + currentLocation + '\n' +
+                    '- North: (unexplored)\n' +
+                    '- South: (unexplored)\n' +
+                    '- East: (unexplored)\n' +
+                    '- West: (unexplored)'
+                );
+            } else {
+                // Standard cardinal direction - include all options
+                pathwaysList = (
+                    '- ' + getOppositeDirection(direction) + ': ' + currentLocation + '\n' +
+                    '- North: (unexplored)\n' +
+                    '- South: (unexplored)\n' +
+                    '- East: (unexplored)\n' +
+                    '- West: (unexplored)\n' +
+                    '- Inside: (unexplored)'  // Buildings can have interiors
+                );
+            }
+            
+            const locationEntry = (
+                locationHeaders + '\n' +
+                '## **' + locationName + '**\n' +
+                'Type: Unknown | Terrain: Unexplored\n' +
+                '### Description\n' +
+                'An unexplored location. Details will be revealed upon first visit.\n' +
+                '### Pathways\n' +
+                pathwaysList
+            );
+            
+            const snakeCased = locationName.toLowerCase();
+            const spacedName = locationName.replace(/_/g, ' ');
+            
+            const locationCard = {
+                title: `[LOCATION] ${locationName}`,
+                type: 'Location',
+                keys: `${snakeCased}, ${spacedName}`,  // Keys as comma-separated string
+                entry: locationEntry,
+                description: `Discovered by ${character.name} on turn ${info?.actionCount || 0}`
+            };
+            
+            Utilities.storyCard.add(locationCard);
+            
+            // Update current location's pathway
+            updateLocationPathway(currentLocation, direction, locationName);
+            
+            // Queue for generation if GenerationWizard is available
+            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startGeneration) {
+                GenerationWizard.startGeneration('Location', null, {
+                    NAME: locationName,
+                    metadata: {
+                        from: currentLocation,
+                        direction: direction,
+                        discoveredBy: character.name
+                    }
+                });
+            }
+            
+            if (debug) console.log(`${MODULE_NAME}: ${character.name} discovered ${locationName} to the ${direction}`);
             return 'executed';
         },
+        
+        connect_locations: function(locationA, locationB, directionFromA) {
+            if (!locationA || !locationB || !directionFromA) return 'malformed';
+            
+            locationA = String(locationA).replace(/\s+/g, '_');
+            locationB = String(locationB).replace(/\s+/g, '_');
+            directionFromA = String(directionFromA).toLowerCase();
+            
+            // Validate direction (cardinal directions + inside/outside for nested locations)
+            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
+            if (!validDirections.includes(directionFromA)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${directionFromA}. Valid: ${validDirections.join(', ')}`);
+                return 'malformed';
+            }
+            
+            // Check both locations exist
+            const cardA = Utilities.storyCard.get(`[LOCATION] ${locationA}`);
+            const cardB = Utilities.storyCard.get(`[LOCATION] ${locationB}`);
+            
+            if (!cardA || !cardB) {
+                if (debug) console.log(`${MODULE_NAME}: One or both locations not found`);
+                return 'malformed';
+            }
+            
+            // Update pathways bidirectionally
+            updateLocationPathway(locationA, directionFromA, locationB);
+            updateLocationPathway(locationB, getOppositeDirection(directionFromA), locationA);
+            
+            if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} ${directionFromA} to ${locationB}`);
+            return 'executed';
+        },
+        
+        // TODO: Future resident management tools
+        // add_resident: function(characterName, locationName, role) { }
+        // remove_resident: function(characterName, locationName) { }
         
         accept_quest: function(playerName, questName, questGiver, questType) {
             // Must have all 4 parameters
@@ -3635,6 +3885,76 @@ function GameState(hook, text) {
             
             characterName = String(characterName).toLowerCase();
             if (debug) console.log(`${MODULE_NAME}: Death recorded for: ${characterName}`);
+            return 'executed';
+        },
+        
+        get_player_name: function() {
+            // Find the first [PLAYER] card
+            const playerCard = Utilities.storyCard.find(card => {
+                return card.title && card.title.startsWith('[PLAYER]');
+            }, false);
+            
+            let playerName = null;
+            if (playerCard) {
+                const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
+                if (match) {
+                    playerName = match[1].trim();
+                }
+            }
+            
+            if (debug) console.log(`${MODULE_NAME}: Player name is: ${playerName}`);
+            return playerName || 'unknown';
+        },
+        
+        update_character_format: function(section, newTemplate) {
+            if (!section || !newTemplate) return 'malformed';
+            
+            // Get current character format
+            const formatCard = Utilities.storyCard.get('[RPG_SCHEMA] Character Format');
+            if (!formatCard) {
+                if (debug) console.log(`${MODULE_NAME}: Character Format card not found`);
+                return 'malformed';
+            }
+            
+            // Parse the current format
+            const lines = formatCard.entry.split('\n');
+            let inSection = null;
+            let updatedLines = [];
+            let sectionUpdated = false;
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const trimmed = line.trim();
+                
+                // Check for section headers
+                if (trimmed.startsWith('# ')) {
+                    inSection = trimmed.substring(2).toLowerCase().replace(/\s+/g, '_');
+                    updatedLines.push(line);
+                } else if (inSection === section.toLowerCase().replace(/\s+/g, '_')) {
+                    // We're in the target section - replace the template line
+                    if (!sectionUpdated && trimmed !== '' && !trimmed.startsWith('#')) {
+                        updatedLines.push(newTemplate);
+                        sectionUpdated = true;
+                        // Skip the original line
+                    } else {
+                        updatedLines.push(line);
+                    }
+                } else {
+                    updatedLines.push(line);
+                }
+            }
+            
+            if (!sectionUpdated) {
+                if (debug) console.log(`${MODULE_NAME}: Section ${section} not found in Character Format`);
+                return 'malformed';
+            }
+            
+            // Update the card
+            Utilities.storyCard.update('[RPG_SCHEMA] Character Format', {
+                entry: updatedLines.join('\n')
+            });
+            
+            if (debug) console.log(`${MODULE_NAME}: Updated character format section: ${section}`);
             return 'executed';
         }
     };
@@ -4281,7 +4601,7 @@ function GameState(hook, text) {
             // Test entity generation for Location
             gw_location: () => {
                 if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Location', {name: 'Debug_Test_Location'});
+                GenerationWizard.startGeneration('Location', null, {NAME: 'Debug_Test_Location'});
                 return "\n<<<Started Location generation for Debug_Test_Location>>>\n";
             },
             
@@ -4754,6 +5074,23 @@ function GameState(hook, text) {
     };
     GameState.saveCharacter = saveCharacter;
     GameState.createCharacter = createCharacter;
+    GameState.getPlayerName = function() {
+        // Find the first [PLAYER] card
+        const playerCard = Utilities.storyCard.find(card => {
+            return card.title && card.title.startsWith('[PLAYER]');
+        }, false); // false = return first match only
+        
+        if (playerCard) {
+            // Extract name from title: [PLAYER] Name
+            const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
+            if (match) {
+                return match[1].trim();
+            }
+        }
+        
+        if (debug) console.log(`${MODULE_NAME}: No [PLAYER] card found`);
+        return null;
+    };
     
     // Entity tracking API
     GameState.completeEntityGeneration = completeEntityGeneration;

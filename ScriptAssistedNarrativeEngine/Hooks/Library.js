@@ -6189,7 +6189,7 @@ function GenerationWizard(hook, text) {
     // Constants
     // ==========================
     const PROGRESS_CARD = '[ENTITY_GEN] In Progress';
-    const TEMPLATE_PREFIX = '[ENTITY_TEMPLATE]';
+    const TEMPLATE_PREFIX = '[GW Template]';
     const CONFIG_AND_PROMPTS_CARD = '[GENERATION_CONFIG]';
     const HIDDEN_OUTPUT = '\n<<<The GM is thinking, please hit continue... (Use `/GW abort` if needed, this prompting is still being worked on)>>>\n';
     const COMPLETION_MESSAGE = '\n<<<Generation complete, please hit continue>>>\n';
@@ -6379,6 +6379,138 @@ function GenerationWizard(hook, text) {
         }
         
         return prompt;
+    }
+    
+    // ==========================
+    // Location Data Transformation
+    // ==========================
+    function createLocationFromData(collectedData, metadata) {
+        const name = collectedData.NAME || 'Unknown_Location';
+        const formattedName = name.replace(/\s+/g, '_');
+        
+        // Build type string from fields
+        let typeString = '';
+        if (collectedData.LOCATION_TYPE) typeString += `Type: ${collectedData.LOCATION_TYPE}`;
+        if (collectedData.TERRAIN) typeString += ` | Terrain: ${collectedData.TERRAIN}`;
+        
+        // TODO: Could add implicit danger tags based on LOCATION_TYPE
+        // Settlement/Safezone = Safe
+        // Wilderness/Landmark = Medium
+        // Dungeon/Ruins = Dangerous
+        
+        // Build pathways section (no header here, added in locationEntry)
+        let pathwaysSection = '';
+        
+        // Add return path if we know where we came from
+        if (metadata && metadata.from && metadata.direction) {
+            const oppositeDir = getOppositeDirection(metadata.direction);
+            pathwaysSection += `- ${oppositeDir}: ${metadata.from}\n`;
+        }
+        
+        // Add unexplored paths for other directions
+        const allDirections = ['North', 'South', 'East', 'West'];
+        for (const dir of allDirections) {
+            if (!metadata || !metadata.direction || dir !== getOppositeDirection(metadata.direction)) {
+                pathwaysSection += `- ${dir}: (unexplored)\n`;
+            }
+        }
+        
+        // Dynamically determine location header based on player's floor
+        let locationHeaders = '<$# Locations>';
+        if (typeof GameState !== 'undefined' && GameState.getPlayerName && GameState.loadCharacter) {
+            const playerName = GameState.getPlayerName();
+            if (playerName) {
+                const player = GameState.loadCharacter(playerName);
+                if (player && player.location) {
+                    // Try to extract floor from player's location (e.g., "Floor_2_Town" or check runtime)
+                    const currentFloor = GameState.getRuntimeValue ? 
+                        (GameState.getRuntimeValue('current_floor') || 1) : 1;
+                    
+                    // Convert floor number to words for header
+                    const floorWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
+                    let floorName;
+                    if (currentFloor >= 0 && currentFloor < floorWords.length) {
+                        floorName = 'Floor ' + floorWords[currentFloor];
+                    } else {
+                        floorName = 'Floor ' + currentFloor;
+                    }
+                    locationHeaders = '<$# Locations>\n<$## ' + floorName + '>';
+                }
+            }
+            
+            // Allow override via runtime variable if set
+            const customHeader = GameState.getRuntimeValue ? GameState.getRuntimeValue('location_header') : null;
+            if (customHeader) {
+                locationHeaders = customHeader; // User override takes precedence
+            }
+        }
+        
+        // Build the location entry
+        const locationEntry = (
+            locationHeaders + '\n' +
+            '## **' + formattedName + '**\n' +
+            typeString + '\n' +
+            '### Description\n' +
+            (collectedData.DESCRIPTION || 'An unexplored location.') + '\n' +
+            '### Pathways\n' +
+            pathwaysSection
+        );
+        
+        // Create the card
+        const snakeCased = formattedName.toLowerCase();  // Already has underscores
+        const spacedName = formattedName.replace(/_/g, ' ');
+        
+        const card = {
+            title: `[LOCATION] ${formattedName}`,
+            type: 'Location',
+            keys: `${snakeCased}, ${spacedName}`,  // Keys as comma-separated string
+            entry: locationEntry,
+            description: `Generated on turn ${info?.actionCount || 0}`
+        };
+        
+        Utilities.storyCard.add(card);
+        
+        // Update the connecting location's pathways if needed
+        if (metadata && metadata.from && metadata.direction) {
+            updateLocationPathway(metadata.from, metadata.direction, formattedName);
+        }
+        
+        if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName}`);
+        
+        // Signal completion if GameState has a handler
+        if (typeof GameState !== 'undefined' && GameState.completeLocationGeneration) {
+            GameState.completeLocationGeneration(formattedName, metadata);
+        }
+    }
+    
+    function getOppositeDirection(direction) {
+        const opposites = {
+            'north': 'South',
+            'south': 'North',
+            'east': 'West',
+            'west': 'East'
+        };
+        return opposites[direction.toLowerCase()] || direction;
+    }
+    
+    function updateLocationPathway(locationName, direction, destinationName) {
+        const card = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
+        if (!card) return;
+        
+        // Parse current entry
+        let entry = card.entry || '';
+        
+        // Find and update the pathway line
+        const dirCapitalized = direction.charAt(0).toUpperCase() + direction.slice(1).toLowerCase();
+        const pathwayRegex = new RegExp(`^- ${dirCapitalized}: .*$`, 'm');
+        
+        if (entry.match(pathwayRegex)) {
+            entry = entry.replace(pathwayRegex, `- ${dirCapitalized}: ${destinationName}`);
+        }
+        
+        Utilities.storyCard.update(card.title, { entry: entry });
+        
+        if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
     }
     
     // ==========================
@@ -7063,8 +7195,8 @@ function GenerationWizard(hook, text) {
                     return { active: true, text: text };
                 }
                 
-                // For quests and NPCs, use batched collection
-                if (progress.entityType === 'Quest' || progress.entityType === 'NPC') {
+                // For quests, NPCs, and Locations, use batched collection
+                if (progress.entityType === 'Quest' || progress.entityType === 'NPC' || progress.entityType === 'Location') {
                     // Get fields that need to be collected
                     const activeFields = progress.templateFields.filter(field => 
                         !progress.collectedData.hasOwnProperty(field.name)
@@ -7108,7 +7240,7 @@ function GenerationWizard(hook, text) {
                         });
                         
                         progress.expectingBatch = true;
-                    } else {
+                    } else if (progress.entityType === 'Quest') {
                         // Quest logic
                         batchPrompt = generateQuestBatchPrompt(
                             activeFields,
@@ -7118,6 +7250,25 @@ function GenerationWizard(hook, text) {
                             progress.collectedData
                         );
                         progress.expectingQuestBatch = true;
+                    } else {
+                        // Other entity types (like Location) - just use field list
+                        let fieldList = '';
+                        for (const field of activeFields) {
+                            let fieldDescription = field.prompt || field.type;
+                            
+                            // If it's a choice field, show the options
+                            if (field.type === 'choice' && field.params) {
+                                fieldDescription = `(${field.params})`;
+                            }
+                            
+                            fieldList += `${field.name}: ${fieldDescription}\n`;
+                        }
+                        
+                        batchPrompt = generatePrompt('Field Collection', {
+                            ENTITY_TYPE: progress.entityType,
+                            FIELD_LIST: fieldList
+                        });
+                        progress.expectingBatch = true;
                     }
                     
                     // Store which fields we're asking about
@@ -7170,10 +7321,13 @@ function GenerationWizard(hook, text) {
                     const template = loadTemplate(progress.entityType);
                     if (template) {
                         const finalText = processTemplate(template, progress.collectedData);
-                        // Pass triggerName along with collectedData
+                        // Pass triggerName and metadata along with collectedData
                         const dataWithTrigger = { ...progress.collectedData };
                         if (progress.triggerName) {
                             dataWithTrigger.triggerName = progress.triggerName;
+                        }
+                        if (progress.metadata) {
+                            dataWithTrigger.metadata = progress.metadata;
                         }
                         createEntityCard(progress.entityType, finalText, dataWithTrigger);
                     }
@@ -7182,9 +7336,10 @@ function GenerationWizard(hook, text) {
                     return { active: false }; // Let normal output through on completion
                 }
                 
-                // Handle batch response for Quest or NPC
+                // Handle batch response for Quest, NPC, or Location
                 if ((progress.entityType === 'Quest' && progress.expectingQuestBatch) || 
-                    (progress.entityType === 'NPC' && progress.expectingBatch)) {
+                    (progress.entityType === 'NPC' && progress.expectingBatch) ||
+                    (progress.entityType === 'Location' && progress.expectingBatch)) {
                     let allFieldsCollected = true;
                     
                     if (debug) {
@@ -7576,13 +7731,13 @@ function GenerationWizard(hook, text) {
                 cardTitle = `[BOSS] ${name}`;
                 cardType = 'boss';
                 break;
+            case 'LOCATION':
+                // Create location card using collectedData (not progress which isn't available here)
+                return createLocationFromData(collectedData, collectedData.metadata);
+                break;
             case 'ITEM':
                 cardTitle = `[ITEM] ${name}`;
                 cardType = 'item';
-                break;
-            case 'LOCATION':
-                cardTitle = `[LOCATION] ${name}`;
-                cardType = 'location';
                 break;
             case 'QUEST':
                 cardTitle = `[QUEST] ${name}`;
@@ -7627,7 +7782,7 @@ function GenerationWizard(hook, text) {
     function createDefaultTemplates() {
         // NPC Template (creates [CHARACTER] cards)
         Utilities.storyCard.add({
-            title: '[ENTITY_TEMPLATE] NPC',
+            title: '[GW Template] NPC',
             type: 'data',
             entry: (
                 `## **{{NAME}}**{{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
@@ -7669,9 +7824,32 @@ function GenerationWizard(hook, text) {
             ),
         });
         
+        // Location Template
+        Utilities.storyCard.add({
+            title: '[GW Template] Location',
+            type: 'data',
+            entry: (
+                `<$# Locations>\n` +
+                `## **{{NAME}}**\n` +
+                `Type: {{LOCATION_TYPE}} | Terrain: {{TERRAIN}}\n` +
+                `### Description\n` +
+                `{{DESCRIPTION}}\n` +
+                `### Pathways\n` +
+                `{{PATHWAYS}}`
+            ),
+            description: (
+                `// Location Generation\n` +
+                `NAME: required, text, Location name (e.g., Dark_Forest, Mountain_Pass)\n` +
+                `LOCATION_TYPE: required, choice[Settlement|Safezone|Wilderness|Dungeon|Landmark|Ruins], Primary location type\n` +
+                `TERRAIN: required, text, Terrain type (e.g., Plains, Forest, Cobblestone Plaza, etc.)\n` +
+                `ATMOSPHERE: required, text, 2-3 words for inherent mood/vibe (e.g., "dark and ominous", "bustling and lively" - NOT current events/scene)\n` +
+                `DESCRIPTION: required, text, 2-3 sentences about the location's permanent characteristics (NOT current scene/events/people present)`
+            )
+        });
+        
         // Quest Template
         Utilities.storyCard.add({
-            title: '[ENTITY_TEMPLATE] Quest',
+            title: '[GW Template] Quest',
             type: 'data',
             entry: (
                 `<\$# Quests><\$## Active Quests>\n` +
@@ -8157,6 +8335,49 @@ function GenerationWizard(hook, text) {
             if (debug) console.log(`${MODULE_NAME}: Started entity classification for ${entityData.name}`);
             return true;
         };
+        
+        // Generic start generation method for any entity type
+        GenerationWizard.startGeneration = function(entityType, triggerName, initialData) {
+            if (!entityType) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid entity type`);
+                return false;
+            }
+            
+            if (isGenerationActive()) {
+                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
+                return false;
+            }
+            
+            // Check if template exists
+            const template = loadTemplate(entityType);
+            if (!template) {
+                if (debug) console.log(`${MODULE_NAME}: Template not found for ${entityType}`);
+                return false;
+            }
+            
+            // Parse template fields
+            let templateFields = parseTemplateFields(template.description);
+            
+            // Create progress object
+            const progress = {
+                entityType: entityType,
+                entityName: initialData?.NAME || triggerName || 'Unknown',
+                triggerName: triggerName,
+                stage: 'generation',
+                collectedData: initialData || {},
+                templateFields: templateFields,
+                metadata: initialData?.metadata || {},
+                completed: false,
+                currentBatch: null,
+                branchResolved: true,
+                startTurn: info?.actionCount || 0,
+                expectingBatch: entityType === 'NPC' || entityType === 'Location'
+            };
+            
+            saveProgress(progress);
+            if (debug) console.log(`${MODULE_NAME}: Started ${entityType} generation`);
+            return true;
+        };
     }
     
     // Handle hook-based initialization
@@ -8165,7 +8386,7 @@ function GenerationWizard(hook, text) {
     }
     
     // Create default templates on first run
-    if (!Utilities.storyCard.get('[ENTITY_TEMPLATE] NPC')) {
+    if (!Utilities.storyCard.get('[GW Template] NPC')) {
         createDefaultTemplates();
     }
     
@@ -8191,6 +8412,47 @@ function GameState(hook, text) {
     
     // Getter pattern: get_something(parameters)
     const GETTER_PATTERN = /get_[a-z_]+\s*\([^)]*\)/gi;
+    
+    // ==========================
+    // Location Helper Functions
+    // ==========================
+    function getOppositeDirection(direction) {
+        const opposites = {
+            'north': 'South',
+            'south': 'North',
+            'east': 'West',
+            'west': 'East',
+            'inside': 'Outside',
+            'outside': 'Inside'
+        };
+        return opposites[direction.toLowerCase()] || direction;
+    }
+    
+    function updateLocationPathway(locationName, direction, destinationName) {
+        const card = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
+        if (!card) {
+            if (debug) console.log(`${MODULE_NAME}: Location card not found: ${locationName}`);
+            return;
+        }
+        
+        // Parse current entry
+        let entry = card.entry || '';
+        
+        // Find and update the pathway line
+        const dirCapitalized = direction.charAt(0).toUpperCase() + direction.slice(1).toLowerCase();
+        const pathwayRegex = new RegExp(`^- ${dirCapitalized}: .*$`, 'm');
+        
+        if (entry.match(pathwayRegex)) {
+            entry = entry.replace(pathwayRegex, `- ${dirCapitalized}: ${destinationName}`);
+        } else {
+            // TODO: Add pathway if it doesn't exist in the expected format
+            if (debug) console.log(`${MODULE_NAME}: Could not find pathway line for ${dirCapitalized}`);
+        }
+        
+        Utilities.storyCard.update(card.title, { entry: entry });
+        
+        if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
+    }
     
     // ==========================
     // Runtime Variables System
@@ -8408,30 +8670,50 @@ function GameState(hook, text) {
         const currentEntryLength = dataCard.entry.length;
         const currentDescLength = dataCard.description.length;
         
-        // Prefer entry first, then description if entry is getting large
-        if (currentEntryLength < 10000) {
+        // Use entry first until ~1500 chars, then use description up to 10000
+        if (currentEntryLength < 1500) {
             const updatedEntry = dataCard.entry + (dataCard.entry ? '\n\n' : '') + newEntries.join('\n\n');
             Utilities.storyCard.update('[RPG_RUNTIME] DATA 1', {entry: updatedEntry});
-        } else {
+        } else if (currentDescLength < 10000) {
             const updatedDesc = dataCard.description + '\n\n' + newEntries.join('\n\n');
             Utilities.storyCard.update('[RPG_RUNTIME] DATA 1', {description: updatedDesc});
+        } else {
+            // Both entry and description are full, need DATA 2
+            // TODO: Auto-create DATA 2 card and add variables there
+            if (debug) console.log(`${MODULE_NAME}: DATA 1 card is full, need to implement DATA 2 creation`);
         }
         
         if (debug) console.log(`${MODULE_NAME}: Initialized ${missingVars.length} runtime variables`);
     }
     
     function loadRuntimeTools() {
-        const toolsCard = Utilities.storyCard.get('[RPG_RUNTIME] TOOLS');
-        if (!toolsCard) {
-            if (debug) console.log(`${MODULE_NAME}: No runtime tools card found`);
+        // Load all TOOLS cards (TOOLS, TOOLS 2, TOOLS 3, etc.)
+        const toolsCards = [];
+        
+        // Check for base TOOLS card (no number)
+        const baseCard = Utilities.storyCard.get('[RPG_RUNTIME] TOOLS');
+        if (baseCard) toolsCards.push(baseCard);
+        
+        // Check for additional TOOLS cards (2 through 10)
+        for (let i = 2; i <= 10; i++) {
+            const numberedCard = Utilities.storyCard.get('[RPG_RUNTIME] TOOLS ' + i);
+            if (numberedCard) toolsCards.push(numberedCard);
+        }
+        
+        if (toolsCards.length === 0) {
+            if (debug) console.log(`${MODULE_NAME}: No runtime tools cards found`);
             return;
         }
         
         try {
-            // Combine entry and description for more space
-            const fullCode = (toolsCard.entry || '') + '\n' + (toolsCard.description || '');
+            // Combine all cards' entries and descriptions
+            let fullCode = '';
+            for (const card of toolsCards) {
+                fullCode += (card.entry || '') + '\n' + (card.description || '') + ',\n';
+            }
             
-            // Wrap in object literal and eval
+            // Remove trailing comma and wrap in object literal
+            fullCode = fullCode.replace(/,\s*$/, '');
             const code = `({${fullCode}})`;
             const customTools = eval(code);
             
@@ -11084,18 +11366,19 @@ function GameState(hook, text) {
         }
         
         const defaultText = (
-            `[**Current Scene** Current Location: get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
+            `[**Current Scene** Floor get_current_floor() | get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
             `**Available Tools:**\n` +
-            `• Location: update_location(name, place) discover_location(place)\n` +
+            `• Location: update_location(name, place) discover_location(character, place, direction) connect_locations(placeA, placeB, direction)\n` +
+            `  - Directions: north, south, east, west, inside (enter), outside (exit)\n` +
+            `• SAO: advance_to_floor(character, floor) set_current_floor(floor) complete_floor(floor)\n` +
             `• Time: advance_time(hours, minutes)\n` +
-            `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty) use_consumable(name, item, qty)\n` +
+            `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty)\n` +
             `• Relations: update_relationship(name1, name2, points)\n` +
-            `• Quests: offer_quest(quest_giver, quest_name, quest_type) accept_quest(player_name, quest_name, quest_giver, quest_type) update_quest(player_name, quest_name, stage_number) complete_quest(player_name, quest_name) abandon_quest(player_name, quest_name)\n` +
-            `• Level XP: add_levelxp(name, amount)\n` +
-            `• Skill XP: add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
-            `• Attributes: update_attribute(name, attribute, value)\n` +
-            `• Core Stats: update_health(name, current, max) update_max_health(name, value)\n` +
-            `• Combat: deal_damage(source, target, amount) death(name)]`
+            `• Quests: offer_quest(npc, quest, type) update_quest(player, quest, stage) complete_quest(player, quest)\n` +
+            `• Progression: add_levelxp(name, amount) add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
+            `• Stats: update_attribute(name, attribute, value) update_health(name, current, max)\n` +
+            `• Combat: deal_damage(source, target, amount) death(name)\n` +
+            `**Instructions:** Use tools naturally in narrative. Discover new locations as characters explore. Track all exchanges and progression.]`
         );
         
         Utilities.storyCard.add({
@@ -11579,6 +11862,20 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
+            // ONLY validate against schema - data-driven!
+            const schema = loadRPGSchema();
+            
+            if (!schema.attributes || Object.keys(schema.attributes).length === 0) {
+                if (debug) console.log(`${MODULE_NAME}: No attributes defined in [RPG_SCHEMA] Attributes card`);
+                return 'malformed';
+            }
+            
+            const schemaAttrs = Object.keys(schema.attributes).map(a => a.toLowerCase());
+            if (!schemaAttrs.includes(attrName)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid attribute '${attrName}' - must be one of: ${schemaAttrs.join(', ')}`);
+                return 'malformed';
+            }
+            
             const characters = loadAllCharacters();
             const character = characters[characterName];
             
@@ -11649,13 +11946,187 @@ function GameState(hook, text) {
             return 'executed';
         },
         
-        discover_location: function(locationName) {
-            if (!locationName) return 'malformed';
+        discover_location: function(characterName, locationName, direction) {
+            // Validate inputs
+            if (!characterName || !locationName || !direction) return 'malformed';
             
-            locationName = String(locationName).toLowerCase().replace(/\s+/g, '_');
-            if (debug) console.log(`${MODULE_NAME}: TODO - discover_location: ${locationName}`);
+            characterName = String(characterName).toLowerCase();
+            locationName = String(locationName).replace(/\s+/g, '_');
+            direction = String(direction).toLowerCase();
+            
+            // Validate direction (cardinal directions + inside/outside for nested locations)
+            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
+            if (!validDirections.includes(direction)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${direction}. Valid: ${validDirections.join(', ')}`);
+                return 'malformed';
+            }
+            
+            // Get character's current location
+            const characters = loadAllCharacters();
+            const character = characters[characterName];
+            
+            if (!character) {
+                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                return 'malformed';
+            }
+            
+            const currentLocation = character.location;
+            
+            // Check if location already exists
+            const existingLocation = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
+            if (existingLocation) {
+                if (debug) console.log(`${MODULE_NAME}: Location ${locationName} already exists - use connect_locations instead`);
+                return 'malformed';
+            }
+            
+            // Dynamically determine location header based on player's floor
+            let locationHeaders = '<$# Locations>';
+            
+            // First, check the player's current floor
+            // Find the first [PLAYER] card
+            const playerCard = Utilities.storyCard.find(card => {
+                return card.title && card.title.startsWith('[PLAYER]');
+            }, false);
+            
+            let playerName = null;
+            if (playerCard) {
+                const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
+                if (match) {
+                    playerName = match[1].trim();
+                }
+            }
+            
+            if (playerName) {
+                const allChars = loadAllCharacters();
+                const player = allChars[playerName.toLowerCase()];
+                if (player) {
+                    // Get current floor from runtime or default to 1
+                    const currentFloor = getRuntimeValue('current_floor') || 1;
+                    
+                    // Convert floor number to words for header
+                    const floorWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
+                    let floorName;
+                    if (currentFloor >= 0 && currentFloor < floorWords.length) {
+                        floorName = 'Floor ' + floorWords[currentFloor];
+                    } else {
+                        floorName = 'Floor ' + currentFloor;
+                    }
+                    locationHeaders = '<$# Locations>\n<$## ' + floorName + '>';
+                }
+            }
+            
+            // Allow override via runtime variable if set
+            const customHeader = getRuntimeValue('location_header');
+            if (customHeader) {
+                locationHeaders = customHeader; // User override takes precedence
+            }
+            
+            // Create basic location card (will be enhanced by generation)
+            // For inside/outside locations, adjust pathways accordingly
+            let pathwaysList;
+            if (direction === 'inside') {
+                // Interior location - minimal pathways
+                pathwaysList = (
+                    '- Outside: ' + currentLocation + '\n' +
+                    '- Inside: (unexplored)'  // For buildings with multiple rooms
+                );
+            } else if (direction === 'outside') {
+                // Exterior location from interior - include all directions
+                pathwaysList = (
+                    '- Inside: ' + currentLocation + '\n' +
+                    '- North: (unexplored)\n' +
+                    '- South: (unexplored)\n' +
+                    '- East: (unexplored)\n' +
+                    '- West: (unexplored)'
+                );
+            } else {
+                // Standard cardinal direction - include all options
+                pathwaysList = (
+                    '- ' + getOppositeDirection(direction) + ': ' + currentLocation + '\n' +
+                    '- North: (unexplored)\n' +
+                    '- South: (unexplored)\n' +
+                    '- East: (unexplored)\n' +
+                    '- West: (unexplored)\n' +
+                    '- Inside: (unexplored)'  // Buildings can have interiors
+                );
+            }
+            
+            const locationEntry = (
+                locationHeaders + '\n' +
+                '## **' + locationName + '**\n' +
+                'Type: Unknown | Terrain: Unexplored\n' +
+                '### Description\n' +
+                'An unexplored location. Details will be revealed upon first visit.\n' +
+                '### Pathways\n' +
+                pathwaysList
+            );
+            
+            const snakeCased = locationName.toLowerCase();
+            const spacedName = locationName.replace(/_/g, ' ');
+            
+            const locationCard = {
+                title: `[LOCATION] ${locationName}`,
+                type: 'Location',
+                keys: `${snakeCased}, ${spacedName}`,  // Keys as comma-separated string
+                entry: locationEntry,
+                description: `Discovered by ${character.name} on turn ${info?.actionCount || 0}`
+            };
+            
+            Utilities.storyCard.add(locationCard);
+            
+            // Update current location's pathway
+            updateLocationPathway(currentLocation, direction, locationName);
+            
+            // Queue for generation if GenerationWizard is available
+            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startGeneration) {
+                GenerationWizard.startGeneration('Location', null, {
+                    NAME: locationName,
+                    metadata: {
+                        from: currentLocation,
+                        direction: direction,
+                        discoveredBy: character.name
+                    }
+                });
+            }
+            
+            if (debug) console.log(`${MODULE_NAME}: ${character.name} discovered ${locationName} to the ${direction}`);
             return 'executed';
         },
+        
+        connect_locations: function(locationA, locationB, directionFromA) {
+            if (!locationA || !locationB || !directionFromA) return 'malformed';
+            
+            locationA = String(locationA).replace(/\s+/g, '_');
+            locationB = String(locationB).replace(/\s+/g, '_');
+            directionFromA = String(directionFromA).toLowerCase();
+            
+            // Validate direction (cardinal directions + inside/outside for nested locations)
+            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
+            if (!validDirections.includes(directionFromA)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${directionFromA}. Valid: ${validDirections.join(', ')}`);
+                return 'malformed';
+            }
+            
+            // Check both locations exist
+            const cardA = Utilities.storyCard.get(`[LOCATION] ${locationA}`);
+            const cardB = Utilities.storyCard.get(`[LOCATION] ${locationB}`);
+            
+            if (!cardA || !cardB) {
+                if (debug) console.log(`${MODULE_NAME}: One or both locations not found`);
+                return 'malformed';
+            }
+            
+            // Update pathways bidirectionally
+            updateLocationPathway(locationA, directionFromA, locationB);
+            updateLocationPathway(locationB, getOppositeDirection(directionFromA), locationA);
+            
+            if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} ${directionFromA} to ${locationB}`);
+            return 'executed';
+        },
+        
+        // TODO: Future resident management tools
+        // add_resident: function(characterName, locationName, role) { }
+        // remove_resident: function(characterName, locationName) { }
         
         accept_quest: function(playerName, questName, questGiver, questType) {
             // Must have all 4 parameters
@@ -11814,6 +12285,76 @@ function GameState(hook, text) {
             
             characterName = String(characterName).toLowerCase();
             if (debug) console.log(`${MODULE_NAME}: Death recorded for: ${characterName}`);
+            return 'executed';
+        },
+        
+        get_player_name: function() {
+            // Find the first [PLAYER] card
+            const playerCard = Utilities.storyCard.find(card => {
+                return card.title && card.title.startsWith('[PLAYER]');
+            }, false);
+            
+            let playerName = null;
+            if (playerCard) {
+                const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
+                if (match) {
+                    playerName = match[1].trim();
+                }
+            }
+            
+            if (debug) console.log(`${MODULE_NAME}: Player name is: ${playerName}`);
+            return playerName || 'unknown';
+        },
+        
+        update_character_format: function(section, newTemplate) {
+            if (!section || !newTemplate) return 'malformed';
+            
+            // Get current character format
+            const formatCard = Utilities.storyCard.get('[RPG_SCHEMA] Character Format');
+            if (!formatCard) {
+                if (debug) console.log(`${MODULE_NAME}: Character Format card not found`);
+                return 'malformed';
+            }
+            
+            // Parse the current format
+            const lines = formatCard.entry.split('\n');
+            let inSection = null;
+            let updatedLines = [];
+            let sectionUpdated = false;
+            
+            for (let i = 0; i < lines.length; i++) {
+                const line = lines[i];
+                const trimmed = line.trim();
+                
+                // Check for section headers
+                if (trimmed.startsWith('# ')) {
+                    inSection = trimmed.substring(2).toLowerCase().replace(/\s+/g, '_');
+                    updatedLines.push(line);
+                } else if (inSection === section.toLowerCase().replace(/\s+/g, '_')) {
+                    // We're in the target section - replace the template line
+                    if (!sectionUpdated && trimmed !== '' && !trimmed.startsWith('#')) {
+                        updatedLines.push(newTemplate);
+                        sectionUpdated = true;
+                        // Skip the original line
+                    } else {
+                        updatedLines.push(line);
+                    }
+                } else {
+                    updatedLines.push(line);
+                }
+            }
+            
+            if (!sectionUpdated) {
+                if (debug) console.log(`${MODULE_NAME}: Section ${section} not found in Character Format`);
+                return 'malformed';
+            }
+            
+            // Update the card
+            Utilities.storyCard.update('[RPG_SCHEMA] Character Format', {
+                entry: updatedLines.join('\n')
+            });
+            
+            if (debug) console.log(`${MODULE_NAME}: Updated character format section: ${section}`);
             return 'executed';
         }
     };
@@ -12460,7 +13001,7 @@ function GameState(hook, text) {
             // Test entity generation for Location
             gw_location: () => {
                 if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Location', {name: 'Debug_Test_Location'});
+                GenerationWizard.startGeneration('Location', null, {NAME: 'Debug_Test_Location'});
                 return "\n<<<Started Location generation for Debug_Test_Location>>>\n";
             },
             
@@ -12933,6 +13474,23 @@ function GameState(hook, text) {
     };
     GameState.saveCharacter = saveCharacter;
     GameState.createCharacter = createCharacter;
+    GameState.getPlayerName = function() {
+        // Find the first [PLAYER] card
+        const playerCard = Utilities.storyCard.find(card => {
+            return card.title && card.title.startsWith('[PLAYER]');
+        }, false); // false = return first match only
+        
+        if (playerCard) {
+            // Extract name from title: [PLAYER] Name
+            const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
+            if (match) {
+                return match[1].trim();
+            }
+        }
+        
+        if (debug) console.log(`${MODULE_NAME}: No [PLAYER] card found`);
+        return null;
+    };
     
     // Entity tracking API
     GameState.completeEntityGeneration = completeEntityGeneration;
