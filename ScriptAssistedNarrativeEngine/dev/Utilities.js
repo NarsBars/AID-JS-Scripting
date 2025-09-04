@@ -881,6 +881,15 @@ const Utilities = (function() {
                 return evaluator;
             } catch (error) {
                 console.log('[Expression] Parse error:', error.message);
+                console.log('[Expression] Failed expression:', expression);
+                // Log stack trace to find where this is being called from
+                if (typeof Error !== 'undefined') {
+                    const stack = new Error().stack;
+                    if (stack) {
+                        const lines = stack.split('\n').slice(1, 4); // Skip first line and get next 3
+                        console.log('[Expression] Called from:', lines.join('\n'));
+                    }
+                }
                 return null;
             }
         },
@@ -3262,6 +3271,16 @@ const Utilities = (function() {
                 return this._findByPredicate(query, getAll);
             }
             
+            // Check if it's a simple title string (not an expression)
+            // Titles starting with '[' should be treated as literals, not expressions
+            if (typeof query === 'string' && !query.includes(' && ') && !query.includes(' || ') && 
+                !query.includes('.') && !query.includes('==') && !query.includes('!=')) {
+                // Simple title match
+                const titlePredicate = (card) => card && card.title === query;
+                return this._findByPredicateWithCaching(titlePredicate, getAll);
+            }
+            
+            // Parse complex expression queries
             const predicate = ExpressionParser.parseObjectQuery(query, 'card');
             if (!predicate) {
                 const titlePredicate = (card) => card && card.title === query;
@@ -3283,7 +3302,16 @@ const Utilities = (function() {
                 return this._removeByPredicate(titlePredicate, removeAll);
             }
             
-            // Parse ALL string queries through the expression parser
+            // Check if it's a simple title string (not an expression)
+            // Titles starting with '[' should be treated as literals, not expressions
+            if (typeof query === 'string' && !query.includes(' && ') && !query.includes(' || ') && 
+                !query.includes('.') && !query.includes('==') && !query.includes('!=')) {
+                // Simple title match
+                const titlePredicate = (card) => card && card.title === query;
+                return this._removeByPredicate(titlePredicate, removeAll);
+            }
+            
+            // Parse complex expression queries
             const predicate = ExpressionParser.parseObjectQuery(query, 'card');
             if (!predicate) {
                 // Fallback: treat as simple title match

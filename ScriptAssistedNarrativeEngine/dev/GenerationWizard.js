@@ -11,7 +11,7 @@ function GenerationWizard(hook, text) {
     const TEMPLATE_PREFIX = '[GW Template]';
     const CONFIG_AND_PROMPTS_CARD = '[GENERATION_CONFIG]';
     const HIDDEN_OUTPUT = '\n<<<The GM is thinking, please hit continue... (Use `/GW abort` if needed, this prompting is still being worked on)>>>\n';
-    const COMPLETION_MESSAGE = '\n<<<Generation complete, please hit continue>>>\n';
+    const COMPLETION_MESSAGE = '\n<<<Generation Completed, returning to story>>>\n';
     
     // Helper to wrap debug output in markers to hide from LLM
     function wrapDebugOutput(text) {
@@ -578,7 +578,7 @@ function GenerationWizard(hook, text) {
     // Quest Batch Collection
     // ==========================
     
-    function generateQuestBatchPrompt(fields, stageCount, existingStages, questType, collectedData) {
+    function generateQuestBatchPrompt(fields, stageCount, existingStages, questType, collectedData, validationErrors) {
         // Build the CONTEXT section - what we already know
         let contextSection = '==== CONTEXT (Already Provided) ====\n';
         contextSection += '**Quest Information:**\n';
@@ -624,7 +624,7 @@ function GenerationWizard(hook, text) {
                 const fieldPrompt = field.prompt || field.name.replace(/_/g, ' ').toLowerCase();
                 
                 // Check if there's a validation error for this field
-                const validationError = progress.validationErrors && progress.validationErrors[field.name];
+                const validationError = validationErrors && validationErrors[field.name];
                 
                 let typeHint = '';
                 switch(field.type) {
@@ -1010,6 +1010,19 @@ function GenerationWizard(hook, text) {
         
         switch(hook) {
             case 'context':
+                // First check if all fields are already collected but not marked complete
+                if (!progress.completed && progress.templateFields) {
+                    const activeFields = progress.templateFields.filter(field => 
+                        !progress.collectedData.hasOwnProperty(field.name)
+                    );
+                    if (activeFields.length === 0) {
+                        // All fields collected - mark as complete
+                        progress.completed = true;
+                        saveProgress(progress);
+                        if (debug) console.log(`${MODULE_NAME}: Context: All fields collected - marked as complete`);
+                    }
+                }
+                
                 if (progress.completed) {
                     return { active: true, text: text };
                 }
@@ -1060,13 +1073,20 @@ function GenerationWizard(hook, text) {
                         
                         progress.expectingBatch = true;
                     } else if (progress.entityType === 'Quest') {
-                        // Quest logic
+                        // Quest logic - ensure stageCollection is initialized
+                        if (!progress.stageCollection) {
+                            progress.stageCollection = {
+                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
+                                stages: {}
+                            };
+                        }
                         batchPrompt = generateQuestBatchPrompt(
                             activeFields,
                             progress.stageCollection.stageCount,
                             progress.stageCollection.stages,
                             progress.collectedData.QUEST_TYPE,
-                            progress.collectedData
+                            progress.collectedData,
+                            progress.validationErrors
                         );
                         progress.expectingQuestBatch = true;
                     } else {
@@ -1109,6 +1129,15 @@ function GenerationWizard(hook, text) {
                     };
                 }
                 
+                // Handle 'Entity' type - needs to select what kind of entity to create
+                if (progress.entityType === 'Entity' && !progress.branchResolved) {
+                    const entitySelectionPrompt = generatePrompt('Entity Selection', {});
+                    return {
+                        active: true,
+                        text: text + entitySelectionPrompt
+                    };
+                }
+                
                 // Non-quest entities - generate prompts for missing fields
                 const activeFields = getActiveFields(progress.templateFields, progress.collectedData);
                 
@@ -1135,24 +1164,10 @@ function GenerationWizard(hook, text) {
                 return { active: true, text: text };
                 
             case 'output':
+                // Check if already completed
                 if (progress.completed) {
-                    // Apply final template and create card
-                    const template = loadTemplate(progress.entityType);
-                    if (template) {
-                        const finalText = processTemplate(template, progress.collectedData);
-                        // Pass triggerName and metadata along with collectedData
-                        const dataWithTrigger = { ...progress.collectedData };
-                        if (progress.triggerName) {
-                            dataWithTrigger.triggerName = progress.triggerName;
-                        }
-                        if (progress.metadata) {
-                            dataWithTrigger.metadata = progress.metadata;
-                        }
-                        createEntityCard(progress.entityType, finalText, dataWithTrigger);
-                    }
-                    
                     clearProgress();
-                    return { active: false }; // Let normal output through on completion
+                    return { active: false };
                 }
                 
                 // Handle batch response for Quest, NPC, or Location
@@ -1207,6 +1222,14 @@ function GenerationWizard(hook, text) {
                     
                     // Parse stages (Quest only)
                     if (progress.entityType === 'Quest' && !progress.collectedData.STAGES) {
+                        // Ensure stageCollection is initialized
+                        if (!progress.stageCollection) {
+                            progress.stageCollection = {
+                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
+                                stages: {}
+                            };
+                        }
+                        
                         const stages = parseStageResponse(
                             text,
                             progress.stageCollection.stageCount,
@@ -1263,15 +1286,33 @@ function GenerationWizard(hook, text) {
                         if (debug) console.log(`${MODULE_NAME}: Missing REWARDS`);
                     }
                     
-                    // Set completed if we have everything
-                    if (allFieldsCollected) {
+                    // Check if ALL fields are now collected (not just from this response)
+                    const remainingFields = getActiveFields(progress.templateFields, progress.collectedData);
+                    console.log(`${MODULE_NAME}: After batch processing - Remaining fields: ${remainingFields.length}`);
+                    console.log(`${MODULE_NAME}: Collected so far: ${JSON.stringify(Object.keys(progress.collectedData))}`);
+                    
+                    if (remainingFields.length === 0) {
                         progress.completed = true;
                         progress.expectingQuestBatch = false;
                         progress.expectingBatch = false;
                         if (debug) console.log(`${MODULE_NAME}: Quest generation completed!`);
                         
-                        // Save progress and return completion message
-                        saveProgress(progress);
+                        // Create the entity card immediately
+                        const template = loadTemplate(progress.entityType);
+                        if (template) {
+                            const finalText = processTemplate(template, progress.collectedData);
+                            const dataWithTrigger = { ...progress.collectedData };
+                            if (progress.triggerName) {
+                                dataWithTrigger.triggerName = progress.triggerName;
+                            }
+                            if (progress.metadata) {
+                                dataWithTrigger.metadata = progress.metadata;
+                            }
+                            createEntityCard(progress.entityType, finalText, dataWithTrigger);
+                        }
+                        
+                        // Clear and return completion message
+                        clearProgress();
                         return { active: true, text: config.debug ? wrapDebugOutput(text) : COMPLETION_MESSAGE };
                     }
                     
@@ -1283,6 +1324,48 @@ function GenerationWizard(hook, text) {
                 // Handle entity classification response
                 if (progress.entityType === 'EntityClassification') {
                     return handleEntityClassification(progress, text, config);
+                }
+                
+                // Handle Entity type selection response
+                if (progress.entityType === 'Entity' && !progress.branchResolved) {
+                    const branchTo = handleEntityBranching(text);
+                    if (branchTo) {
+                        if (debug) console.log(`${MODULE_NAME}: Entity branched to ${branchTo}`);
+                        
+                        // Load the template for the new entity type
+                        const template = loadTemplate(branchTo);
+                        if (!template) {
+                            if (debug) console.log(`${MODULE_NAME}: No template for ${branchTo}`);
+                            clearProgress();
+                            return { active: true, text: 'Failed to find template for ' + branchTo };
+                        }
+                        
+                        // Parse template fields
+                        const templateFields = parseTemplateFields(template.description);
+                        
+                        // Update progress with the actual entity type
+                        progress.entityType = branchTo;
+                        progress.templateFields = templateFields;
+                        progress.branchResolved = true;
+                        
+                        // Initialize Quest-specific fields if branching to Quest
+                        if (branchTo === 'Quest') {
+                            progress.stageCollection = {
+                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
+                                stages: {}
+                            };
+                            progress.expectingQuestBatch = true;
+                        } else if (branchTo === 'NPC' || branchTo === 'Location') {
+                            progress.expectingBatch = true;
+                        }
+                        
+                        saveProgress(progress);
+                        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
+                    } else {
+                        if (debug) console.log(`${MODULE_NAME}: Invalid entity type in response: ${text}`);
+                        // Stay in Entity state and will re-prompt on next context
+                        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
+                    }
                 }
                 
                 return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
@@ -1399,35 +1482,133 @@ function GenerationWizard(hook, text) {
     }
     
     // ==========================
+    // Helper Functions
+    // ==========================
+    function normalizeDateFormat(dateStr) {
+        if (!dateStr) return '';
+        
+        // If already in YYYY-MM-DD format, return as is
+        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
+            return dateStr;
+        }
+        
+        // Try to parse various date formats
+        const months = {
+            'january': '01', 'jan': '01',
+            'february': '02', 'feb': '02',
+            'march': '03', 'mar': '03',
+            'april': '04', 'apr': '04',
+            'may': '05',
+            'june': '06', 'jun': '06',
+            'july': '07', 'jul': '07',
+            'august': '08', 'aug': '08',
+            'september': '09', 'sep': '09', 'sept': '09',
+            'october': '10', 'oct': '10',
+            'november': '11', 'nov': '11',
+            'december': '12', 'dec': '12'
+        };
+        
+        // Try "Month DD, YYYY" or "Month DD YYYY"
+        const match1 = dateStr.match(/^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/i);
+        if (match1) {
+            const month = months[match1[1].toLowerCase()];
+            if (month) {
+                const day = match1[2].padStart(2, '0');
+                return `${match1[3]}-${month}-${day}`;
+            }
+        }
+        
+        // Try "DD Month YYYY"
+        const match2 = dateStr.match(/^(\d{1,2})\s+(\w+)\s+(\d{4})$/i);
+        if (match2) {
+            const month = months[match2[2].toLowerCase()];
+            if (month) {
+                const day = match2[1].padStart(2, '0');
+                return `${match2[3]}-${month}-${day}`;
+            }
+        }
+        
+        // Try MM/DD/YYYY or MM-DD-YYYY
+        const match3 = dateStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+        if (match3) {
+            const month = match3[1].padStart(2, '0');
+            const day = match3[2].padStart(2, '0');
+            return `${match3[3]}-${month}-${day}`;
+        }
+        
+        // Try DD/MM/YYYY (assume day first if day > 12)
+        const match4 = dateStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
+        if (match4) {
+            const first = parseInt(match4[1]);
+            const second = parseInt(match4[2]);
+            if (first > 12 && second <= 12) {
+                // First number must be day
+                const month = match4[2].padStart(2, '0');
+                const day = match4[1].padStart(2, '0');
+                return `${match4[3]}-${month}-${day}`;
+            }
+        }
+        
+        // Return original if we can't parse it
+        return dateStr;
+    }
+    
+    // ==========================
     // Final Template Processing
     // ==========================
     function processTemplate(template, collectedData) {
         let finalText = template.entry;
         
+        // Flatten nested properties for template processing
+        const flatData = {...collectedData};
+        
+        // Handle hp object specially
+        if (collectedData.hp && typeof collectedData.hp === 'object') {
+            flatData['hp.current'] = collectedData.hp.current || 100;
+            flatData['hp.max'] = collectedData.hp.max || 100;
+            // Remove the nested object to avoid confusion
+            delete flatData.hp;
+        } else if (collectedData.HP || collectedData.MAX_HP) {
+            // Fallback if HP/MAX_HP are provided as flat fields
+            flatData['hp.current'] = collectedData.HP || collectedData.MAX_HP || 100;
+            flatData['hp.max'] = collectedData.MAX_HP || collectedData.HP || 100;
+        } else {
+            // Default HP values for NPCs
+            flatData['hp.current'] = 100;
+            flatData['hp.max'] = 100;
+        }
+        
+        // Normalize DOB to YYYY-MM-DD format
+        if (flatData.DOB) {
+            flatData.DOB = normalizeDateFormat(flatData.DOB);
+        }
+        
         // Generate random skills for NPCs if not provided
-        if (!collectedData.SKILLS) {
-            collectedData.SKILLS = generateRandomSkills(1); // Always level 1
+        if (!flatData.SKILLS) {
+            flatData.SKILLS = generateRandomSkills(1); // Always level 1
         }
         
         // Get location from first [PLAYER] if not provided
-        if (!collectedData.LOCATION) {
+        if (!flatData.LOCATION) {
             const players = Utilities.storyCard.find(c => c.title && c.title.startsWith('[PLAYER]'), true);
             if (players && players.length > 0) {
                 const match = players[0].entry.match(/Current Location:\s*([^\n]+)/);
                 if (match) {
-                    collectedData.LOCATION = match[1].trim();
+                    flatData.LOCATION = match[1].trim();
                 }
             }
             // Default if no player found
-            if (!collectedData.LOCATION) {
-                collectedData.LOCATION = 'Town_Of_Beginnings';
+            if (!flatData.LOCATION) {
+                flatData.LOCATION = 'Town_Of_Beginnings';
             }
         }
         
-        // Replace all {{FIELD_NAME}} placeholders
-        for (const [field, value] of Object.entries(collectedData)) {
-            const placeholder = new RegExp(`\\{\\{${field}\\}\\}`, 'gi');
-            finalText = finalText.replace(placeholder, value);
+        // Replace all {{FIELD_NAME}} placeholders that exist in flatData
+        for (const [field, value] of Object.entries(flatData)) {
+            // Escape dots in field names for regex
+            const escapedField = field.replace(/\./g, '\\.');
+            const placeholder = new RegExp(`\\{\\{${escapedField}\\}\\}`, 'gi');
+            finalText = finalText.replace(placeholder, value || '');
         }
         
         // Process formulas from the description
@@ -1572,15 +1753,19 @@ function GenerationWizard(hook, text) {
         if (collectedData.FULL_NAME && collectedData.FULL_NAME !== name) {
             keysList.push(collectedData.FULL_NAME);
         }
-        if (collectedData.triggerName && collectedData.triggerName !== name) {
-            keysList.push(collectedData.triggerName);
+        // Ensure triggerName is a string before adding to keys
+        const triggerNameStr = typeof collectedData.triggerName === 'string' 
+            ? collectedData.triggerName 
+            : (collectedData.triggerName?.name || null);
+        if (triggerNameStr && triggerNameStr !== name) {
+            keysList.push(triggerNameStr);
         }
         const keys = keysList.join(', ') + ' ';
         
         // Create the story card
         let description = `Generated by GenerationWizard on turn ${info?.actionCount || 0}`;
-        if (collectedData.triggerName && collectedData.triggerName !== name) {
-            description += `\nTrigger Name: ${collectedData.triggerName}`;
+        if (triggerNameStr && triggerNameStr !== name) {
+            description += `\nTrigger Name: ${triggerNameStr}`;
         }
         
         Utilities.storyCard.add({
@@ -1605,7 +1790,7 @@ function GenerationWizard(hook, text) {
             type: 'data',
             entry: (
                 `## **{{NAME}}**{{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
-                `DOB: {{DOB}} | Gender: {{GENDER}} | HP: {{HP}}/{{MAX_HP}} | Level {{LEVEL}} (0/{{XP_MAX}} XP) | Current Location: {{LOCATION}}\n` +
+                `DOB: {{DOB}} | Gender: {{GENDER}} | HP: {{hp.current}}/{{hp.max}} | Level {{LEVEL}} (0/{{XP_MAX}} XP) | Current Location: {{LOCATION}}\n` +
                 `### Appearance\n` +
                 `Hair: {{HAIR}} | Eyes: {{EYES}} | Build: {{BUILD}}\n` +
                 `### Personality\n` +
@@ -2110,10 +2295,20 @@ function GenerationWizard(hook, text) {
                 return false;
             }
             
+            // Load valid quest types from schema
+            let validTypes = ['story', 'side', 'hidden', 'raid']; // Default fallback
+            
+            if (typeof Utilities !== 'undefined') {
+                const questSchema = Utilities.storyCard.get('[RPG_SCHEMA] Quest Types');
+                if (questSchema && questSchema.value) {
+                    const parsed = Utilities.config.load('[RPG_SCHEMA] Quest Types');
+                    validTypes = Object.keys(parsed).map(type => type.toLowerCase());
+                }
+            }
+            
             // Validate quest type - expect lowercase
-            const validTypes = ['story', 'side', 'hidden', 'raid'];
             if (!validTypes.includes(questType)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType}`);
+                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType}. Valid types: ${validTypes.join(', ')}`);
                 return false;
             }
             

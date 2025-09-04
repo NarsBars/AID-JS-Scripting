@@ -4,7 +4,7 @@ function GameState(hook, text) {
     const debug = true;
     const MODULE_NAME = 'GameState';
     
-    // Entity generation tracking (hardcoded for system use)
+    // Entity generation tracking 
     let currentEntityGeneration = null;
     
     // Tool pattern: standard function calls like tool_name(param1, param2, param3)
@@ -437,41 +437,6 @@ function GameState(hook, text) {
             if (debug) console.log(`${MODULE_NAME}: Failed to load input commands: ${e}`);
         }
         
-        // Load debug commands if debug mode is enabled
-        if (debug) {
-            loadDebugCommands();
-        }
-    }
-    
-    function loadDebugCommands() {
-        const debugCard = Utilities.storyCard.get('[RPG_DEBUG] COMMANDS');
-        if (!debugCard) {
-            if (debug) console.log(`${MODULE_NAME}: No debug commands card found`);
-            return;
-        }
-        
-        try {
-            const fullCode = (debugCard.entry || '') + '\n' + (debugCard.description || '');
-            
-            // Skip if only comments (no actual code)
-            const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
-            if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: No debug commands defined (only comments)`);
-                return;
-            }
-            
-            const code = `({${fullCode}})`;
-            const commands = eval(code);
-            
-            for (const [name, func] of Object.entries(commands)) {
-                if (typeof func !== 'function') continue;
-                inputCommands[name] = createCommandHandler(name, func, true);
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(commands).length} debug commands`);
-        } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load debug commands: ${e}`);
-        }
     }
     
     function createCommandHandler(name, func, isDebugCommand = false) {
@@ -502,6 +467,7 @@ function GameState(hook, text) {
                     Utilities: Utilities,
                     Calendar: typeof Calendar !== 'undefined' ? Calendar : null,
                     GenerationWizard: typeof GenerationWizard !== 'undefined' ? GenerationWizard : null,
+                    RewindSystem: RewindSystem,  // Add RewindSystem access
                     debug: debug,
                     // Debug-only functions
                     trackUnknownEntity: isDebugCommand ? trackUnknownEntity : undefined,
@@ -625,6 +591,563 @@ function GameState(hook, text) {
         }
     }
     
+    // ==========================
+    // Rewind System
+    // ==========================
+    const RewindSystem = {
+        STORAGE_CARD_PREFIX: '[GS_REWIND] History',
+        MAX_HISTORY: 100,  // Store all 100 entries
+        MAX_REWIND: 99,    // Can rewind 99 (need 1 for verification)
+        MAX_CARD_SIZE: 9000, // Max characters per card
+        
+        // Get all rewind cards
+        getAllCards: function() {
+            const cards = [];
+            let cardNum = 1;
+            
+            while (true) {
+                const cardTitle = cardNum === 1 
+                    ? RewindSystem.STORAGE_CARD_PREFIX 
+                    : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
+                
+                const card = Utilities.storyCard.get(cardTitle);
+                if (!card) break;
+                
+                try {
+                    cards.push({
+                        title: cardTitle,
+                        data: JSON.parse(card.description || '{"entries":[]}')
+                    });
+                } catch(e) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to parse card ${cardTitle}: ${e}`);
+                }
+                cardNum++;
+            }
+            
+            return cards;
+        },
+        
+        // Get merged storage from all cards
+        getStorage: function() {
+            const cards = RewindSystem.getAllCards();
+            
+            if (cards.length === 0) {
+                // Create first card
+                const firstTitle = RewindSystem.STORAGE_CARD_PREFIX;
+                Utilities.storyCard.add({
+                    title: firstTitle,
+                    value: '# Rewind System Data\nTracks tool execution history for state consistency.',
+                    description: JSON.stringify({
+                        entries: [],
+                        position: -1
+                    }),
+                    type: 'data'
+                });
+                return { entries: [], position: -1 };
+            }
+            
+            // Merge all entries from all cards
+            let allEntries = [];
+            let position = -1;
+            
+            for (const card of cards) {
+                allEntries = allEntries.concat(card.data.entries || []);
+                if (card.data.position !== undefined && card.data.position > position) {
+                    position = card.data.position;
+                }
+            }
+            
+            return { entries: allEntries, position: position };
+        },
+        
+        // Save storage across multiple cards
+        saveStorage: function(data) {
+            // Ensure we don't exceed max history
+            if (data.entries.length > RewindSystem.MAX_HISTORY) {
+                data.entries = data.entries.slice(-RewindSystem.MAX_HISTORY);
+            }
+            
+            // Clear existing cards first
+            let cardNum = 1;
+            while (true) {
+                const cardTitle = cardNum === 1 
+                    ? RewindSystem.STORAGE_CARD_PREFIX 
+                    : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
+                
+                const card = Utilities.storyCard.get(cardTitle);
+                if (!card) break;
+                
+                Utilities.storyCard.remove(cardTitle);
+                cardNum++;
+            }
+            
+            // Split entries into cards
+            const cards = [];
+            let currentCard = { entries: [], position: data.position };
+            let currentSize = 50; // Account for JSON structure overhead
+            
+            for (let i = 0; i < data.entries.length; i++) {
+                const entry = data.entries[i];
+                const entryStr = JSON.stringify(entry);
+                const entrySize = entryStr.length + 2; // +2 for comma and spacing
+                
+                if (currentSize + entrySize > RewindSystem.MAX_CARD_SIZE && currentCard.entries.length > 0) {
+                    // Save current card and start new one
+                    cards.push({...currentCard});
+                    currentCard = { entries: [], position: data.position };
+                    currentSize = 50;
+                }
+                
+                currentCard.entries.push(entry);
+                currentSize += entrySize;
+            }
+            
+            // Save last card if it has entries
+            if (currentCard.entries.length > 0) {
+                cards.push(currentCard);
+            }
+            
+            // Create/update story cards
+            for (let i = 0; i < cards.length; i++) {
+                const cardTitle = i === 0 
+                    ? RewindSystem.STORAGE_CARD_PREFIX 
+                    : `${RewindSystem.STORAGE_CARD_PREFIX} ${i + 1}`;
+                
+                const cardData = cards[i];
+                const existing = Utilities.storyCard.get(cardTitle);
+                
+                if (existing) {
+                    Utilities.storyCard.update(cardTitle, {
+                        description: JSON.stringify(cardData)
+                    });
+                } else {
+                    Utilities.storyCard.add({
+                        title: cardTitle,
+                        value: `# Rewind System Data (Part ${i + 1})\nTracks tool execution history for state consistency.`,
+                        description: JSON.stringify(cardData),
+                        type: 'data'
+                    });
+                }
+            }
+            
+            if (debug) console.log(`${MODULE_NAME}: Saved ${data.entries.length} entries across ${cards.length} cards`);
+        },
+        
+        // Quick hash function for text comparison
+        quickHash: function(text) {
+            if (!text) return '';
+            let hash = 0;
+            // Hash the entire text to detect any changes
+            for (let i = 0; i < text.length; i++) {
+                const char = text.charCodeAt(i);
+                hash = ((hash << 5) - hash) + char;
+                hash = hash & hash; // Convert to 32bit integer
+            }
+            return hash.toString(36);
+        },
+        
+        // Store action at specific position
+        recordAction: function(text, tools, position = null) {
+            const data = RewindSystem.getStorage();
+            const hash = RewindSystem.quickHash(text);
+            
+            // If no position specified, append at end
+            if (position === null) {
+                position = data.entries.length;
+            }
+            
+            // If we're recording at a position that's less than the current array length,
+            // and the hash is different, we're creating a new timeline branch
+            if (position < data.entries.length && data.entries[position]) {
+                const existingHash = data.entries[position].h;
+                if (existingHash !== hash) {
+                    // Different content at this position - truncate everything after it
+                    data.entries = data.entries.slice(0, position);
+                    if (debug) console.log(`${MODULE_NAME}: New timeline branch at position ${position}, truncated future entries`);
+                }
+            }
+            
+            // Store tools with their revert data at the specified position
+            data.entries[position] = {
+                h: hash,
+                t: tools.map(t => [t.tool, t.params, t.revertData || {}])
+            };
+            
+            // Update position
+            data.position = position;
+            
+            // Maintain max history - align with AI Dungeon's behavior
+            // When we exceed max, remove oldest entry (index 0)
+            while (data.entries.length > RewindSystem.MAX_HISTORY) {
+                data.entries.shift();
+                // All positions shift down by 1
+                data.position = Math.max(0, data.position - 1);
+            }
+            
+            RewindSystem.saveStorage(data);
+            if (debug) console.log(`${MODULE_NAME}: Recorded action at position ${position} with ${tools.length} tools`);
+        },
+        
+        // Find current position by matching history
+        findCurrentPosition: function() {
+            const data = RewindSystem.getStorage();
+            if (!history || history.length === 0) {
+                if (debug) console.log(`${MODULE_NAME}: No history available`);
+                return { matched: false, position: -1 };
+            }
+            
+            if (data.entries.length === 0) {
+                if (debug) console.log(`${MODULE_NAME}: No stored entries yet`);
+                return { matched: false, position: -1 };
+            }
+            
+            // The current history length tells us where we are
+            // If history has 1 entry, we're at position 0
+            // If history has 2 entries, we're at position 1, etc.
+            const historyLength = history.length;
+            const expectedPosition = historyLength - 1;
+            
+            // Verify this matches our stored data
+            if (expectedPosition >= 0 && expectedPosition < data.entries.length) {
+                // Quick verification: check if the last few entries match
+                let verified = true;
+                const checkCount = Math.min(3, historyLength, data.entries.length);
+                
+                for (let i = 0; i < checkCount; i++) {
+                    const historyIndex = historyLength - 1 - i;
+                    const dataIndex = expectedPosition - i;
+                    
+                    if (historyIndex >= 0 && dataIndex >= 0) {
+                        const historyHash = RewindSystem.quickHash(history[historyIndex].text);
+                        const storedHash = data.entries[dataIndex].h;
+                        
+                        if (historyHash !== storedHash) {
+                            verified = false;
+                            break;
+                        }
+                    }
+                }
+                
+                if (verified) {
+                    if (debug) console.log(`${MODULE_NAME}: Current position: ${expectedPosition} (history length: ${historyLength})`);
+                    return { matched: true, position: expectedPosition };
+                } else {
+                    if (debug) console.log(`${MODULE_NAME}: Position mismatch - history doesn't match stored data`);
+                }
+            }
+            
+            return { matched: false, position: -1 };
+        },
+        
+        // Detect if history was edited
+        detectEdit: function() {
+            const data = RewindSystem.getStorage();
+            const position = RewindSystem.findCurrentPosition();
+            
+            if (!position.matched) {
+                // Can't determine position - possible major edit
+                return { edited: true, position: 0, confidence: 'low' };
+            }
+            
+            // Check if all hashes match up to current position
+            const currentHashes = history.map(h => RewindSystem.quickHash(h.text));
+            
+            for (let i = 0; i < Math.min(currentHashes.length, data.entries.length); i++) {
+                if (currentHashes[i] !== data.entries[i].h) {
+                    return { edited: true, position: i, confidence: 'high' };
+                }
+            }
+            
+            return { edited: false };
+        },
+        
+        // Rehash from a certain position forward (after edit)
+        rehashFrom: function(position) {
+            const data = RewindSystem.getStorage();
+            
+            // When an edit is detected, everything after the edit point is invalid
+            // We should discard those entries and start fresh from the edit point
+            if (position < data.entries.length) {
+                // Keep entries up to AND including the edit position
+                data.entries = data.entries.slice(0, position + 1);
+                
+                // Update position to match current history length
+                data.position = Math.min(position, history.length - 1);
+                
+                if (debug) console.log(`${MODULE_NAME}: Discarded entries after position ${position}, keeping ${data.entries.length} entries`);
+            }
+            
+            // Now rehash the current history entries from the edit point forward
+            for (let i = position; i < history.length; i++) {
+                const newHash = RewindSystem.quickHash(history[i].text);
+                
+                // If this position exists in our data, update its hash
+                if (i < data.entries.length) {
+                    data.entries[i].h = newHash;
+                }
+                // Otherwise we'll add new entries as they come in during output processing
+            }
+            
+            RewindSystem.saveStorage(data);
+            if (debug) console.log(`${MODULE_NAME}: Rehashed from position ${position}`);
+        },
+        
+        // Get tool reversions for rewinding
+        getReversions: function() {
+            // TODO: Implement tool-specific reversions
+            return {
+                'deal_damage': (params) => ['heal', params],
+                'heal': (params) => ['deal_damage', params],
+                'add_tag': (params) => ['remove_tag', params],
+                'remove_tag': (params) => ['add_tag', params],
+                'transfer_item': (params) => ['transfer_item', [params[1], params[0], params[2], params[3]]],
+                'add_levelxp': (params) => ['add_levelxp', [params[0], -params[1]]],
+                'add_skillxp': (params) => ['add_skillxp', [params[0], params[1], -params[2]]],
+                'update_relationship': (params) => ['update_relationship', [params[0], params[1], -params[2]]],
+                // Non-reversible tools return null
+                'offer_quest': () => null,
+                'check_threshold': () => null
+            };
+        },
+        
+        // Rewind to a specific position
+        rewindTo: function(targetPosition) {
+            const data = RewindSystem.getStorage();
+            const currentPos = data.position;
+            
+            if (targetPosition >= currentPos) {
+                if (debug) console.log(`${MODULE_NAME}: Cannot rewind forward`);
+                return false;
+            }
+            
+            // Revert tools from current back to target
+            for (let i = currentPos; i > targetPosition; i--) {
+                const entry = data.entries[i];
+                if (!entry) continue;
+                
+                // Process tools in reverse order
+                for (let j = entry.t.length - 1; j >= 0; j--) {
+                    const toolData = entry.t[j];
+                    const [tool, params, revertData] = toolData;
+                    
+                    // Use the captured revert data if available
+                    if (revertData && Object.keys(revertData).length > 0) {
+                        // Apply the captured revert data directly
+                        if (debug) console.log(`${MODULE_NAME}: Reverting ${tool} using captured data:`, revertData);
+                        
+                        // Different tools need different reversion approaches
+                        switch(tool) {
+                            case 'update_location':
+                                if (revertData.previousLocation) {
+                                    const result = processToolCall('update_location', [params[0], revertData.previousLocation]);
+                                    if (debug) console.log(`${MODULE_NAME}: Reverted location for ${params[0]} to ${revertData.previousLocation}: ${result}`);
+                                }
+                                break;
+                                
+                            case 'transfer_item':
+                                // Reverse the transfer
+                                if (revertData.amount > 0) {
+                                    const result = processToolCall('transfer_item', [params[1], params[0], params[2], revertData.amount]);
+                                    if (debug) console.log(`${MODULE_NAME}: Reverted item transfer: ${params[2]} x${revertData.amount} from ${params[1]} to ${params[0]}: ${result}`);
+                                }
+                                break;
+                                
+                            case 'update_relationship':
+                                // Reverse the relationship change by negating it
+                                const relationshipChange = parseInt(params[2]) || 0;
+                                if (relationshipChange !== 0) {
+                                    const result = processToolCall('update_relationship', [params[0], params[1], -relationshipChange]);
+                                    if (debug) console.log(`${MODULE_NAME}: Reverted relationship ${params[0]}->${params[1]} by ${-relationshipChange}: ${result}`);
+                                }
+                                break;
+                                
+                            case 'unlock_newskill':
+                                // Skip reverting skill unlocks
+                                break;
+                                
+                            case 'add_levelxp':
+                                // Subtract the XP that was added
+                                const xpToRemove = parseInt(params[1]) || 0;
+                                if (xpToRemove > 0) {
+                                    const result = processToolCall('add_levelxp', [params[0], -xpToRemove]);
+                                    if (debug) console.log(`${MODULE_NAME}: Reverted level XP for ${params[0]} by ${-xpToRemove}: ${result}`);
+                                }
+                                break;
+                                
+                            case 'add_skillxp':
+                                // Subtract the skill XP that was added
+                                const skillXpToRemove = parseInt(params[2]) || 0;
+                                if (skillXpToRemove > 0) {
+                                    const result = processToolCall('add_skillxp', [params[0], params[1], -skillXpToRemove]);
+                                    if (debug) console.log(`${MODULE_NAME}: Reverted skill XP for ${params[0]}'s ${params[1]} by ${-skillXpToRemove}: ${result}`);
+                                }
+                                break;
+                                
+                            case 'add_item':
+                                // Remove the item that was added
+                                const itemsToRemove = parseInt(params[2]) || 1;
+                                if (itemsToRemove > 0) {
+                                    const result = processToolCall('remove_item', [params[0], params[1], itemsToRemove]);
+                                    if (debug) console.log(`${MODULE_NAME}: Reverted add_item for ${params[0]}: removed ${params[1]} x${itemsToRemove}: ${result}`);
+                                }
+                                break;
+                                
+                            case 'remove_item':
+                                // Add back the item that was removed
+                                const itemsToAdd = parseInt(params[2]) || 1;
+                                if (itemsToAdd > 0) {
+                                    const result = processToolCall('add_item', [params[0], params[1], itemsToAdd]);
+                                    if (debug) console.log(`${MODULE_NAME}: Reverted remove_item for ${params[0]}: added ${params[1]} x${itemsToAdd}: ${result}`);
+                                }
+                                break;
+                                
+                            default:
+                                if (debug) console.log(`${MODULE_NAME}: No reversion logic for ${tool}`);
+                        }
+                    } else {
+                        // Fallback to old reversion system if no revert data captured
+                        const reversions = RewindSystem.getReversions();
+                        const reverter = reversions[tool];
+                        
+                        if (reverter) {
+                            const reversion = reverter(params);
+                            if (reversion) {
+                                const [revertTool, revertParams] = reversion;
+                                const result = processToolCall(revertTool, revertParams);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted (fallback): ${tool}(${params.join(',')}) -> ${revertTool}(${revertParams.join(',')}): ${result}`);
+                            }
+                        }
+                    }
+                }
+            }
+            
+            data.position = targetPosition;
+            RewindSystem.saveStorage(data);
+            return true;
+        },
+        
+        // Extract and execute tools from text
+        extractAndExecuteTools: function(text) {
+            const executedTools = [];
+            if (!text) return executedTools;
+            
+            // Find all tool calls in the text using the same pattern as processTools
+            let match;
+            while ((match = TOOL_PATTERN.exec(text)) !== null) {
+                const [fullMatch, toolName, paramString] = match;
+                
+                // Use the same parameter parser as processTools
+                const params = parseParameters(paramString);
+                
+                // Skip if this is a getter function (get_*)
+                if (toolName.startsWith('get_')) continue;
+                
+                // Capture revert data BEFORE executing
+                const revertData = captureRevertData(toolName.toLowerCase(), params);
+                
+                // Execute the tool
+                const result = processToolCall(toolName, params);
+                
+                // Only track if successfully executed (ignore malformed/unknown)
+                if (result === 'executed') {
+                    executedTools.push({
+                        tool: toolName.toLowerCase(),
+                        params: params,
+                        executed: true,
+                        revertData: revertData
+                    });
+                    
+                    if (debug) console.log(`${MODULE_NAME}: Executed tool from history: ${toolName}(${params.join(', ')})`);
+                }
+            }
+            
+            return executedTools;
+        },
+        
+        // Process tools and add to history (called from processTools)
+        trackTools: function(text, executedTools) {
+            if (!executedTools || executedTools.length === 0) return;
+            
+            RewindSystem.recordAction(text, executedTools);
+        },
+        
+        // Handle context updates (check for edits and rewinds)
+        handleContext: function() {
+            // Check if history is available
+            if (typeof history === 'undefined' || !history) {
+                if (debug) console.log(`${MODULE_NAME}: History not available in context`);
+                return;
+            }
+            
+            const data = RewindSystem.getStorage();
+            const historyLength = history.length;
+            const oldLength = data.entries.length;
+            
+            // Detect if history array has shifted (when at max capacity)
+            let shifted = false;
+            if (historyLength === 100 && oldLength >= 100) {
+                // Check if the entries have shifted by comparing a few positions
+                // If history[0] doesn't match our entries[0], we've shifted
+                if (history[0] && data.entries[0]) {
+                    const historyHash = RewindSystem.quickHash(history[0].text);
+                    if (data.entries[0].h !== historyHash) {
+                        shifted = true;
+                        if (debug) console.log(`${MODULE_NAME}: History array shifted - realigning entries`);
+                    }
+                }
+            }
+            
+            // If shifted, remove the oldest entry from our data
+            if (shifted) {
+                data.entries.shift();
+            }
+            
+            // Process new entries at the end (don't reprocess existing ones)
+            for (let i = data.entries.length; i < historyLength; i++) {
+                const historyEntry = history[i];
+                if (!historyEntry || !historyEntry.text) {
+                    data.entries[i] = null;
+                    continue;
+                }
+                
+                if (debug) console.log(`${MODULE_NAME}: Processing new history entry at position ${i}`);
+                
+                const hash = RewindSystem.quickHash(historyEntry.text);
+                const tools = RewindSystem.extractAndExecuteTools(historyEntry.text);
+                
+                data.entries[i] = {
+                    h: hash,
+                    t: tools.map(t => [t.tool, t.params, t.revertData || {}])
+                };
+            }
+            
+            // Verify existing entries haven't been edited
+            const checkLength = Math.min(data.entries.length, historyLength);
+            for (let i = 0; i < checkLength; i++) {
+                if (!history[i] || !data.entries[i]) continue;
+                
+                const historyHash = RewindSystem.quickHash(history[i].text);
+                
+                if (data.entries[i].h !== historyHash) {
+                    // This entry was edited - reprocess it
+                    if (debug) console.log(`${MODULE_NAME}: History entry ${i} was edited - reprocessing`);
+                    
+                    const tools = RewindSystem.extractAndExecuteTools(history[i].text);
+                    data.entries[i] = {
+                        h: historyHash,
+                        t: tools.map(t => [t.tool, t.params, t.revertData || {}])
+                    };
+                }
+            }
+            
+            // Update position
+            data.position = historyLength - 1;
+            RewindSystem.saveStorage(data);
+            
+            if (debug) console.log(`${MODULE_NAME}: History check complete - ${data.entries.length} entries tracked`);
+        }
+    };
+    
     function createSampleRuntimeCards() {
         let created = false;
         
@@ -747,245 +1270,6 @@ function GameState(hook, text) {
                 `    return \`Gave \${qty} \${item}(s)\`;\n` +
                 `}\n` +
                 `*/`
-            )
-            });
-            created = true;
-        }
-        
-        // Create DEBUG_COMMANDS card (only works when debug = true in GameState.js)
-        if (!Utilities.storyCard.get('[RPG_DEBUG] COMMANDS')) {
-            Utilities.storyCard.add({
-            title: '[RPG_DEBUG] COMMANDS',
-            type: 'data',
-            entry: (
-                `// DEBUG COMMANDS - Only work when debug = true in GameState.js line 4\n` +
-                `// These commands help test generation systems\n` +
-                `\n` +
-                `debug_check: function(args) {\n` +
-                `    // Check if debug mode is enabled\n` +
-                `    if (!this.debug) return "Debug mode is disabled. Set debug = true in GameState.js line 4";\n` +
-                `    return "✓ Debug mode is ACTIVE";\n` +
-                `},\n` +
-                `\n` +
-                `debug_gw: function(args) {\n` +
-                `    // Test GenerationWizard activation\n` +
-                `    if (!this.debug) return null;\n` +
-                `    \n` +
-                `    const subcommand = args[0];\n` +
-                `    if (!subcommand) {\n` +
-                `        return "Usage: /debug_gw [start|status|abort|test_npc|test_item|test_quest]";\n` +
-                `    }\n` +
-                `    \n` +
-                `    if (typeof this.GenerationWizard === 'undefined') {\n` +
-                `        return "GenerationWizard module not available";\n` +
-                `    }\n` +
-                `    \n` +
-                `    switch(subcommand) {\n` +
-                `        case 'start':\n` +
-                `            this.GenerationWizard.activate();\n` +
-                `            return "GenerationWizard activated - next input will trigger selection";\n` +
-                `            \n` +
-                `        case 'status':\n` +
-                `            return \`GenerationWizard active: \${this.GenerationWizard.isActive()}\`;\n` +
-                `            \n` +
-                `        case 'abort':\n` +
-                `            this.GenerationWizard.abort();\n` +
-                `            return "GenerationWizard aborted";\n` +
-                `            \n` +
-                `        case 'test_npc':\n` +
-                `            this.GenerationWizard.startGeneration('NPC', {name: 'Test_NPC'});\n` +
-                `            return "Started NPC generation for Test_NPC";\n` +
-                `            \n` +
-                `        case 'test_item':\n` +
-                `            this.GenerationWizard.startGeneration('Item', {name: 'Test_Item'});\n` +
-                `            return "Started Item generation for Test_Item";\n` +
-                `            \n` +
-                `        case 'test_quest':\n` +
-                `            this.GenerationWizard.startGeneration('Quest', {name: 'Test_Quest'});\n` +
-                `            return "Started Quest generation for Test_Quest";\n` +
-                `            \n` +
-                `        default:\n` +
-                `            return "Unknown subcommand: " + subcommand;\n` +
-                `    }\n` +
-                `},\n` +
-                `\n` +
-                `debug_entity: function(args) {\n` +
-                `    // Debug entity tracker system\n` +
-                `    if (!this.debug) return null;\n` +
-                `    \n` +
-                `    const subcommand = args[0];\n` +
-                `    if (!subcommand) {\n` +
-                `        return "Usage: /debug_entity [list|clear|trigger|config|queue]";\n` +
-                `    }\n` +
-                `    \n` +
-                `    switch(subcommand) {\n` +
-                `        case 'list':\n` +
-                `            const configCard = this.Utilities.storyCard.get('[RPG_RUNTIME] Entity Tracker Config');\n` +
-                `            if (!configCard || !configCard.description) return "No entities being tracked";\n` +
-                `            return "Tracked entities:\\n" + configCard.description;\n` +
-                `            \n` +
-                `        case 'clear':\n` +
-                `            this.Utilities.storyCard.update('[RPG_RUNTIME] Entity Tracker Config', {\n` +
-                `                description: '// Entity tracking data\\n'\n` +
-                `            });\n` +
-                `            return "Entity tracker data cleared";\n` +
-                `            \n` +
-                `        case 'trigger':\n` +
-                `            const entityName = args[1] || 'test_entity';\n` +
-                `            // Force trigger by adding 5 references\n` +
-                `            for (let i = 1; i <= 5; i++) {\n` +
-                `                this.trackUnknownEntity(entityName, 'debug_command', i);\n` +
-                `            }\n` +
-                `            return \`Triggered tracking for '\${entityName}' - should queue for generation\`;\n` +
-                `            \n` +
-                `        case 'config':\n` +
-                `            const config = this.loadEntityTrackerConfig();\n` +
-                `            return \`Entity Tracker Config:\\n\` +\n` +
-                `                   \`- Threshold: \${config.threshold}\\n\` +\n` +
-                `                   \`- Auto Generate: \${config.autoGenerate}\\n\` +\n` +
-                `                   \`- Blacklist: \${config.blacklist.join(', ')}\`;\n` +
-                `            \n` +
-                `        case 'queue':\n` +
-                `            const queueCard = this.Utilities.storyCard.get('[RPG_RUNTIME] Entity Queue');\n` +
-                `            if (!queueCard || !queueCard.entry) return "Entity queue is empty";\n` +
-                `            return "Entity queue:\\n" + queueCard.entry;\n` +
-                `            \n` +
-                `        default:\n` +
-                `            return "Unknown subcommand: " + subcommand;\n` +
-                `    }\n` +
-                `},\n` +
-                `\n` +
-                `debug_char: function(args) {\n` +
-                `    // Debug character operations\n` +
-                `    if (!this.debug) return null;\n` +
-                `    \n` +
-                `    const subcommand = args[0];\n` +
-                `    if (!subcommand) {\n` +
-                `        return "Usage: /debug_char [list|create|delete|inspect]";\n` +
-                `    }\n` +
-                `    \n` +
-                `    switch(subcommand) {\n` +
-                `        case 'list':\n` +
-                `            const chars = this.loadAllCharacters();\n` +
-                `            const names = Object.keys(chars);\n` +
-                `            if (names.length === 0) return "No characters found";\n` +
-                `            return "Characters: " + names.join(', ');\n` +
-                `            \n` +
-                `        case 'create':\n` +
-                `            const name = args[1] || 'Debug_NPC';\n` +
-                `            const character = this.createCharacter({\n` +
-                `                name: name,\n` +
-                `                type: 'NPC',\n` +
-                `                level: 5,\n` +
-                `                attributes: { vitality: 10, strength: 8, dexterity: 12, agility: 10 },\n` +
-                `                hp: { current: 100, max: 100 },\n` +
-                `                location: 'debug_room'\n` +
-                `            });\n` +
-                `            this.saveCharacter(character);\n` +
-                `            return \`Created character: \${name}\`;\n` +
-                `            \n` +
-                `        case 'delete':\n` +
-                `            const delName = args[1];\n` +
-                `            if (!delName) return "Specify character name to delete";\n` +
-                `            const cardTitle = delName.toLowerCase() === 'player' ? \n` +
-                `                \`[PLAYER] \${delName}\` : \`[CHARACTER] \${delName}\`;\n` +
-                `            if (this.Utilities.storyCard.remove(cardTitle)) {\n` +
-                `                return \`Deleted character: \${delName}\`;\n` +
-                `            }\n` +
-                `            return \`Character not found: \${delName}\`;\n` +
-                `            \n` +
-                `        case 'inspect':\n` +
-                `            const inspectName = args[1];\n` +
-                `            if (!inspectName) return "Specify character name to inspect";\n` +
-                `            const char = this.loadCharacter(inspectName);\n` +
-                `            if (!char) return \`Character not found: \${inspectName}\`;\n` +
-                `            return JSON.stringify(char, null, 2);\n` +
-                `            \n` +
-                `        default:\n` +
-                `            return "Unknown subcommand: " + subcommand;\n` +
-                `    }\n` +
-                `},\n` +
-                `\n` +
-                `debug_schema: function(args) {\n` +
-                `    // Debug schema system\n` +
-                `    if (!this.debug) return null;\n` +
-                `    \n` +
-                `    const schemaType = args[0];\n` +
-                `    if (!schemaType) {\n` +
-                `        return "Usage: /debug_schema [attributes|stats|skills|format|progression]";\n` +
-                `    }\n` +
-                `    \n` +
-                `    const schemaMap = {\n` +
-                `        'attributes': '[RPG_SCHEMA] Attributes',\n` +
-                `        'stats': '[RPG_SCHEMA] Core Stats',\n` +
-                `        'skills': '[RPG_SCHEMA] Skills',\n` +
-                `        'format': '[RPG_SCHEMA] Character Format',\n` +
-                `        'progression': '[RPG_SCHEMA] Level Progression'\n` +
-                `    };\n` +
-                `    \n` +
-                `    const cardTitle = schemaMap[schemaType];\n` +
-                `    if (!cardTitle) return "Unknown schema type: " + schemaType;\n` +
-                `    \n` +
-                `    const card = this.Utilities.storyCard.get(cardTitle);\n` +
-                `    if (!card) return \`Schema not found: \${cardTitle}\`;\n` +
-                `    \n` +
-                `    return \`\${cardTitle}:\\n\${card.entry}\`;\n` +
-                `},\n` +
-                `\n` +
-                `debug_runtime: function(args) {\n` +
-                `    // Debug runtime variables\n` +
-                `    if (!this.debug) return null;\n` +
-                `    \n` +
-                `    const subcommand = args[0];\n` +
-                `    if (!subcommand) {\n` +
-                `        return "Usage: /debug_runtime [list|get|set|clear]";\n` +
-                `    }\n` +
-                `    \n` +
-                `    switch(subcommand) {\n` +
-                `        case 'list':\n` +
-                `            const vars = this.loadRuntimeVariables();\n` +
-                `            const varList = Object.entries(vars)\n` +
-                `                .map(([name, type]) => \`\${name}: \${type}\`)\n` +
-                `                .join('\\n');\n` +
-                `            return varList || "No runtime variables declared";\n` +
-                `            \n` +
-                `        case 'get':\n` +
-                `            const varName = args[1];\n` +
-                `            if (!varName) return "Specify variable name";\n` +
-                `            const value = this.getRuntimeValue(varName);\n` +
-                `            return \`\${varName} = \${JSON.stringify(value)}\`;\n` +
-                `            \n` +
-                `        case 'set':\n` +
-                `            const setVar = args[1];\n` +
-                `            const setValue = args.slice(2).join(' ');\n` +
-                `            if (!setVar || !setValue) return "Usage: /debug_runtime set <var> <value>";\n` +
-                `            if (this.setRuntimeValue(setVar, setValue)) {\n` +
-                `                return \`Set \${setVar} = \${setValue}\`;\n` +
-                `            }\n` +
-                `            return \`Failed to set \${setVar} (not declared?)\`;\n` +
-                `            \n` +
-                `        case 'clear':\n` +
-                `            this.Utilities.config.clearCache('[RPG_RUNTIME] Variables');\n` +
-                `            return "Runtime variables cache cleared";\n` +
-                `            \n` +
-                `        default:\n` +
-                `            return "Unknown subcommand: " + subcommand;\n` +
-                `    }\n` +
-                `}\n` +
-                `// Add more debug commands above with commas between them`
-            ),
-            description: (
-                `// Additional debug commands can be added here\n` +
-                `// Remember: These only work when debug = true in GameState.js\n` +
-                `// \n` +
-                `// Available debug contexts:\n` +
-                `// - this.debug (the debug flag)\n` +
-                `// - this.GenerationWizard (if available)\n` +
-                `// - this.trackUnknownEntity(name, tool, turn)\n` +
-                `// - this.loadEntityTrackerConfig()\n` +
-                `// - this.createCharacter(data)\n` +
-                `// - this.loadRuntimeVariables()\n` +
-                `// - All standard command contexts`
             )
             });
             created = true;
@@ -1786,9 +2070,9 @@ function GameState(hook, text) {
             `\n` +
             `## Prefix Template\n` +
             `// Text to add before the character sheet (for compatibility with other scripts)\n` +
-            `// Use conditionals: {isPlayer?<$# Player>} or {isNPC?<$# Character>}\n` +
+            `// Use conditionals: {isPlayer?<$# User>} or {isNPC?<$# Characters>}\n` +
             `// Leave blank if not needed\n` +
-            `{isPlayer?<$# Player>}{isNPC?<$# Character>}\n` +
+            `{isPlayer?<$# User>}{isNPC?<$# Characters>}\n` +
             `\n` +
             `## Header Template\n` +
             `// Use {fieldname} for values, **text** for bold\n` +
@@ -1995,8 +2279,8 @@ function GameState(hook, text) {
                     // Store any prefix text (but ignore template-generated prefixes)
                     if (prefixLines.length > 0) {
                         const prefixText = prefixLines.join('\n').trim();
-                        // Don't store template-generated prefixes like <$# Player> or <$# Character>
-                        if (!prefixText.match(/^<\$#\s+(Player|Character)>$/)) {
+                        // Don't store template-generated prefixes like <$# User> or <$# Characters>
+                        if (!prefixText.match(/^<\$#\s+[^>]+>$/)) {
                             character.prefixText = prefixText;
                         }
                     }
@@ -2977,8 +3261,7 @@ function GameState(hook, text) {
             `• Quests: offer_quest(npc, quest, type) update_quest(player, quest, stage) complete_quest(player, quest)\n` +
             `• Progression: add_levelxp(name, amount) add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
             `• Stats: update_attribute(name, attribute, value) update_health(name, current, max)\n` +
-            `• Combat: deal_damage(source, target, amount) death(name)\n` +
-            `**Instructions:** Use tools naturally in narrative. Discover new locations as characters explore. Track all exchanges and progression.]`
+            `• Combat: deal_damage(source, target, amount) death(name)]`
         );
         
         Utilities.storyCard.add({
@@ -3236,64 +3519,6 @@ function GameState(hook, text) {
             }
             
             return anySuccess ? 'executed' : 'executed';
-        },
-        
-        update_health: function(characterName, current, max) {
-            if (!characterName) return 'malformed';
-            
-            characterName = String(characterName).toLowerCase();
-            
-            // Handle "current/max" format
-            if (typeof current === 'string' && current.includes('/')) {
-                const parts = current.split('/');
-                current = parseInt(parts[0]);
-                max = parseInt(parts[1]);
-            } else {
-                current = parseInt(current);
-                max = parseInt(max);
-            }
-            
-            if (isNaN(current) || isNaN(max)) return 'malformed';
-            
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
-            
-            if (!character) return 'executed';
-            
-            character.hp.current = Math.max(0, current);
-            character.hp.max = Math.max(1, max); // Max HP must be at least 1
-            
-            saveCharacter(character);
-            if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s HP to ${character.hp.current}/${character.hp.max}`);
-            
-            return 'executed';
-        },
-        
-        update_max_health: function(characterName, value) {
-            if (!characterName) return 'malformed';
-            
-            characterName = String(characterName).toLowerCase();
-            const newMax = parseInt(value);
-            
-            if (isNaN(newMax) || newMax <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid max health: ${value}`);
-                return 'malformed';
-            }
-            
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
-            
-            if (!character) return 'executed';
-            
-            character.hp.max = newMax;
-            if (character.hp.current > newMax) {
-                character.hp.current = newMax;
-            }
-            
-            saveCharacter(character);
-            if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s max HP to ${newMax}`);
-            
-            return 'executed';
         },
         
         deal_damage: function(sourceName, targetName, damageAmount) {
@@ -3740,11 +3965,42 @@ function GameState(hook, text) {
                 normalizedType = normalizedType.substring(0, normalizedType.length - 6);
             }
             
-            // Valid types (all lowercase)
-            const validTypes = ['story', 'side', 'hidden', 'raid'];
+            // Load quest types from schema
+            const questSchema = Utilities.storyCard.get('[RPG_SCHEMA] Quest Types');
+            let validTypes = ['story', 'side', 'hidden', 'raid']; // Default fallback
+            let stageRanges = {};
+            
+            if (questSchema && questSchema.value) {
+                const parsed = Utilities.config.load('[RPG_SCHEMA] Quest Types');
+                validTypes = [];
+                
+                // Parse quest types and their stage counts
+                for (const [type, stages] of Object.entries(parsed)) {
+                    const typeLower = type.toLowerCase();
+                    validTypes.push(typeLower);
+                    
+                    // Parse stage count - can be "min-max" or single number
+                    const stageStr = String(stages);
+                    if (stageStr.includes('-')) {
+                        const [min, max] = stageStr.split('-').map(s => parseInt(s.trim()));
+                        stageRanges[typeLower] = { min, max };
+                    } else {
+                        const exact = parseInt(stageStr);
+                        stageRanges[typeLower] = { min: exact, max: exact };
+                    }
+                }
+            } else {
+                // Fallback to defaults if schema not found
+                stageRanges = {
+                    'story': { min: 3, max: 7 },
+                    'side': { min: 2, max: 5 },
+                    'hidden': { min: 3, max: 7 },
+                    'raid': { min: 3, max: 7 }
+                };
+            }
             
             if (!validTypes.includes(normalizedType)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType} (normalized: ${normalizedType})`);
+                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType} (normalized: ${normalizedType}). Valid types: ${validTypes.join(', ')}`);
                 return 'malformed';
             }
             
@@ -3761,13 +4017,6 @@ function GameState(hook, text) {
             }
             
             // Determine stage count based on type (using lowercase)
-            const stageRanges = {
-                'story': { min: 3, max: 7 },
-                'side': { min: 2, max: 5 },
-                'hidden': { min: 3, max: 7 },
-                'raid': { min: 3, max: 7 }
-            };
-            
             const range = stageRanges[normalizedType];
             const stageCount = Math.floor(Math.random() * (range.max - range.min + 1)) + range.min;
             
@@ -3804,7 +4053,7 @@ function GameState(hook, text) {
             const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
             if (!questCard) {
                 if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                return 'executed';
+                return 'unknown';  // Return unknown so it gets removed
             }
             
             // Parse the new stage number
@@ -4305,6 +4554,7 @@ function GameState(hook, text) {
         let modifiedText = text;
         let toolsToRemove = [];
         let toolsToModify = [];
+        let executedTools = [];  // Track for RewindSystem
         
         // First pass: find and execute all tools, track malformed ones and ones to modify
         let match;
@@ -4325,7 +4575,21 @@ function GameState(hook, text) {
             
             // Parse parameters
             const params = parseParameters(paramString);
+            
+            // Capture revert data BEFORE executing the tool
+            const revertData = captureRevertData(toolName.toLowerCase(), params);
+            
             let result = processToolCall(toolName, params);
+            
+            // Track executed tools for RewindSystem
+            if (result === 'executed') {
+                executedTools.push({
+                    tool: toolName.toLowerCase(),
+                    params: params,
+                    executed: true,
+                    revertData: revertData
+                });
+            }
             
             // Check if this is accept_quest and needs parameter normalization
             if (toolName === 'accept_quest' && result === 'executed') {
@@ -4403,7 +4667,57 @@ function GameState(hook, text) {
             .replace(/ \)/g, ')')            // Space before closing paren
             .replace(/\n\n\n+/g, '\n\n');   // Multiple newlines to double newline
         
-        return modifiedText;
+        // Return both the modified text and executed tools
+        // We'll record them in the main output hook
+        return { modifiedText, executedTools };
+    }
+    
+    // Capture revert data for specific tools
+    function captureRevertData(toolName, params) {
+        const characters = loadAllCharacters();
+        const revertData = {};
+        
+        switch(toolName) {
+            case 'update_location':
+                const char = characters[String(params[0]).toLowerCase()];
+                if (char) revertData.oldLocation = char.location;
+                break;
+                
+            case 'add_item':
+                // No revert data needed - we just remove it on revert
+                revertData.added = true;
+                break;
+                
+            case 'remove_item':
+                // Store that we removed it so we can add it back
+                revertData.removed = true;
+                break;
+                
+            case 'transfer_item':
+                // Store the original transfer direction
+                revertData.from = params[0];
+                revertData.to = params[1];
+                break;
+                
+            case 'deal_damage':
+                const target = characters[String(params[1]).toLowerCase()];
+                if (target && target.hp) {
+                    revertData.oldHp = target.hp.current;
+                }
+                break;
+                
+            case 'update_relationship':
+                const char1 = characters[String(params[0]).toLowerCase()];
+                if (char1 && char1.relationships) {
+                    const char2Name = String(params[1]).toLowerCase();
+                    revertData.oldValue = char1.relationships[char2Name] || 0;
+                }
+                break;
+                
+            // Add more as needed
+        }
+        
+        return revertData;
     }
     
     function processToolCall(toolName, params) {
@@ -4420,28 +4734,41 @@ function GameState(hook, text) {
         // Check for dynamic core stat tools (update_hp, update_mp, etc from schema)
         if (normalizedToolName.startsWith('update_')) {
             const schema = loadRPGSchema();
+            const format = loadCharacterFormat();
             
             // Special handling for update_max_* pattern
             if (normalizedToolName.startsWith('update_max_')) {
-                const statName = normalizedToolName.substring(11).toUpperCase();
+                let statName = normalizedToolName.substring(11);
                 
-                // Check if it's a valid core stat from schema
-                if (schema.coreStats[statName]) {
+                // Check custom field mappings first (e.g., max_health -> hp.max)
+                const customMapping = format.customFields[`max_${statName}`];
+                if (customMapping && customMapping.includes('.')) {
+                    // Extract the base stat name from mapping (e.g., hp.max -> hp)
+                    statName = customMapping.split('.')[0];
+                }
+                
+                // Check if it's a valid core stat from schema (case-insensitive)
+                const upperStatName = statName.toUpperCase();
+                const coreStatKeys = Object.keys(schema.coreStats).map(k => k.toUpperCase());
+                if (coreStatKeys.includes(upperStatName)) {
                     processCoreStatTool(normalizedToolName, params);
                     return 'executed';
                 }
             } else {
                 // Check for update_[stat] pattern
-                const statName = normalizedToolName.substring(7).toUpperCase();
+                let statName = normalizedToolName.substring(7);
                 
-                // Special case for update_health (legacy support)
-                if (statName === 'HEALTH') {
-                    toolProcessors.update_health(...params);
-                    return 'executed';
+                // Check custom field mappings first (e.g., health -> hp.current)
+                const customMapping = format.customFields[statName];
+                if (customMapping && customMapping.includes('.')) {
+                    // Extract the base stat name from mapping (e.g., hp.current -> hp)
+                    statName = customMapping.split('.')[0];
                 }
                 
-                // Check if it's a valid core stat from schema
-                if (schema.coreStats[statName]) {
+                // Check if it's a valid core stat from schema (case-insensitive)
+                const upperStatName = statName.toUpperCase();
+                const coreStatKeys = Object.keys(schema.coreStats).map(k => k.toUpperCase());
+                if (coreStatKeys.includes(upperStatName)) {
                     processCoreStatTool(normalizedToolName, params);
                     return 'executed';
                 }
@@ -4459,10 +4786,21 @@ function GameState(hook, text) {
         
         // Check for update_max_[stat] pattern
         if (toolName.startsWith('update_max_')) {
-            const statName = toolName.substring(11).toUpperCase();
+            let statName = toolName.substring(11);
+            const format = loadCharacterFormat();
             
-            // Check if it's a valid core stat
-            if (!schema.coreStats[statName]) {
+            // Check custom field mappings first
+            const customMapping = format.customFields[`max_${statName}`];
+            if (customMapping && customMapping.includes('.')) {
+                // Extract the base stat name from mapping
+                statName = customMapping.split('.')[0];
+            }
+            
+            // Find the matching core stat (case-insensitive)
+            const upperStatName = statName.toUpperCase();
+            const matchingStatKey = Object.keys(schema.coreStats).find(k => k.toUpperCase() === upperStatName);
+            
+            if (!matchingStatKey) {
                 if (debug) console.log(`${MODULE_NAME}: Unknown core stat: ${statName}`);
                 return false;
             }
@@ -4481,13 +4819,13 @@ function GameState(hook, text) {
             }
             
             // Update max value
-            if (statName === 'HP') {
+            if (matchingStatKey.toUpperCase() === 'HP') {
                 character.hp.max = newMax;
                 if (character.hp.current > newMax) {
                     character.hp.current = newMax;
                 }
             } else {
-                const statKey = statName.toLowerCase();
+                const statKey = matchingStatKey.toLowerCase();
                 if (!character.coreStats[statKey]) {
                     character.coreStats[statKey] = { current: newMax, max: newMax };
                 } else {
@@ -4504,10 +4842,21 @@ function GameState(hook, text) {
         }
         
         // Check for update_[stat] pattern (current/max format)
-        const statName = toolName.substring(7).toUpperCase();
+        let statName = toolName.substring(7);
+        const format = loadCharacterFormat();
         
-        // Check if it's a valid core stat
-        if (!schema.coreStats[statName]) {
+        // Check custom field mappings first
+        const customMapping = format.customFields[statName];
+        if (customMapping && customMapping.includes('.')) {
+            // Extract the base stat name from mapping
+            statName = customMapping.split('.')[0];
+        }
+        
+        // Find the matching core stat (case-insensitive)
+        const upperStatName = statName.toUpperCase();
+        const matchingStatKey = Object.keys(schema.coreStats).find(k => k.toUpperCase() === upperStatName);
+        
+        if (!matchingStatKey) {
             if (debug) console.log(`${MODULE_NAME}: Unknown core stat: ${statName}`);
             return false;
         }
@@ -4535,11 +4884,11 @@ function GameState(hook, text) {
             return false;
         }
         
-        if (statName === 'HP') {
+        if (matchingStatKey.toUpperCase() === 'HP') {
             character.hp.current = current;
             character.hp.max = max;
         } else {
-            const statKey = statName.toLowerCase();
+            const statKey = matchingStatKey.toLowerCase();
             if (!character.coreStats[statKey]) {
                 character.coreStats[statKey] = {};
             }
@@ -4681,6 +5030,43 @@ function GameState(hook, text) {
                 return `Set ${testVar} = ${value}`;
             },
             
+            // Test update_health tool recognition
+            health_tool: () => {
+                let results = [];
+                
+                // Create test character if needed
+                const testChar = createCharacter({
+                    name: 'Debug_Character',
+                    isPlayer: false,
+                    attributes: { STR: 10 }
+                });
+                results.push(`Created test character: ${testChar.name}`);
+                
+                // Test various health tool formats
+                const tools = [
+                    'update_health',
+                    'update_HEALTH',
+                    'update_Health',
+                    'update_hp',
+                    'update_HP',
+                    'update_max_health',
+                    'update_max_hp'
+                ];
+                
+                for (const tool of tools) {
+                    const result = processToolCall(tool, ['debug_character', '50/100']);
+                    results.push(`${tool}: ${result}`);
+                }
+                
+                // Check the character's health
+                const char = loadCharacter('Debug_Character');
+                if (char) {
+                    results.push(`Final HP: ${char.hp.current}/${char.hp.max}`);
+                }
+                
+                return results.join('\n');
+            },
+            
             // Show all schemas
             schema_all: () => {
                 const schemas = [
@@ -4768,7 +5154,7 @@ function GameState(hook, text) {
         GameState.debugTest = debugTest;
         console.log(`${MODULE_NAME}: Debug test functions available - use GameState.debugTest('test_name')`);
         console.log(`${MODULE_NAME}: Available tests: gw_activate, gw_npc, gw_monster, gw_boss, gw_item, gw_location, gw_quest`);
-        console.log(`${MODULE_NAME}: Also: entity_trigger, entity_status, char_create, char_list, runtime_test, schema_all, cleanup`);
+        console.log(`${MODULE_NAME}: Also: entity_trigger, entity_status, char_create, char_list, runtime_test, health_tool, schema_all, cleanup`);
     }
     
     // ==========================
@@ -4876,13 +5262,16 @@ function GameState(hook, text) {
             return text;
             
         case 'context':
-            // Initialize runtime system
-            initializeRuntimeVariables();
-            
-            // Clear caches for fresh load
+            // Clear caches for fresh load (before initialization)
             runtimeVariablesCache = null;
             characterCache = null;
             schemaCache = null;
+            
+            // Initialize runtime system
+            initializeRuntimeVariables();
+            
+            // Check for edits in history (RewindSystem)
+            RewindSystem.handleContext();
             
             // Load context modifier
             loadContextModifier();
@@ -4992,8 +5381,10 @@ function GameState(hook, text) {
                     };
                     
                     // Apply modifier with context
-                    const modifierFunc = eval(`(function(text) { ${contextModifier.toString().match(/\{([\s\S]*)\}/)[1]} })`);
-                    modifiedText = modifierFunc.call(context, modifiedText);
+                    // If it's already a function, just call it with context
+                    if (typeof contextModifier === 'function') {
+                        modifiedText = contextModifier.call(context, modifiedText);
+                    }
                     
                     if (debug) console.log(`${MODULE_NAME}: Applied context modifier`);
                 } catch(e) {
@@ -5025,7 +5416,16 @@ function GameState(hook, text) {
             
             // Process tools in LLM's output
             if (text) {
-                let modifiedText = processTools(text);
+                const result = processTools(text);
+                let modifiedText = result.modifiedText;
+                const executedTools = result.executedTools || [];
+                
+                // Record this output immediately - it will become history next turn
+                // Use the current data position + 1 if we're tracking, otherwise use history length
+                const data = RewindSystem.getStorage();
+                const futurePosition = data.position !== undefined ? data.position + 1 : (history ? history.length : 0);
+                RewindSystem.recordAction(text, executedTools, futurePosition);
+                // Log message removed - recordAction logs internally
                 
                 // Check if any entities need generation
                 const entityQueued = queuePendingEntities();
@@ -5095,6 +5495,9 @@ function GameState(hook, text) {
     // Entity tracking API
     GameState.completeEntityGeneration = completeEntityGeneration;
     GameState.loadEntityTrackerConfig = loadEntityTrackerConfig;
+    
+    // Rewind System API
+    GameState.RewindSystem = RewindSystem;
     
     // Field accessor methods
     GameState.getCharacterField = getCharacterField;
