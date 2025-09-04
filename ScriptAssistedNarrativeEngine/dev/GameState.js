@@ -1082,6 +1082,7 @@ function GameState(hook, text) {
             const data = RewindSystem.getStorage();
             const historyLength = history.length;
             const oldLength = data.entries.length;
+            const oldPosition = data.position || -1;  // Track our last known position
             
             // Detect if history array has shifted (when at max capacity)
             let shifted = false;
@@ -1102,7 +1103,9 @@ function GameState(hook, text) {
                 data.entries.shift();
             }
             
-            // Process new entries at the end (don't reprocess existing ones)
+            // Track new entries but DON'T execute tools (assume already executed)
+            // Only truly new entries at the very end should execute
+            
             for (let i = data.entries.length; i < historyLength; i++) {
                 const historyEntry = history[i];
                 if (!historyEntry || !historyEntry.text) {
@@ -1110,15 +1113,41 @@ function GameState(hook, text) {
                     continue;
                 }
                 
-                if (debug) console.log(`${MODULE_NAME}: Processing new history entry at position ${i}`);
-                
                 const hash = RewindSystem.quickHash(historyEntry.text);
-                const tools = RewindSystem.extractAndExecuteTools(historyEntry.text);
                 
-                data.entries[i] = {
-                    h: hash,
-                    t: tools.map(t => [t.tool, t.params, t.revertData || {}])
-                };
+                // Check if this is the LAST entry in the history (genuinely new)
+                // All other entries are assumed to be restored/already executed
+                if (i === historyLength - 1 && i > oldPosition) {
+                    // This is the newest entry and it's beyond our last position - execute tools
+                    if (debug) console.log(`${MODULE_NAME}: Processing genuinely new entry at position ${i}`);
+                    const tools = RewindSystem.extractAndExecuteTools(historyEntry.text);
+                    data.entries[i] = {
+                        h: hash,
+                        t: tools.map(t => [t.tool, t.params, t.revertData || {}])
+                    };
+                } else {
+                    // This is either:
+                    // 1. A restored entry from history (middle entries)
+                    // 2. Not beyond our last known position
+                    // Just track hash, don't execute tools
+                    if (debug) console.log(`${MODULE_NAME}: Tracking entry at position ${i} without execution (restored or old)`);
+                    
+                    // Extract tools without executing them (for tracking purposes)
+                    const toolMatches = [];
+                    const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/g;
+                    let match;
+                    while ((match = TOOL_PATTERN.exec(historyEntry.text)) !== null) {
+                        const toolName = match[1];
+                        const paramString = match[2];
+                        const params = paramString ? paramString.split(',').map(p => p.trim()) : [];
+                        toolMatches.push([toolName, params, {}]);
+                    }
+                    
+                    data.entries[i] = {
+                        h: hash,
+                        t: toolMatches  // Tools that were in the text but we're not executing
+                    };
+                }
             }
             
             // Verify existing entries haven't been edited
