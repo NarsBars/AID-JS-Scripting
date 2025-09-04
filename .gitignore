@@ -1,5 +1,2 @@
-ScriptAssistedNarrativeEngine/dev/CLAUDE.md
-ScriptAssistedNarrativeEngine/.claude/settings.local.json
-ScriptAssistedNarrativeEngine/dev/Character-ECS.md
-ScriptAssistedNarrativeEngine/dev/Location-System.md
-ScriptAssistedNarrativeEngine/dev/SANE-Design-Document.md
+*.md
+*.json
