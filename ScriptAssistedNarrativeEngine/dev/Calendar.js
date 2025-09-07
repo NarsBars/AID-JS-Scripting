@@ -1943,7 +1943,7 @@ function Calendar(hook, text) {
     switch(hook) {
         case 'context':
             // Full context processing
-            const config = loadConfiguration();
+            let config = loadConfiguration();
             if (!config) {
                 if (debug) console.log(`${MODULE_NAME}: Time system requires configuration to function`);
                 createDefaultConfiguration();
@@ -1953,8 +1953,9 @@ function Calendar(hook, text) {
                 }
                 
                 // Try to load again after creation
-                const newConfig = loadConfiguration();
-                if (!newConfig) {
+                config = loadConfiguration();
+                if (!config) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to load configuration after creation`);
                     initializeAPI();
                     return;
                 }

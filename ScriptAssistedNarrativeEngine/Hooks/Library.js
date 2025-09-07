@@ -4077,7 +4077,7 @@ function Calendar(hook, text) {
                     state.startingTimeApplied = true;
                 }
                 
-                if (debug) console.log(`${MODULE_NAME}: Starting at ${hour}:${String(minute).padStart(2, '0')} (one-time only)`);
+                if (debug) console.log(`${MODULE_NAME}: Starting at ${Utilities.format.formatTime(hour, minute)} (one-time only)`);
             }
         }
         
@@ -4176,7 +4176,7 @@ function Calendar(hook, text) {
         const totalMinutes = Math.floor(progress * hoursPerDay * 60);
         const hour = Math.floor(totalMinutes / 60) % hoursPerDay;
         const minute = totalMinutes % 60;
-        return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+        return Utilities.format.formatTime(hour, minute);
     }
     
     function calculateDate(totalDays, startDateStr, config) {
@@ -4592,7 +4592,7 @@ function Calendar(hook, text) {
             adjustments.push({
                 turn: currentAction !== null ? currentAction : timeData.lastProcessedAction,
                 type: 'setTime',
-                description: `${hour}:${String(minute).padStart(2, '0')}`,
+                description: Utilities.format.formatTime(hour, minute),
                 amount: progressDiff
             });
             
@@ -5589,7 +5589,7 @@ function Calendar(hook, text) {
     switch(hook) {
         case 'context':
             // Full context processing
-            const config = loadConfiguration();
+            let config = loadConfiguration();
             if (!config) {
                 if (debug) console.log(`${MODULE_NAME}: Time system requires configuration to function`);
                 createDefaultConfiguration();
@@ -5599,8 +5599,9 @@ function Calendar(hook, text) {
                 }
                 
                 // Try to load again after creation
-                const newConfig = loadConfiguration();
-                if (!newConfig) {
+                config = loadConfiguration();
+                if (!config) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to load configuration after creation`);
                     initializeAPI();
                     return;
                 }
