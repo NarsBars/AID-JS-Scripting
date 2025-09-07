@@ -11903,11 +11903,10 @@ function GameState(hook, text) {
         }
         
         const defaultText = (
-            `[**Current Scene** Floor get_current_floor() | get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
+            `[**Current Scene** get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
             `**Available Tools:**\n` +
             `• Location: update_location(name, place) discover_location(character, place, direction) connect_locations(placeA, placeB, direction)\n` +
             `  - Directions: north, south, east, west, inside (enter), outside (exit)\n` +
-            `• SAO: advance_to_floor(character, floor) set_current_floor(floor) complete_floor(floor)\n` +
             `• Time: advance_time(hours, minutes)\n` +
             `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty)\n` +
             `• Relations: update_relationship(name1, name2, points)\n` +
@@ -12471,25 +12470,6 @@ function GameState(hook, text) {
                 const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
                 if (match) {
                     playerName = match[1].trim();
-                }
-            }
-            
-            if (playerName) {
-                const allChars = loadAllCharacters();
-                const player = allChars[playerName.toLowerCase()];
-                if (player) {
-                    // Get current floor from runtime or default to 1
-                    const currentFloor = getRuntimeValue('current_floor') || 1;
-                    
-                    // Convert floor number to words for header
-                    const floorWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
-                    let floorName;
-                    if (currentFloor >= 0 && currentFloor < floorWords.length) {
-                        floorName = 'Floor ' + floorWords[currentFloor];
-                    } else {
-                        floorName = 'Floor ' + currentFloor;
-                    }
-                    locationHeaders = '<$# Locations>\n<$## ' + floorName + '>';
                 }
             }
             
