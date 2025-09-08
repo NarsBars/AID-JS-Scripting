@@ -7,7 +7,7 @@ function GenerationWizard(hook, text) {
     // ==========================
     // Constants
     // ==========================
-    const PROGRESS_CARD = '[ENTITY_GEN] In Progress';
+    const PROGRESS_CARD = '[GW] In Progress';
     const TEMPLATE_PREFIX = '[GW Template]';
     const CONFIG_AND_PROMPTS_CARD = '[GENERATION_CONFIG]';
     const HIDDEN_OUTPUT = '\n<<<The GM is thinking, please hit continue... (Use `/GW abort` if needed, this prompting is still being worked on)>>>\n';
@@ -528,21 +528,25 @@ function GenerationWizard(hook, text) {
         let entry = `# Generating ${progress.entityType}\n\n`;
         
         const activeFields = progress.templateFields || [];
-        const completedCount = Object.keys(progress.collectedData).filter(key => 
-            key !== 'name' && key !== 'QUEST_TYPE' && key !== 'QUEST_GIVER' && key !== 'STAGE_COUNT' && key !== 'REWARDS_PARSED'
-        ).length;
         
-        // Calculate total fields based on entity type
+        // For quests, we need to count differently since some fields are predefined
+        let completedCount;
         let totalFields;
+        
         if (progress.entityType === 'Quest') {
-            // For quests, add 2 for STAGES and REWARDS which are handled specially
-            totalFields = activeFields.filter(f => f.name !== 'STAGES' && f.name !== 'REWARDS').length + 2;
+            // Count only the non-predefined fields that we actually ask for
+            const fieldsToCount = ['DESCRIPTION', 'STAGES', 'REWARDS'];
+            completedCount = fieldsToCount.filter(field => progress.collectedData[field]).length;
+            totalFields = fieldsToCount.length;
         } else {
-            // For other entities, just count the template fields
+            // For other entities, count all fields except internal ones
+            completedCount = Object.keys(progress.collectedData).filter(key => 
+                key !== 'name' && key !== 'REWARDS_PARSED'
+            ).length;
             totalFields = activeFields.length;
         }
         
-        entry += `**Progress:** ${completedCount} of ~${totalFields} fields collected\n\n`;
+        entry += `**Progress:** ${completedCount} of ${totalFields} fields collected\n\n`;
         
         // Show collected data
         if (completedCount > 0) {
@@ -582,10 +586,10 @@ function GenerationWizard(hook, text) {
         // Build the CONTEXT section - what we already know
         let contextSection = '==== CONTEXT (Already Provided) ====\n';
         contextSection += '**Quest Information:**\n';
-        contextSection += `Name: ${collectedData.NAME}\n`;
-        contextSection += `Giver: ${collectedData.QUEST_GIVER}\n`;
-        contextSection += `Type: ${questType}\n`;
-        contextSection += `Stages: ${stageCount}\n`;
+        contextSection += `Name: ${collectedData.NAME || 'Not specified'}\n`;
+        contextSection += `Giver: ${collectedData.QUEST_GIVER || 'Not specified'}\n`;
+        contextSection += `Type: ${questType || 'Not specified'}\n`;
+        contextSection += `Stages: ${stageCount || 'Not specified'}\n`;
         
         // Add collected fields to context
         if (collectedData.DESCRIPTION) {
@@ -768,6 +772,13 @@ function GenerationWizard(hook, text) {
         
         // Special handling for specific fields
         if (field.name === 'NAME') {
+            // CRITICAL: Enforce snake_case for all names to prevent system breakage
+            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            
+            if (snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
+                if (debug) console.log(`${MODULE_NAME}: Converting NAME to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
+            }
+            
             // Check for duplicate usernames in existing characters
             const existingCharacters = Utilities.storyCard.find((card) => {
                 return card.type === 'character' || 
@@ -777,13 +788,48 @@ function GenerationWizard(hook, text) {
             for (const character of existingCharacters) {
                 // Extract username from character header (## **Username**)
                 const headerMatch = character.entry.match(/^##\s+\*\*([^*]+)\*\*/);
-                if (headerMatch && headerMatch[1].toLowerCase() === trimmedValue.toLowerCase()) {
+                if (headerMatch && headerMatch[1].toLowerCase() === snakeCased) {
                     return { 
                         valid: false, 
-                        error: `Username "${trimmedValue}" already exists. Please provide a different username.` 
+                        error: `Username "${snakeCased}" already exists. Please provide a different username.` 
                     };
                 }
             }
+            
+            // Return the snake_cased version
+            return { valid: true, value: snakeCased };
+        }
+        
+        // Enforce snake_case for quest givers too
+        if (field.name === 'QUEST_GIVER') {
+            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            if (debug && snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
+                console.log(`${MODULE_NAME}: Converting QUEST_GIVER to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
+            }
+            return { valid: true, value: snakeCased };
+        }
+        
+        // Validate DESCRIPTION has meaningful content (more than 2 words)
+        if (field.name === 'DESCRIPTION') {
+            const wordCount = trimmedValue.split(/\s+/).filter(word => word.length > 0).length;
+            if (wordCount < 3) {
+                return { valid: false, error: 'Description must be at least 3 words (got "' + trimmedValue + '")' };
+            }
+            return { valid: true, value: trimmedValue };
+        }
+        
+        // Validate STAGES is not just a number or too short
+        if (field.name === 'STAGES') {
+            // Check if it's just a number
+            if (/^\d+$/.test(trimmedValue)) {
+                return { valid: false, error: 'STAGES cannot be just a number (got "' + trimmedValue + '")' };
+            }
+            // Check if it has actual stage content (should have numbered items)
+            const hasStageContent = /\d+[\.\:\-\)]\s*.+/i.test(trimmedValue);
+            if (!hasStageContent) {
+                return { valid: false, error: 'STAGES must contain numbered objectives (got "' + trimmedValue + '")' };
+            }
+            return { valid: true, value: trimmedValue };
         }
         
         if (field.name === 'GENDER') {
@@ -1114,6 +1160,11 @@ function GenerationWizard(hook, text) {
                     progress.currentBatch = activeFields.map(f => f.name);
                     saveProgress(progress);
                     
+                    if (debug) {
+                        console.log(`${MODULE_NAME}: Adding batch prompt to context for fields: ${activeFields.map(f => f.name).join(', ')}`);
+                        console.log(`${MODULE_NAME}: Full prompt injection:\n${batchPrompt}`);
+                    }
+                    
                     return {
                         active: true,
                         text: text + batchPrompt
@@ -1220,7 +1271,7 @@ function GenerationWizard(hook, text) {
                         }
                     }
                     
-                    // Parse stages (Quest only)
+                    // Parse stages (Quest only) - Special handling to avoid false matches
                     if (progress.entityType === 'Quest' && !progress.collectedData.STAGES) {
                         // Ensure stageCollection is initialized
                         if (!progress.stageCollection) {
@@ -1230,8 +1281,24 @@ function GenerationWizard(hook, text) {
                             };
                         }
                         
+                        // Look for the actual STAGES section, not summary lines
+                        // Find where "STAGES:" appears on its own line (not "Stages: 3")
+                        const stagesIndex = text.search(/^STAGES:\s*$/m);
+                        let stageText = text;
+                        
+                        if (stagesIndex !== -1) {
+                            // Extract everything after "STAGES:" line
+                            stageText = text.substring(stagesIndex);
+                            // Stop at "REWARDS:" if present
+                            const rewardsIndex = stageText.search(/^REWARDS:\s*$/m);
+                            if (rewardsIndex > 0) {
+                                stageText = stageText.substring(0, rewardsIndex);
+                            }
+                            if (debug) console.log(`${MODULE_NAME}: Extracted stage section for parsing`);
+                        }
+                        
                         const stages = parseStageResponse(
-                            text,
+                            stageText,
                             progress.stageCollection.stageCount,
                             progress.stageCollection.stages
                         );
@@ -1242,11 +1309,15 @@ function GenerationWizard(hook, text) {
                         progress.stageCollection.stages = stages;
                         
                         if (allValid) {
-                            progress.collectedData.STAGES = formatStagesForCard(
+                            const formattedStages = formatStagesForCard(
                                 stages,
                                 progress.stageCollection.stageCount
                             );
-                            if (debug) console.log(`${MODULE_NAME}: All ${progress.stageCollection.stageCount} stages collected`);
+                            progress.collectedData.STAGES = formattedStages;
+                            if (debug) {
+                                console.log(`${MODULE_NAME}: All ${progress.stageCollection.stageCount} stages collected`);
+                                console.log(`${MODULE_NAME}: Formatted stages:\n${formattedStages}`);
+                            }
                         } else {
                             allFieldsCollected = false;
                             if (debug) console.log(`${MODULE_NAME}: Stage validation failed, will retry`);
@@ -1287,8 +1358,22 @@ function GenerationWizard(hook, text) {
                     }
                     
                     // Check if ALL fields are now collected (not just from this response)
-                    const remainingFields = getActiveFields(progress.templateFields, progress.collectedData);
-                    console.log(`${MODULE_NAME}: After batch processing - Remaining fields: ${remainingFields.length}`);
+                    // For quests, we need to check DESCRIPTION, STAGES, and REWARDS specifically
+                    let remainingFields = [];
+                    let remainingFieldNames = '';
+                    
+                    if (progress.entityType === 'Quest') {
+                        // Check the three required quest fields
+                        const requiredQuestFields = ['DESCRIPTION', 'STAGES', 'REWARDS'];
+                        const missingQuestFields = requiredQuestFields.filter(f => !progress.collectedData[f]);
+                        remainingFields = missingQuestFields.map(name => ({ name }));
+                        remainingFieldNames = missingQuestFields.join(', ');
+                    } else {
+                        remainingFields = getActiveFields(progress.templateFields, progress.collectedData);
+                        remainingFieldNames = remainingFields.map(f => f.name).join(', ');
+                    }
+                    
+                    console.log(`${MODULE_NAME}: After batch processing - Remaining fields: ${remainingFields.length}${remainingFields.length > 0 ? ` (${remainingFieldNames})` : ''}`);
                     console.log(`${MODULE_NAME}: Collected so far: ${JSON.stringify(Object.keys(progress.collectedData))}`);
                     
                     if (remainingFields.length === 0) {
@@ -1562,6 +1647,11 @@ function GenerationWizard(hook, text) {
         // Flatten nested properties for template processing
         const flatData = {...collectedData};
         
+        if (debug && flatData.STAGES !== undefined) {
+            console.log(`${MODULE_NAME}: processTemplate - STAGES value: "${flatData.STAGES}"`);
+            console.log(`${MODULE_NAME}: processTemplate - STAGES type: ${typeof flatData.STAGES}`);
+        }
+        
         // Handle hp object specially
         if (collectedData.hp && typeof collectedData.hp === 'object') {
             flatData['hp.current'] = collectedData.hp.current || 100;
@@ -1760,7 +1850,7 @@ function GenerationWizard(hook, text) {
         if (triggerNameStr && triggerNameStr !== name) {
             keysList.push(triggerNameStr);
         }
-        const keys = keysList.join(', ') + ' ';
+        const keys = keysList.join(', ');
         
         // Create the story card
         let description = `Generated by GenerationWizard on turn ${info?.actionCount || 0}`;
@@ -1789,7 +1879,7 @@ function GenerationWizard(hook, text) {
             title: '[GW Template] NPC',
             type: 'data',
             entry: (
-                `## **{{NAME}}**{{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
+                `## **{{NAME}}** {{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
                 `DOB: {{DOB}} | Gender: {{GENDER}} | HP: {{hp.current}}/{{hp.max}} | Level {{LEVEL}} (0/{{XP_MAX}} XP) | Current Location: {{LOCATION}}\n` +
                 `### Appearance\n` +
                 `Hair: {{HAIR}} | Eyes: {{EYES}} | Build: {{BUILD}}\n` +
@@ -2350,48 +2440,6 @@ function GenerationWizard(hook, text) {
             return true;
         };
         
-        // Generic start generation method for any entity type
-        GenerationWizard.startGeneration = function(entityType, triggerName, initialData) {
-            if (!entityType) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid entity type`);
-                return false;
-            }
-            
-            if (isGenerationActive()) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return false;
-            }
-            
-            // Check if template exists
-            const template = loadTemplate(entityType);
-            if (!template) {
-                if (debug) console.log(`${MODULE_NAME}: Template not found for ${entityType}`);
-                return false;
-            }
-            
-            // Parse template fields
-            let templateFields = parseTemplateFields(template.description);
-            
-            // Create progress object
-            const progress = {
-                entityType: entityType,
-                entityName: initialData?.NAME || triggerName || 'Unknown',
-                triggerName: triggerName,
-                stage: 'generation',
-                collectedData: initialData || {},
-                templateFields: templateFields,
-                metadata: initialData?.metadata || {},
-                completed: false,
-                currentBatch: null,
-                branchResolved: true,
-                startTurn: info?.actionCount || 0,
-                expectingBatch: entityType === 'NPC' || entityType === 'Location'
-            };
-            
-            saveProgress(progress);
-            if (debug) console.log(`${MODULE_NAME}: Started ${entityType} generation`);
-            return true;
-        };
     }
     
     // Handle hook-based initialization

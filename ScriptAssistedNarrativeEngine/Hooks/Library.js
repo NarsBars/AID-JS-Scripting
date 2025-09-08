@@ -6217,7 +6217,7 @@ function GenerationWizard(hook, text) {
     // ==========================
     // Constants
     // ==========================
-    const PROGRESS_CARD = '[ENTITY_GEN] In Progress';
+    const PROGRESS_CARD = '[GW] In Progress';
     const TEMPLATE_PREFIX = '[GW Template]';
     const CONFIG_AND_PROMPTS_CARD = '[GENERATION_CONFIG]';
     const HIDDEN_OUTPUT = '\n<<<The GM is thinking, please hit continue... (Use `/GW abort` if needed, this prompting is still being worked on)>>>\n';
@@ -6738,21 +6738,25 @@ function GenerationWizard(hook, text) {
         let entry = `# Generating ${progress.entityType}\n\n`;
         
         const activeFields = progress.templateFields || [];
-        const completedCount = Object.keys(progress.collectedData).filter(key => 
-            key !== 'name' && key !== 'QUEST_TYPE' && key !== 'QUEST_GIVER' && key !== 'STAGE_COUNT' && key !== 'REWARDS_PARSED'
-        ).length;
         
-        // Calculate total fields based on entity type
+        // For quests, we need to count differently since some fields are predefined
+        let completedCount;
         let totalFields;
+        
         if (progress.entityType === 'Quest') {
-            // For quests, add 2 for STAGES and REWARDS which are handled specially
-            totalFields = activeFields.filter(f => f.name !== 'STAGES' && f.name !== 'REWARDS').length + 2;
+            // Count only the non-predefined fields that we actually ask for
+            const fieldsToCount = ['DESCRIPTION', 'STAGES', 'REWARDS'];
+            completedCount = fieldsToCount.filter(field => progress.collectedData[field]).length;
+            totalFields = fieldsToCount.length;
         } else {
-            // For other entities, just count the template fields
+            // For other entities, count all fields except internal ones
+            completedCount = Object.keys(progress.collectedData).filter(key => 
+                key !== 'name' && key !== 'REWARDS_PARSED'
+            ).length;
             totalFields = activeFields.length;
         }
         
-        entry += `**Progress:** ${completedCount} of ~${totalFields} fields collected\n\n`;
+        entry += `**Progress:** ${completedCount} of ${totalFields} fields collected\n\n`;
         
         // Show collected data
         if (completedCount > 0) {
@@ -6792,10 +6796,10 @@ function GenerationWizard(hook, text) {
         // Build the CONTEXT section - what we already know
         let contextSection = '==== CONTEXT (Already Provided) ====\n';
         contextSection += '**Quest Information:**\n';
-        contextSection += `Name: ${collectedData.NAME}\n`;
-        contextSection += `Giver: ${collectedData.QUEST_GIVER}\n`;
-        contextSection += `Type: ${questType}\n`;
-        contextSection += `Stages: ${stageCount}\n`;
+        contextSection += `Name: ${collectedData.NAME || 'Not specified'}\n`;
+        contextSection += `Giver: ${collectedData.QUEST_GIVER || 'Not specified'}\n`;
+        contextSection += `Type: ${questType || 'Not specified'}\n`;
+        contextSection += `Stages: ${stageCount || 'Not specified'}\n`;
         
         // Add collected fields to context
         if (collectedData.DESCRIPTION) {
@@ -6978,6 +6982,13 @@ function GenerationWizard(hook, text) {
         
         // Special handling for specific fields
         if (field.name === 'NAME') {
+            // CRITICAL: Enforce snake_case for all names to prevent system breakage
+            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            
+            if (snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
+                if (debug) console.log(`${MODULE_NAME}: Converting NAME to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
+            }
+            
             // Check for duplicate usernames in existing characters
             const existingCharacters = Utilities.storyCard.find((card) => {
                 return card.type === 'character' || 
@@ -6987,13 +6998,48 @@ function GenerationWizard(hook, text) {
             for (const character of existingCharacters) {
                 // Extract username from character header (## **Username**)
                 const headerMatch = character.entry.match(/^##\s+\*\*([^*]+)\*\*/);
-                if (headerMatch && headerMatch[1].toLowerCase() === trimmedValue.toLowerCase()) {
+                if (headerMatch && headerMatch[1].toLowerCase() === snakeCased) {
                     return { 
                         valid: false, 
-                        error: `Username "${trimmedValue}" already exists. Please provide a different username.` 
+                        error: `Username "${snakeCased}" already exists. Please provide a different username.` 
                     };
                 }
             }
+            
+            // Return the snake_cased version
+            return { valid: true, value: snakeCased };
+        }
+        
+        // Enforce snake_case for quest givers too
+        if (field.name === 'QUEST_GIVER') {
+            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            if (debug && snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
+                console.log(`${MODULE_NAME}: Converting QUEST_GIVER to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
+            }
+            return { valid: true, value: snakeCased };
+        }
+        
+        // Validate DESCRIPTION has meaningful content (more than 2 words)
+        if (field.name === 'DESCRIPTION') {
+            const wordCount = trimmedValue.split(/\s+/).filter(word => word.length > 0).length;
+            if (wordCount < 3) {
+                return { valid: false, error: 'Description must be at least 3 words (got "' + trimmedValue + '")' };
+            }
+            return { valid: true, value: trimmedValue };
+        }
+        
+        // Validate STAGES is not just a number or too short
+        if (field.name === 'STAGES') {
+            // Check if it's just a number
+            if (/^\d+$/.test(trimmedValue)) {
+                return { valid: false, error: 'STAGES cannot be just a number (got "' + trimmedValue + '")' };
+            }
+            // Check if it has actual stage content (should have numbered items)
+            const hasStageContent = /\d+[\.\:\-\)]\s*.+/i.test(trimmedValue);
+            if (!hasStageContent) {
+                return { valid: false, error: 'STAGES must contain numbered objectives (got "' + trimmedValue + '")' };
+            }
+            return { valid: true, value: trimmedValue };
         }
         
         if (field.name === 'GENDER') {
@@ -7324,6 +7370,11 @@ function GenerationWizard(hook, text) {
                     progress.currentBatch = activeFields.map(f => f.name);
                     saveProgress(progress);
                     
+                    if (debug) {
+                        console.log(`${MODULE_NAME}: Adding batch prompt to context for fields: ${activeFields.map(f => f.name).join(', ')}`);
+                        console.log(`${MODULE_NAME}: Full prompt injection:\n${batchPrompt}`);
+                    }
+                    
                     return {
                         active: true,
                         text: text + batchPrompt
@@ -7430,7 +7481,7 @@ function GenerationWizard(hook, text) {
                         }
                     }
                     
-                    // Parse stages (Quest only)
+                    // Parse stages (Quest only) - Special handling to avoid false matches
                     if (progress.entityType === 'Quest' && !progress.collectedData.STAGES) {
                         // Ensure stageCollection is initialized
                         if (!progress.stageCollection) {
@@ -7440,8 +7491,24 @@ function GenerationWizard(hook, text) {
                             };
                         }
                         
+                        // Look for the actual STAGES section, not summary lines
+                        // Find where "STAGES:" appears on its own line (not "Stages: 3")
+                        const stagesIndex = text.search(/^STAGES:\s*$/m);
+                        let stageText = text;
+                        
+                        if (stagesIndex !== -1) {
+                            // Extract everything after "STAGES:" line
+                            stageText = text.substring(stagesIndex);
+                            // Stop at "REWARDS:" if present
+                            const rewardsIndex = stageText.search(/^REWARDS:\s*$/m);
+                            if (rewardsIndex > 0) {
+                                stageText = stageText.substring(0, rewardsIndex);
+                            }
+                            if (debug) console.log(`${MODULE_NAME}: Extracted stage section for parsing`);
+                        }
+                        
                         const stages = parseStageResponse(
-                            text,
+                            stageText,
                             progress.stageCollection.stageCount,
                             progress.stageCollection.stages
                         );
@@ -7452,11 +7519,15 @@ function GenerationWizard(hook, text) {
                         progress.stageCollection.stages = stages;
                         
                         if (allValid) {
-                            progress.collectedData.STAGES = formatStagesForCard(
+                            const formattedStages = formatStagesForCard(
                                 stages,
                                 progress.stageCollection.stageCount
                             );
-                            if (debug) console.log(`${MODULE_NAME}: All ${progress.stageCollection.stageCount} stages collected`);
+                            progress.collectedData.STAGES = formattedStages;
+                            if (debug) {
+                                console.log(`${MODULE_NAME}: All ${progress.stageCollection.stageCount} stages collected`);
+                                console.log(`${MODULE_NAME}: Formatted stages:\n${formattedStages}`);
+                            }
                         } else {
                             allFieldsCollected = false;
                             if (debug) console.log(`${MODULE_NAME}: Stage validation failed, will retry`);
@@ -7497,8 +7568,22 @@ function GenerationWizard(hook, text) {
                     }
                     
                     // Check if ALL fields are now collected (not just from this response)
-                    const remainingFields = getActiveFields(progress.templateFields, progress.collectedData);
-                    console.log(`${MODULE_NAME}: After batch processing - Remaining fields: ${remainingFields.length}`);
+                    // For quests, we need to check DESCRIPTION, STAGES, and REWARDS specifically
+                    let remainingFields = [];
+                    let remainingFieldNames = '';
+                    
+                    if (progress.entityType === 'Quest') {
+                        // Check the three required quest fields
+                        const requiredQuestFields = ['DESCRIPTION', 'STAGES', 'REWARDS'];
+                        const missingQuestFields = requiredQuestFields.filter(f => !progress.collectedData[f]);
+                        remainingFields = missingQuestFields.map(name => ({ name }));
+                        remainingFieldNames = missingQuestFields.join(', ');
+                    } else {
+                        remainingFields = getActiveFields(progress.templateFields, progress.collectedData);
+                        remainingFieldNames = remainingFields.map(f => f.name).join(', ');
+                    }
+                    
+                    console.log(`${MODULE_NAME}: After batch processing - Remaining fields: ${remainingFields.length}${remainingFields.length > 0 ? ` (${remainingFieldNames})` : ''}`);
                     console.log(`${MODULE_NAME}: Collected so far: ${JSON.stringify(Object.keys(progress.collectedData))}`);
                     
                     if (remainingFields.length === 0) {
@@ -7772,6 +7857,11 @@ function GenerationWizard(hook, text) {
         // Flatten nested properties for template processing
         const flatData = {...collectedData};
         
+        if (debug && flatData.STAGES !== undefined) {
+            console.log(`${MODULE_NAME}: processTemplate - STAGES value: "${flatData.STAGES}"`);
+            console.log(`${MODULE_NAME}: processTemplate - STAGES type: ${typeof flatData.STAGES}`);
+        }
+        
         // Handle hp object specially
         if (collectedData.hp && typeof collectedData.hp === 'object') {
             flatData['hp.current'] = collectedData.hp.current || 100;
@@ -7970,7 +8060,7 @@ function GenerationWizard(hook, text) {
         if (triggerNameStr && triggerNameStr !== name) {
             keysList.push(triggerNameStr);
         }
-        const keys = keysList.join(', ') + ' ';
+        const keys = keysList.join(', ');
         
         // Create the story card
         let description = `Generated by GenerationWizard on turn ${info?.actionCount || 0}`;
@@ -7999,7 +8089,7 @@ function GenerationWizard(hook, text) {
             title: '[GW Template] NPC',
             type: 'data',
             entry: (
-                `## **{{NAME}}**{{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
+                `## **{{NAME}}** {{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
                 `DOB: {{DOB}} | Gender: {{GENDER}} | HP: {{hp.current}}/{{hp.max}} | Level {{LEVEL}} (0/{{XP_MAX}} XP) | Current Location: {{LOCATION}}\n` +
                 `### Appearance\n` +
                 `Hair: {{HAIR}} | Eyes: {{EYES}} | Build: {{BUILD}}\n` +
@@ -8560,48 +8650,6 @@ function GenerationWizard(hook, text) {
             return true;
         };
         
-        // Generic start generation method for any entity type
-        GenerationWizard.startGeneration = function(entityType, triggerName, initialData) {
-            if (!entityType) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid entity type`);
-                return false;
-            }
-            
-            if (isGenerationActive()) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return false;
-            }
-            
-            // Check if template exists
-            const template = loadTemplate(entityType);
-            if (!template) {
-                if (debug) console.log(`${MODULE_NAME}: Template not found for ${entityType}`);
-                return false;
-            }
-            
-            // Parse template fields
-            let templateFields = parseTemplateFields(template.description);
-            
-            // Create progress object
-            const progress = {
-                entityType: entityType,
-                entityName: initialData?.NAME || triggerName || 'Unknown',
-                triggerName: triggerName,
-                stage: 'generation',
-                collectedData: initialData || {},
-                templateFields: templateFields,
-                metadata: initialData?.metadata || {},
-                completed: false,
-                currentBatch: null,
-                branchResolved: true,
-                startTurn: info?.actionCount || 0,
-                expectingBatch: entityType === 'NPC' || entityType === 'Location'
-            };
-            
-            saveProgress(progress);
-            if (debug) console.log(`${MODULE_NAME}: Started ${entityType} generation`);
-            return true;
-        };
     }
     
     // Handle hook-based initialization
@@ -10858,6 +10906,11 @@ function GameState(hook, text) {
             if (parsed && parsed.name) {
                 // Store with lowercase name as key
                 characterCache[parsed.name.toLowerCase()] = parsed;
+                
+                // For [PLAYER] cards, also add 'you' as a key
+                if (card.title.startsWith('[PLAYER]')) {
+                    characterCache['you'] = parsed;
+                }
             }
         }
         
@@ -11983,6 +12036,65 @@ function GameState(hook, text) {
     }
     
     // ==========================
+    // Character Name Validation
+    // ==========================
+    const INVALID_CHARACTER_NAMES = [
+        // Generic references
+        'player', 'self', 'me', 'you', 'user', 'myself', 'yourself', 
+        'him', 'her', 'them', 'they', 'it', 'this', 'that',
+        'someone', 'somebody', 'anyone', 'anybody', 'everyone', 'everybody',
+        'no_one', 'nobody', 'none', 'nothing', 'unknown', 'undefined', 'null',
+        
+        // Group references
+        'group', 'party', 'team', 'squad', 'guild', 'clan', 'faction',
+        'allies', 'enemies', 'friends', 'companions', 'members',
+        
+        // Common placeholder names
+        'name', 'character', 'person', 'npc', 'target', 'source', 
+        'giver', 'receiver', 'sender', 'recipient', 'victim', 'attacker',
+        'customer', 'merchant', 'vendor', 'shop', 'shopkeeper',
+        
+        // Common action descriptors that might be mistaken for names
+        'here', 'there', 'now', 'then', 'today', 'tomorrow', 'yesterday',
+        'all', 'some', 'any', 'other', 'another', 'each', 'every',
+        'both', 'either', 'neither', 'several', 'many', 'few',
+        
+        // System/meta references
+        'system', 'admin', 'gm', 'dm', 'gamemaster', 'dungeonmaster',
+        'narrator', 'storyteller', 'ai', 'bot', 'assistant', 'helper'
+    ];
+    
+    function isValidCharacterName(name) {
+        if (!name || typeof name !== 'string') return false;
+        
+        // Convert to lowercase for checking
+        const normalized = name.toLowerCase().trim();
+        
+        // Check if empty or just whitespace
+        if (!normalized) return false;
+        
+        // First, check if this character actually exists - if so, it's valid regardless of blacklist
+        const characters = loadAllCharacters();
+        if (characters[normalized]) {
+            return true; // Character exists, so name is valid
+        }
+        
+        // Check against blacklist
+        if (INVALID_CHARACTER_NAMES.includes(normalized)) {
+            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (blacklisted)`);
+            return false;
+        }
+        
+        // Check if it's just numbers
+        if (/^\d+$/.test(normalized)) {
+            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (only numbers)`);
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // ==========================
     // Tool Processors (converted to standard syntax)
     // ==========================
     const toolProcessors = {
@@ -12012,6 +12124,11 @@ function GameState(hook, text) {
         update_location: function(characterName, location) {
             if (!characterName || !location) return 'malformed';
             
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             characterName = String(characterName).toLowerCase();
             location = String(location).toLowerCase().replace(/\s+/g, '_');
             
@@ -12035,6 +12152,11 @@ function GameState(hook, text) {
         
         add_item: function(characterName, itemName, quantity) {
             if (!characterName || !itemName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
@@ -12066,6 +12188,11 @@ function GameState(hook, text) {
         
         remove_item: function(characterName, itemName, quantity) {
             if (!characterName || !itemName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
@@ -12105,6 +12232,11 @@ function GameState(hook, text) {
         
         transfer_item: function(giverName, receiverName, itemName, quantity) {
             if (!giverName || !receiverName || !itemName) return 'malformed';
+            
+            // Validate both character names before processing
+            if (!isValidCharacterName(giverName) || !isValidCharacterName(receiverName)) {
+                return 'malformed';
+            }
             
             giverName = String(giverName).toLowerCase();
             receiverName = String(receiverName).toLowerCase();
@@ -12176,6 +12308,11 @@ function GameState(hook, text) {
         deal_damage: function(sourceName, targetName, damageAmount) {
             if (!targetName) return 'malformed';
             
+            // Validate target name (source can be 'unknown' for environmental damage)
+            if (!isValidCharacterName(targetName)) {
+                return 'malformed';
+            }
+            
             sourceName = sourceName ? String(sourceName).toLowerCase() : 'unknown';
             targetName = String(targetName).toLowerCase();
             damageAmount = parseInt(damageAmount);
@@ -12213,6 +12350,11 @@ function GameState(hook, text) {
         add_levelxp: function(characterName, xpAmount) {
             if (!characterName) return 'malformed';
             
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             characterName = String(characterName).toLowerCase();
             xpAmount = parseInt(xpAmount);
             
@@ -12245,6 +12387,11 @@ function GameState(hook, text) {
         
         add_skillxp: function(characterName, skillName, xpAmount) {
             if (!characterName || !skillName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
@@ -12285,6 +12432,11 @@ function GameState(hook, text) {
         
         unlock_newskill: function(characterName, skillName) {
             if (!characterName || !skillName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
@@ -12330,6 +12482,11 @@ function GameState(hook, text) {
         update_attribute: function(characterName, attrName, value) {
             if (!characterName || !attrName) return 'malformed';
             
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             characterName = String(characterName).toLowerCase();
             attrName = String(attrName).toLowerCase();
             value = parseInt(value);
@@ -12368,6 +12525,11 @@ function GameState(hook, text) {
         
         update_relationship: function(name1, name2, changeAmount) {
             if (!name1 || !name2) return 'malformed';
+            
+            // Validate both character names before processing
+            if (!isValidCharacterName(name1) || !isValidCharacterName(name2)) {
+                return 'malformed';
+            }
             
             name1 = String(name1).toLowerCase();
             name2 = String(name2).toLowerCase();
@@ -12426,6 +12588,11 @@ function GameState(hook, text) {
         discover_location: function(characterName, locationName, direction) {
             // Validate inputs
             if (!characterName || !locationName || !direction) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             locationName = String(locationName).replace(/\s+/g, '_');
@@ -12590,6 +12757,10 @@ function GameState(hook, text) {
             // Must have all 4 parameters
             if (!playerName || !questName || !questGiver || !questType) return 'malformed';
             
+            // CRITICAL: Convert quest name and giver to snake_case to prevent system breakage
+            questName = String(questName).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            questGiver = String(questGiver).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            
             // Normalize quest type to lowercase - handle both "story" and "story_quest" formats
             let normalizedType = String(questType).toLowerCase();
             
@@ -12680,6 +12851,11 @@ function GameState(hook, text) {
         update_quest: function(characterName, questName, objective, progress, total) {
             if (!questName) return 'malformed';
             
+            // If characterName is provided, validate it
+            if (characterName && !isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             questName = String(questName).toLowerCase().replace(/\s+/g, '_');
             
             // Get the quest card
@@ -12710,6 +12886,11 @@ function GameState(hook, text) {
         
         complete_quest: function(characterName, questName) {
             if (!characterName || !questName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             questName = String(questName).toLowerCase().replace(/\s+/g, '_');
@@ -12764,6 +12945,11 @@ function GameState(hook, text) {
         
         death: function(characterName) {
             if (!characterName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             if (debug) console.log(`${MODULE_NAME}: Death recorded for: ${characterName}`);
@@ -12941,6 +13127,24 @@ function GameState(hook, text) {
         
         // Use provided turn number or default to 0
         const currentTurn = turnNumber || 0;
+        
+        // Clean up old entries (older than 100 turns)
+        const cutoffTurn = currentTurn - 100;
+        for (const [name, data] of Object.entries(tracker)) {
+            // Filter out turns older than cutoff
+            const recentTurns = data.uniqueTurns.filter(turn => turn > cutoffTurn);
+            
+            // If no recent turns remain, remove the entity from tracking
+            if (recentTurns.length === 0) {
+                delete tracker[name];
+                if (debug) console.log(`${MODULE_NAME}: Removed stale entity from tracker: ${name} (all turns older than ${cutoffTurn})`);
+            } else if (recentTurns.length < data.uniqueTurns.length) {
+                // Update with only recent turns
+                tracker[name].uniqueTurns = recentTurns;
+                tracker[name].count = recentTurns.length;
+                if (debug) console.log(`${MODULE_NAME}: Cleaned up old turns for ${name}: kept ${recentTurns.length} recent turns`);
+            }
+        }
         
         // Initialize entity tracking if needed
         if (!tracker[entityName]) {
@@ -13226,8 +13430,20 @@ function GameState(hook, text) {
             
             // Check if this is accept_quest and needs parameter normalization
             if (toolName === 'accept_quest' && result === 'executed') {
-                // Normalize the quest type parameter in the visible text
+                // Normalize ALL parameters in the visible text to teach the LLM proper format
                 const normalizedParams = [...params];
+                
+                // Normalize quest name (param 1)
+                if (normalizedParams[1]) {
+                    normalizedParams[1] = String(normalizedParams[1]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+                }
+                
+                // Normalize quest giver (param 2)
+                if (normalizedParams[2]) {
+                    normalizedParams[2] = String(normalizedParams[2]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+                }
+                
+                // Normalize quest type (param 3)
                 if (normalizedParams[3]) {
                     let questType = String(normalizedParams[3]).toLowerCase();
                     // Remove _quest suffix if present
@@ -13590,7 +13806,13 @@ function GameState(hook, text) {
             // Test entity generation for Quest
             gw_quest: () => {
                 if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Quest', {name: 'Debug_Test_Quest'});
+                // Quests require predefined values from accept_quest tool
+                GenerationWizard.startGeneration('Quest', {
+                    NAME: 'Debug_Test_Quest',
+                    QUEST_GIVER: 'Debug_NPC',
+                    QUEST_TYPE: 'side',
+                    STAGE_COUNT: 3
+                });
                 return "\n<<<Started Quest generation for Debug_Test_Quest>>>\n";
             },
             

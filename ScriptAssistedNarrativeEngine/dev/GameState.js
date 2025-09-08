@@ -2234,6 +2234,11 @@ function GameState(hook, text) {
             if (parsed && parsed.name) {
                 // Store with lowercase name as key
                 characterCache[parsed.name.toLowerCase()] = parsed;
+                
+                // For [PLAYER] cards, also add 'you' as a key
+                if (card.title.startsWith('[PLAYER]')) {
+                    characterCache['you'] = parsed;
+                }
             }
         }
         
@@ -3359,6 +3364,65 @@ function GameState(hook, text) {
     }
     
     // ==========================
+    // Character Name Validation
+    // ==========================
+    const INVALID_CHARACTER_NAMES = [
+        // Generic references
+        'player', 'self', 'me', 'you', 'user', 'myself', 'yourself', 
+        'him', 'her', 'them', 'they', 'it', 'this', 'that',
+        'someone', 'somebody', 'anyone', 'anybody', 'everyone', 'everybody',
+        'no_one', 'nobody', 'none', 'nothing', 'unknown', 'undefined', 'null',
+        
+        // Group references
+        'group', 'party', 'team', 'squad', 'guild', 'clan', 'faction',
+        'allies', 'enemies', 'friends', 'companions', 'members',
+        
+        // Common placeholder names
+        'name', 'character', 'person', 'npc', 'target', 'source', 
+        'giver', 'receiver', 'sender', 'recipient', 'victim', 'attacker',
+        'customer', 'merchant', 'vendor', 'shop', 'shopkeeper',
+        
+        // Common action descriptors that might be mistaken for names
+        'here', 'there', 'now', 'then', 'today', 'tomorrow', 'yesterday',
+        'all', 'some', 'any', 'other', 'another', 'each', 'every',
+        'both', 'either', 'neither', 'several', 'many', 'few',
+        
+        // System/meta references
+        'system', 'admin', 'gm', 'dm', 'gamemaster', 'dungeonmaster',
+        'narrator', 'storyteller', 'ai', 'bot', 'assistant', 'helper'
+    ];
+    
+    function isValidCharacterName(name) {
+        if (!name || typeof name !== 'string') return false;
+        
+        // Convert to lowercase for checking
+        const normalized = name.toLowerCase().trim();
+        
+        // Check if empty or just whitespace
+        if (!normalized) return false;
+        
+        // First, check if this character actually exists - if so, it's valid regardless of blacklist
+        const characters = loadAllCharacters();
+        if (characters[normalized]) {
+            return true; // Character exists, so name is valid
+        }
+        
+        // Check against blacklist
+        if (INVALID_CHARACTER_NAMES.includes(normalized)) {
+            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (blacklisted)`);
+            return false;
+        }
+        
+        // Check if it's just numbers
+        if (/^\d+$/.test(normalized)) {
+            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (only numbers)`);
+            return false;
+        }
+        
+        return true;
+    }
+    
+    // ==========================
     // Tool Processors (converted to standard syntax)
     // ==========================
     const toolProcessors = {
@@ -3388,6 +3452,11 @@ function GameState(hook, text) {
         update_location: function(characterName, location) {
             if (!characterName || !location) return 'malformed';
             
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             characterName = String(characterName).toLowerCase();
             location = String(location).toLowerCase().replace(/\s+/g, '_');
             
@@ -3411,6 +3480,11 @@ function GameState(hook, text) {
         
         add_item: function(characterName, itemName, quantity) {
             if (!characterName || !itemName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
@@ -3442,6 +3516,11 @@ function GameState(hook, text) {
         
         remove_item: function(characterName, itemName, quantity) {
             if (!characterName || !itemName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
@@ -3481,6 +3560,11 @@ function GameState(hook, text) {
         
         transfer_item: function(giverName, receiverName, itemName, quantity) {
             if (!giverName || !receiverName || !itemName) return 'malformed';
+            
+            // Validate both character names before processing
+            if (!isValidCharacterName(giverName) || !isValidCharacterName(receiverName)) {
+                return 'malformed';
+            }
             
             giverName = String(giverName).toLowerCase();
             receiverName = String(receiverName).toLowerCase();
@@ -3552,6 +3636,11 @@ function GameState(hook, text) {
         deal_damage: function(sourceName, targetName, damageAmount) {
             if (!targetName) return 'malformed';
             
+            // Validate target name (source can be 'unknown' for environmental damage)
+            if (!isValidCharacterName(targetName)) {
+                return 'malformed';
+            }
+            
             sourceName = sourceName ? String(sourceName).toLowerCase() : 'unknown';
             targetName = String(targetName).toLowerCase();
             damageAmount = parseInt(damageAmount);
@@ -3589,6 +3678,11 @@ function GameState(hook, text) {
         add_levelxp: function(characterName, xpAmount) {
             if (!characterName) return 'malformed';
             
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             characterName = String(characterName).toLowerCase();
             xpAmount = parseInt(xpAmount);
             
@@ -3621,6 +3715,11 @@ function GameState(hook, text) {
         
         add_skillxp: function(characterName, skillName, xpAmount) {
             if (!characterName || !skillName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
@@ -3661,6 +3760,11 @@ function GameState(hook, text) {
         
         unlock_newskill: function(characterName, skillName) {
             if (!characterName || !skillName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
@@ -3706,6 +3810,11 @@ function GameState(hook, text) {
         update_attribute: function(characterName, attrName, value) {
             if (!characterName || !attrName) return 'malformed';
             
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             characterName = String(characterName).toLowerCase();
             attrName = String(attrName).toLowerCase();
             value = parseInt(value);
@@ -3744,6 +3853,11 @@ function GameState(hook, text) {
         
         update_relationship: function(name1, name2, changeAmount) {
             if (!name1 || !name2) return 'malformed';
+            
+            // Validate both character names before processing
+            if (!isValidCharacterName(name1) || !isValidCharacterName(name2)) {
+                return 'malformed';
+            }
             
             name1 = String(name1).toLowerCase();
             name2 = String(name2).toLowerCase();
@@ -3802,6 +3916,11 @@ function GameState(hook, text) {
         discover_location: function(characterName, locationName, direction) {
             // Validate inputs
             if (!characterName || !locationName || !direction) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             locationName = String(locationName).replace(/\s+/g, '_');
@@ -3966,6 +4085,10 @@ function GameState(hook, text) {
             // Must have all 4 parameters
             if (!playerName || !questName || !questGiver || !questType) return 'malformed';
             
+            // CRITICAL: Convert quest name and giver to snake_case to prevent system breakage
+            questName = String(questName).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            questGiver = String(questGiver).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            
             // Normalize quest type to lowercase - handle both "story" and "story_quest" formats
             let normalizedType = String(questType).toLowerCase();
             
@@ -4056,6 +4179,11 @@ function GameState(hook, text) {
         update_quest: function(characterName, questName, objective, progress, total) {
             if (!questName) return 'malformed';
             
+            // If characterName is provided, validate it
+            if (characterName && !isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
+            
             questName = String(questName).toLowerCase().replace(/\s+/g, '_');
             
             // Get the quest card
@@ -4086,6 +4214,11 @@ function GameState(hook, text) {
         
         complete_quest: function(characterName, questName) {
             if (!characterName || !questName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             questName = String(questName).toLowerCase().replace(/\s+/g, '_');
@@ -4140,6 +4273,11 @@ function GameState(hook, text) {
         
         death: function(characterName) {
             if (!characterName) return 'malformed';
+            
+            // Validate character name before processing
+            if (!isValidCharacterName(characterName)) {
+                return 'malformed';
+            }
             
             characterName = String(characterName).toLowerCase();
             if (debug) console.log(`${MODULE_NAME}: Death recorded for: ${characterName}`);
@@ -4317,6 +4455,24 @@ function GameState(hook, text) {
         
         // Use provided turn number or default to 0
         const currentTurn = turnNumber || 0;
+        
+        // Clean up old entries (older than 100 turns)
+        const cutoffTurn = currentTurn - 100;
+        for (const [name, data] of Object.entries(tracker)) {
+            // Filter out turns older than cutoff
+            const recentTurns = data.uniqueTurns.filter(turn => turn > cutoffTurn);
+            
+            // If no recent turns remain, remove the entity from tracking
+            if (recentTurns.length === 0) {
+                delete tracker[name];
+                if (debug) console.log(`${MODULE_NAME}: Removed stale entity from tracker: ${name} (all turns older than ${cutoffTurn})`);
+            } else if (recentTurns.length < data.uniqueTurns.length) {
+                // Update with only recent turns
+                tracker[name].uniqueTurns = recentTurns;
+                tracker[name].count = recentTurns.length;
+                if (debug) console.log(`${MODULE_NAME}: Cleaned up old turns for ${name}: kept ${recentTurns.length} recent turns`);
+            }
+        }
         
         // Initialize entity tracking if needed
         if (!tracker[entityName]) {
@@ -4602,8 +4758,20 @@ function GameState(hook, text) {
             
             // Check if this is accept_quest and needs parameter normalization
             if (toolName === 'accept_quest' && result === 'executed') {
-                // Normalize the quest type parameter in the visible text
+                // Normalize ALL parameters in the visible text to teach the LLM proper format
                 const normalizedParams = [...params];
+                
+                // Normalize quest name (param 1)
+                if (normalizedParams[1]) {
+                    normalizedParams[1] = String(normalizedParams[1]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+                }
+                
+                // Normalize quest giver (param 2)
+                if (normalizedParams[2]) {
+                    normalizedParams[2] = String(normalizedParams[2]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+                }
+                
+                // Normalize quest type (param 3)
                 if (normalizedParams[3]) {
                     let questType = String(normalizedParams[3]).toLowerCase();
                     // Remove _quest suffix if present
@@ -4966,7 +5134,13 @@ function GameState(hook, text) {
             // Test entity generation for Quest
             gw_quest: () => {
                 if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Quest', {name: 'Debug_Test_Quest'});
+                // Quests require predefined values from accept_quest tool
+                GenerationWizard.startGeneration('Quest', {
+                    NAME: 'Debug_Test_Quest',
+                    QUEST_GIVER: 'Debug_NPC',
+                    QUEST_TYPE: 'side',
+                    STAGE_COUNT: 3
+                });
                 return "\n<<<Started Quest generation for Debug_Test_Quest>>>\n";
             },
             
