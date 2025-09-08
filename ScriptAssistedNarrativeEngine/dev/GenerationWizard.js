@@ -1882,19 +1882,19 @@ function GenerationWizard(hook, text) {
             entry: (
                 `## **{{NAME}}** {{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
                 `DOB: {{DOB}} | Gender: {{GENDER}} | HP: {{hp.current}}/{{hp.max}} | Level {{LEVEL}} (0/{{XP_MAX}} XP) | Current Location: {{LOCATION}}\n` +
-                `### Appearance\n` +
+                `**Appearance**\n` +
                 `Hair: {{HAIR}} | Eyes: {{EYES}} | Build: {{BUILD}}\n` +
-                `### Personality\n` +
+                `**Personality**\n` +
                 `{{PERSONALITY}}\n` +
-                `### Background\n` +
+                `**Background**\n` +
                 `{{BACKGROUND}}\n` +
-                `### Attributes\n` +
+                `**Attributes**\n` +
                 `VITALITY: {{VITALITY}} | STRENGTH: {{STRENGTH}} | DEXTERITY: {{DEXTERITY}} | AGILITY: {{AGILITY}}\n` +
-                `### Skills\n` +
+                `**Skills**\n` +
                 `{{SKILLS}}\n` +
-                `### Inventory\n` +
+                `**Inventory**\n` +
                 `{}\n` +
-                `### Relationships\n`
+                `**Relationships**\n`
             ),
             description: (
                 `// NPC Generation\n` +
@@ -1927,9 +1927,9 @@ function GenerationWizard(hook, text) {
                 `<$# Locations>\n` +
                 `## **{{NAME}}**\n` +
                 `Type: {{LOCATION_TYPE}} | Terrain: {{TERRAIN}}\n` +
-                `### Description\n` +
+                `**Description**\n` +
                 `{{DESCRIPTION}}\n` +
-                `### Pathways\n` +
+                `**Pathways**\n` +
                 `{{PATHWAYS}}`
             ),
             description: (
@@ -1950,11 +1950,11 @@ function GenerationWizard(hook, text) {
                 `<\$# Quests><\$## Active Quests>\n` +
                 `## **{{NAME}}**\n` +
                 `Type: {{QUEST_TYPE}} | Giver: {{QUEST_GIVER}} | Current Stage: 0\n` +
-                `### Description\n` +
+                `**Description**\n` +
                 `{{DESCRIPTION}}\n` +
-                `### Stages\n` +
+                `**Stages**\n` +
                 `{{STAGES}}\n` +
-                `### Rewards\n` +
+                `**Rewards**\n` +
                 `{{REWARDS}}`
             ),
             description: (

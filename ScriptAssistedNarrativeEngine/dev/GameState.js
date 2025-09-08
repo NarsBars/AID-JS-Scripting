@@ -4,6 +4,33 @@ function GameState(hook, text) {
     const debug = true;
     const MODULE_NAME = 'GameState';
     
+    // Check for automatic cleanup FIRST before any processing
+    const stateSize = JSON.stringify(state).length;
+    if (stateSize > 60000) {
+        if (debug) {
+            console.log(`${MODULE_NAME}: State size ${Math.round(stateSize/1000)}KB exceeds 60KB limit - performing automatic cleanup`);
+        }
+        
+        // Reset debug logs
+        if (state.debugLog) {
+            state.debugLog = {
+                turns: [],
+                allErrors: state.debugLog.allErrors ? state.debugLog.allErrors.slice(-10) : [], // Keep only last 10 errors
+                lastRewindData: null // Clear rewind data too
+            };
+        }
+        
+        // Clear rewind backups
+        if (state.rewindBackups) {
+            delete state.rewindBackups;
+        }
+        
+        // Trim execution times
+        if (state.times && state.times.length > 20) {
+            state.times = state.times.slice(-20);
+        }
+    }
+    
     // Entity generation tracking 
     let currentEntityGeneration = null;
     
@@ -12,6 +39,338 @@ function GameState(hook, text) {
     
     // Getter pattern: get_something(parameters)
     const GETTER_PATTERN = /get_[a-z_]+\s*\([^)]*\)/gi;
+    
+    // ==========================
+    // Debug Logging System
+    // ==========================
+    const MAX_DEBUG_TURNS = 20; // Keep only last 20 turns
+    
+    function initDebugLogging() {
+        if (!debug) return;
+        
+        // Initialize debug log structure in state if needed
+        if (!state.debugLog) {
+            state.debugLog = {
+                turns: [],  // Array of turn data
+                allErrors: []  // Track ALL errors throughout the entire adventure
+            };
+        }
+        
+        // Ensure allErrors exists even for existing debug logs
+        if (!state.debugLog.allErrors) {
+            state.debugLog.allErrors = [];
+        }
+    }
+    
+    function logError(error, context = '') {
+        if (!debug) return;
+        
+        if (!state.debugLog) {
+            initDebugLogging();
+        }
+        
+        const errorEntry = {
+            actionCount: state.actionCount || 0,
+            error: error.toString(),
+            stack: error.stack || '',
+            context: context,
+            timestamp: new Date().toISOString()
+        };
+        
+        state.debugLog.allErrors.push(errorEntry);
+        
+        // Keep only last 100 errors to prevent state bloat
+        if (state.debugLog.allErrors.length > 100) {
+            state.debugLog.allErrors = state.debugLog.allErrors.slice(-100);
+        }
+    }
+    
+    // Track processing events for this turn
+    let currentTurnEvents = [];
+    
+    function logEvent(message) {
+        if (!debug) return;
+        currentTurnEvents.push(message);
+        // Don't console.log here - caller will do that separately
+    }
+    
+    function logDebugTurn(hook, inputText, outputText, extraData = {}) {
+        if (!debug) return;
+        
+        initDebugLogging();
+        
+        const turnData = {
+            hook: hook,
+            actionCount: info?.actionCount || state.actionCount || 0,
+            timestamp: new Date().toISOString(),
+            events: [...currentTurnEvents], // Capture all events for this turn
+            ...extraData
+        };
+        
+        // Clear events after capturing
+        currentTurnEvents = [];
+        
+        // Store different data based on hook
+        if (hook === 'input') {
+            turnData.inputSummary = inputText ? inputText.substring(0, 100) : '';
+            // Track any commands processed
+            if (inputText && inputText.includes('/')) {
+                turnData.commandDetected = true;
+            }
+        } else if (hook === 'context') {
+            // Track context size and key indicators
+            turnData.contextSize = inputText ? inputText.length : 0;
+        } else if (hook === 'output') {
+            // Store ONLY the raw output
+            turnData.rawOutput = extraData.rawOutput || outputText || '';
+            turnData.outputSize = turnData.rawOutput.length;
+            
+            // Check for tools in output
+            const toolMatches = outputText ? outputText.match(/([a-z_]+)\s*\([^)]*\)/gi) : [];
+            if (toolMatches && toolMatches.length > 0) {
+                turnData.toolsInOutput = toolMatches;
+            }
+            
+            // Capture ENTIRE RewindSystem data from all Story Cards
+            let rewindData = {
+                cards: [],
+                totalEntries: 0,
+                position: -1
+            };
+            
+            try {
+                const rewindCards = RewindSystem.getAllCards();
+                rewindCards.forEach(card => {
+                    // Store complete card data including title and all entries
+                    const cardData = {
+                        title: card.title,
+                        entries: card.data ? card.data.entries : [],
+                        position: card.data ? card.data.position : -1
+                    };
+                    rewindData.cards.push(cardData);
+                    rewindData.totalEntries += cardData.entries.length;
+                    if (cardData.position > rewindData.position) {
+                        rewindData.position = cardData.position;
+                    }
+                });
+            } catch (e) {
+                // If cards are deleted or corrupted, at least we tried
+                rewindData.error = e.toString();
+                logError(e, 'Failed to read RewindSystem cards');
+            }
+            
+            // Store the ENTIRE RewindSystem data in state
+            turnData.rewindData = rewindData;
+            
+            // Track state size at this point
+            turnData.stateSizeAtTurn = JSON.stringify(state).length;
+        }
+        
+        // Only store turns that have meaningful data
+        const hasEvents = turnData.events && turnData.events.length > 0;
+        const hasTools = turnData.toolsExecuted && turnData.toolsExecuted.length > 0;
+        const hasInput = turnData.hook === 'input' && (turnData.commandDetected || turnData.inputSummary?.startsWith('/'));
+        const hasEntityQueued = turnData.entityQueued;
+        const hasGenerationWizard = turnData.generationWizardActive;
+        
+        // Skip storing empty context hooks and output hooks with only "Loaded 1 runtime tools"
+        const isEmptyContext = turnData.hook === 'context' && !hasEvents;
+        const isBoringOutput = turnData.hook === 'output' && 
+            !hasTools && !hasEntityQueued && !hasGenerationWizard &&
+            (!hasEvents || (turnData.events.length === 1 && turnData.events[0].includes('Loaded 1 runtime tools')));
+        
+        if (!isEmptyContext && !isBoringOutput) {
+            // This turn has meaningful data, store it
+            state.debugLog.turns.push(turnData);
+            
+            // Keep only last MAX_DEBUG_TURNS
+            if (state.debugLog.turns.length > MAX_DEBUG_TURNS) {
+                state.debugLog.turns = state.debugLog.turns.slice(-MAX_DEBUG_TURNS);
+            }
+        }
+        
+        // Always store RewindSystem data in a separate location for the last turn only
+        // This ensures we have it for debugging without bloating the turn history
+        state.debugLog.lastRewindData = turnData.rewindData;
+    }
+    
+    function outputDebugLog() {
+        if (!debug) {
+            return "Debug mode is not enabled. Set debug = true in GameState.js to enable debug logging.";
+        }
+        
+        if (!state.debugLog || !state.debugLog.turns || state.debugLog.turns.length === 0) {
+            return "No debug logs available yet.";
+        }
+        
+        // Build comprehensive debug output
+        let output = `# Debug Log Report\n`;
+        output += `Generated: ${new Date().toISOString()}\n\n`;
+        
+        output += `## Recent Actions\n\n`;
+        
+        state.debugLog.turns.forEach((turn, index) => {
+            // Skip input hooks entirely
+            if (turn.hook === 'input') {
+                return; // Skip all input hooks
+            }
+            
+            // Skip context hooks that have no events or useful info
+            if (turn.hook === 'context' && (!turn.events || turn.events.length === 0)) {
+                return; // Skip this turn entirely
+            }
+            
+            // Skip output hooks that only loaded runtime tools and nothing else
+            if (turn.hook === 'output' && turn.events && turn.events.length === 1 && 
+                turn.events[0].includes('Loaded 1 runtime tools') &&
+                !turn.entityQueued && !turn.generationWizardActive) {
+                return; // Skip this turn entirely
+            }
+            
+            output += `### Action ${turn.actionCount} - ${turn.hook.toUpperCase()} Hook\n`;
+            
+            // Show hook-specific debug info
+            if (turn.hook === 'output') {
+                // Extra flags only
+                if (turn.entityQueued) output += `Entity Queued: ${turn.entityQueued}\n`;
+                if (turn.generationWizardActive) output += `GenerationWizard Active: ${turn.generationWizardActive}\n`;
+            }
+            
+            // Show processing events for this turn
+            if (turn.events && turn.events.length > 0) {
+                output += `\n#### Processing Events:\n`;
+                turn.events.forEach(event => {
+                    output += `${event}\n`;
+                });
+            }
+            
+            output += `\n---\n`;
+        });
+        
+        // Get COMPLETE RewindSystem data from the separate storage
+        let latestRewindData = state.debugLog.lastRewindData;
+        
+        // Add RewindSystem data
+        output += `## Rewind System Data\n\n`;
+        
+        if (latestRewindData) {
+            if (latestRewindData.error) {
+                output += `ERROR: ${latestRewindData.error}\n\n`;
+            }
+            
+            // Show each card and ALL its entries
+            latestRewindData.cards.forEach((card, cardIndex) => {
+                output += `### ${card.title} (${card.entries.length} entries, position: ${card.position})\n`;
+                
+                if (card.entries.length > 0) {
+                    card.entries.forEach((entry, entryIndex) => {
+                        output += `[${entryIndex}]: `;
+                        if (entry) {
+                            if (entry.h) output += `hash:${entry.h.substring(0, 8)} `;
+                            if (entry.t && entry.t.length > 0) {
+                                const toolList = entry.t.map(t => {
+                                    if (Array.isArray(t)) {
+                                        return `${t[0]}(${t[1] ? t[1].join(',') : ''})`;
+                                    }
+                                    return String(t);
+                                }).join(', ');
+                                output += `tools:[${toolList}]`;
+                            } else {
+                                output += `no tools`;
+                            }
+                        } else {
+                            output += `null entry`;
+                        }
+                        output += `\n`;
+                    });
+                } else {
+                    output += `(no entries)\n`;
+                }
+                output += `\n`;
+            });
+        } else {
+            output += `No rewind data found in stored turns.\n\n`;
+        }
+        
+        output += `---\n`;
+        
+        // Add ALL ERRORS from the entire adventure
+        if (state.debugLog.allErrors && state.debugLog.allErrors.length > 0) {
+            output += `## ALL ERRORS (Entire Adventure)\n\n`;
+            output += `Total Errors: ${state.debugLog.allErrors.length}\n\n`;
+            
+            state.debugLog.allErrors.forEach((err, index) => {
+                output += `### Error ${index + 1} (Action ${err.actionCount})\n`;
+                output += `Time: ${err.timestamp}\n`;
+                output += `Context: ${err.context}\n`;
+                output += `Error: ${err.error}\n`;
+                if (err.stack) {
+                    output += `Stack:\n\`\`\`\n${err.stack}\n\`\`\`\n`;
+                }
+                output += `\n`;
+            });
+            output += `---\n`;
+        }
+        
+        // Add execution times
+        if (state.times && state.times.length > 0) {
+            // Get last 100 times for analysis
+            const recentTimes = state.times.slice(-100);
+            
+            // Find the 10 highest times with their turn numbers
+            const timesWithTurns = recentTimes.map((time, index) => ({
+                turn: state.times.length - recentTimes.length + index + 1,
+                time: time
+            }));
+            
+            // Sort by time descending and take top 10
+            const highestTimes = [...timesWithTurns]
+                .sort((a, b) => b.time - a.time)
+                .slice(0, 10);
+            
+            output += `## Execution Times (Highest 10 from last ${recentTimes.length})\n`;
+            highestTimes.forEach(entry => {
+                output += `${entry.turn}: ${entry.time}ms\n`;
+            });
+            
+            const avgTime = recentTimes.reduce((a, b) => a + b, 0) / recentTimes.length;
+            output += `Average (last ${recentTimes.length}): ${Math.round(avgTime)}ms`;
+        }
+        
+        // Save to Story Card using upsert
+        const debugCard = {
+            title: '[DEBUG] Debug Log',
+            type: 'data',
+            description: output,
+            entry: `Debug log generated at ${new Date().toISOString()}\nUse /debug_log to update this card.`
+        };
+        
+        Utilities.storyCard.upsert(debugCard);
+        
+        // Pin debug card to top for easy access
+        try {
+            const debugCardObj = Utilities.storyCard.get('[DEBUG] Debug Log');
+            if (debugCardObj && typeof worldInfo !== 'undefined' && worldInfo.length > 1) {
+                // Sort by update time (newest first)
+                worldInfo.sort((a, b) => {
+                    const timeA = a.updatedAt ? Date.parse(a.updatedAt) : 0;
+                    const timeB = b.updatedAt ? Date.parse(b.updatedAt) : 0;
+                    return timeB - timeA;
+                });
+                
+                // Move debug card to top
+                const debugIndex = worldInfo.findIndex(card => card.title === '[DEBUG] Debug Log');
+                if (debugIndex > 0) {
+                    const [debugEntry] = worldInfo.splice(debugIndex, 1);
+                    worldInfo.unshift(debugEntry);
+                }
+            }
+        } catch (e) {
+            // Ignore pinning errors - not critical
+        }
+        
+        return `Debug log saved to [DEBUG] Debug Log story card.`;
+    }
     
     // ==========================
     // Location Helper Functions
@@ -386,7 +745,10 @@ function GameState(hook, text) {
                 })(name, func);
             }
             
-            if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(customTools).length} runtime tools`);
+            if (debug) {
+                console.log(`${MODULE_NAME}: Loaded ${Object.keys(customTools).length} runtime tools`);
+                logEvent(`${MODULE_NAME}: Loaded ${Object.keys(customTools).length} runtime tools`);
+            }
         } catch(e) {
             if (debug) console.log(`${MODULE_NAME}: Failed to load runtime tools: ${e}`);
         }
@@ -422,6 +784,7 @@ function GameState(hook, text) {
                 commands = eval(code);
             } catch (e) {
                 if (debug) console.log(`${MODULE_NAME}: Failed to parse commands, using empty object: ${e}`);
+                logError(e, 'Failed to parse INPUT_COMMANDS');
                 commands = {};
             }
             
@@ -667,6 +1030,73 @@ function GameState(hook, text) {
                 data.entries = data.entries.slice(-RewindSystem.MAX_HISTORY);
             }
             
+            // Check for suspicious data loss or hash mismatches
+            const existingData = RewindSystem.getStorage();
+            let shouldBackup = false;
+            let backupReason = '';
+            
+            // Check for significant data loss
+            if (existingData.entries.length > 20 && data.entries.length < existingData.entries.length / 2) {
+                shouldBackup = true;
+                backupReason = `Data loss: ${data.entries.length} entries replacing ${existingData.entries.length}`;
+            }
+            
+            // Check for hash mismatches (over 30% different)
+            if (!shouldBackup && existingData.entries.length > 10 && data.entries.length > 10) {
+                let mismatchCount = 0;
+                const checkLength = Math.min(existingData.entries.length, data.entries.length);
+                
+                for (let i = 0; i < checkLength; i++) {
+                    if (existingData.entries[i]?.h !== data.entries[i]?.h) {
+                        mismatchCount++;
+                    }
+                }
+                
+                if (mismatchCount > checkLength * 0.3) {
+                    shouldBackup = true;
+                    backupReason = `Hash mismatch: ${mismatchCount}/${checkLength} entries differ`;
+                }
+            }
+            
+            if (shouldBackup) {
+                if (debug) {
+                    console.log(`${MODULE_NAME}: WARNING: ${backupReason} - creating backup in state`);
+                    logEvent(`${MODULE_NAME}: WARNING: RewindSystem backup created - ${backupReason}`);
+                }
+                
+                // Store backup in state with turn number
+                if (!state.rewindBackups) {
+                    state.rewindBackups = [];
+                }
+                
+                state.rewindBackups.push({
+                    turn: info?.actionCount || state.actionCount || 0,
+                    entries: existingData.entries,
+                    position: existingData.position,
+                    reason: backupReason
+                });
+                
+                // Keep only last 3 backups to prevent state bloat
+                if (state.rewindBackups.length > 3) {
+                    state.rewindBackups = state.rewindBackups.slice(-3);
+                }
+                
+                // Log the issue
+                logError(new Error('RewindSystem anomaly detected'), backupReason);
+            }
+            
+            // Clean up old backups (older than 20 turns)
+            if (state.rewindBackups && state.rewindBackups.length > 0) {
+                const currentTurn = info?.actionCount || state.actionCount || 0;
+                state.rewindBackups = state.rewindBackups.filter(backup => 
+                    currentTurn - backup.turn < 20
+                );
+                
+                if (state.rewindBackups.length === 0) {
+                    delete state.rewindBackups; // Clean up empty array
+                }
+            }
+            
             // Clear existing cards first
             let cardNum = 1;
             while (true) {
@@ -751,10 +1181,14 @@ function GameState(hook, text) {
             const data = RewindSystem.getStorage();
             const hash = RewindSystem.quickHash(text);
             
-            // If no position specified, append at end
+            // Position is ALWAYS bounded to 0-99 (for MAX_HISTORY of 100)
+            // If no position specified, use current entries length
             if (position === null) {
-                position = data.entries.length;
+                position = Math.min(data.entries.length, RewindSystem.MAX_HISTORY - 1);
             }
+            
+            // Ensure position is within bounds
+            position = Math.min(position, RewindSystem.MAX_HISTORY - 1);
             
             // If we're recording at a position that's less than the current array length,
             // and the hash is different, we're creating a new timeline branch
@@ -773,14 +1207,13 @@ function GameState(hook, text) {
                 t: tools.map(t => [t.tool, t.params, t.revertData || {}])
             };
             
-            // Update position
+            // Update position to match where we just stored
             data.position = position;
             
-            // Maintain max history - align with AI Dungeon's behavior
-            // When we exceed max, remove oldest entry (index 0)
+            // Maintain max history - when we exceed max, remove oldest entry
             while (data.entries.length > RewindSystem.MAX_HISTORY) {
                 data.entries.shift();
-                // All positions shift down by 1
+                // Adjust position since we removed an entry
                 data.position = Math.max(0, data.position - 1);
             }
             
@@ -1514,7 +1947,10 @@ function GameState(hook, text) {
             parseLevelProgressionSchema(levelCard.entry, schemaCache.levelProgression);
         }
         
-        if (debug) console.log(`${MODULE_NAME}: Loaded RPG schema`);
+        if (debug) {
+            console.log(`${MODULE_NAME}: Loaded RPG schema`);
+            logEvent(`${MODULE_NAME}: Loaded RPG schema`);
+        }
         return schemaCache;
     }
     
@@ -1869,23 +2305,39 @@ function GameState(hook, text) {
         const formatCard = Utilities.storyCard.get('[RPG_SCHEMA] Character Format');
         if (!formatCard) {
             createDefaultCharacterFormat();
-            characterFormatCache = parseCharacterFormatSchema(getDefaultFormatText());
+            characterFormatCache = validateFormatSchema(parseCharacterFormatSchema(getDefaultFormatText()));
             return characterFormatCache;
         }
         
-        characterFormatCache = parseCharacterFormatSchema(formatCard.entry);
+        // Parse from description field (10k limit) instead of entry (2k limit)
+        try {
+            characterFormatCache = parseCharacterFormatSchema(formatCard.description || formatCard.entry);
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error parsing character format: ${e}. Using defaults.`);
+            logError(e, 'Failed to parse character format schema');
+            characterFormatCache = getDefaultCharacterFormat();
+        }
+        
+        // Always validate to ensure all required properties exist
+        characterFormatCache = validateFormatSchema(characterFormatCache);
         return characterFormatCache;
     }
     
     function parseCharacterFormatSchema(text) {
+        // Always start with a complete default structure
         const format = {
             sections: [],
             sectionFormats: {},
             sectionOrder: [],
             prefixTemplate: '',
+            mainTemplate: '## **{name}**{fullName? [{fullName}]}',
+            infoTemplate: 'Gender: {gender} | HP: {hp.current}/{hp.max} | Level {level} ({xp.current}/{xp.max} XP) | Current Location: {location}',
+            footerTemplate: '',
+            customFields: {},
+            sectionPatterns: {},
+            // Legacy compatibility
             headerFormat: '## **{name}**{fullName? [{fullName}]}',
-            infoLineFormat: 'Gender: {gender} | HP: {hp.current}/{hp.max} | Level {level} ({xp.current}/{xp.max} XP) | Current Location: {location}',
-            customFields: {}
+            infoLineFormat: 'Gender: {gender} | HP: {hp.current}/{hp.max} | Level {level} ({xp.current}/{xp.max} XP) | Current Location: {location}'
         };
         
         if (!text) return getDefaultCharacterFormat();
@@ -1908,18 +2360,11 @@ function GameState(hook, text) {
             // Parse based on current section
             switch (currentSection) {
                 case 'section definitions':
-                    // Parse: id -> Display Name (Alt1, Alt2)
-                    const defMatch = line.match(/^([a-z_]+)\s*->\s*([^(]+)(?:\(([^)]*)\))?/);
-                    if (defMatch) {
-                        const id = defMatch[1].trim();
-                        const displayName = defMatch[2].trim();
-                        const alternates = defMatch[3] ? 
-                            defMatch[3].split(',').map(s => s.trim()) : [];
-                        
+                    // Parse: just the section id, one per line
+                    const id = line.trim();
+                    if (id && id.match(/^[a-z_]+$/)) {
                         format.sections.push({
                             id: id,
-                            displayName: displayName,
-                            alternateNames: alternates,
                             format: 'plain_text' // default, will be overridden
                         });
                     }
@@ -1956,14 +2401,16 @@ function GameState(hook, text) {
                     }
                     break;
                     
-                case 'header template':
+                case 'main template':
+                case 'header template':  // Legacy support
                     // Next non-comment line is the template
                     if (!line.startsWith('#')) {
                         format.headerFormat = line;
                     }
                     break;
                     
-                case 'info line template':
+                case 'info template':
+                case 'info line template':  // Legacy support
                     // Accumulate lines until next section
                     if (!line.startsWith('#')) {
                         // Check if next line is also part of template
@@ -1977,6 +2424,31 @@ function GameState(hook, text) {
                             template += ' ' + nextLine;
                         }
                         format.infoLineFormat = template;
+                    }
+                    break;
+                    
+                case 'footer template':
+                    // Accumulate lines until next section
+                    if (!line.startsWith('#')) {
+                        let template = line;
+                        while (i + 1 < lines.length) {
+                            const nextLine = lines[i + 1].trim();
+                            if (!nextLine || nextLine.startsWith('##') || nextLine.startsWith('//')) {
+                                break;
+                            }
+                            i++;
+                            template += '\n' + lines[i];
+                        }
+                        format.footerTemplate = template;
+                    }
+                    break;
+                    
+                    
+                case 'section patterns':
+                    // Parse: section_id: pattern (for pattern-based parsing)
+                    const patternMatch = line.match(/^([a-z_]+):\s*(.+)/);
+                    if (patternMatch) {
+                        format.sectionPatterns[patternMatch[1]] = patternMatch[2].trim();
                     }
                     break;
                     
@@ -2002,124 +2474,152 @@ function GameState(hook, text) {
             format.sectionOrder = format.sections.map(s => s.id);
         }
         
+        // Validate and ensure all required properties exist
+        return validateFormatSchema(format);
+    }
+    
+    function validateFormatSchema(format) {
+        // Ensure all required properties exist
+        if (!format) format = {};
+        
+        // Required arrays
+        if (!Array.isArray(format.sections)) format.sections = [];
+        if (!Array.isArray(format.sectionOrder)) format.sectionOrder = [];
+        
+        // Required objects - CRITICAL: Ensure these are never null/undefined
+        if (!format.sectionFormats || typeof format.sectionFormats !== 'object') {
+            format.sectionFormats = {};
+        }
+        if (!format.sectionPatterns || typeof format.sectionPatterns !== 'object') {
+            format.sectionPatterns = {};
+        }
+        if (!format.customFields || typeof format.customFields !== 'object') {
+            format.customFields = {};
+        }
+        
+        // Required strings with defaults
+        if (!format.prefixTemplate) format.prefixTemplate = '';
+        if (!format.mainTemplate) format.mainTemplate = '## **{name}**';
+        if (!format.infoTemplate) format.infoTemplate = '';
+        if (!format.footerTemplate) format.footerTemplate = '';
+        
+        // Legacy compatibility
+        if (!format.headerFormat) format.headerFormat = format.mainTemplate;
+        if (!format.infoLineFormat) format.infoLineFormat = format.infoTemplate;
+        
         return format;
     }
     
     function getDefaultCharacterFormat() {
         return {
+            prefixTemplate: '{isPlayer?<$# User>}{isNPC?<$# Characters>}',
+            mainTemplate: '## **{name}**{fullName? [{fullName}]}',
+            infoTemplate: '{dob?DOB: {dob} | }{race?Race: {race} | }Gender: {gender}',
+            footerTemplate: '{isPlayer?$name is a USER. Do not speak or act for them.}',
             sections: [
                 {
                     id: "attributes",
-                    displayName: "Attributes",
-                    alternateNames: [],
                     format: "pipe_delimited"
                 },
                 {
                     id: "skills",
-                    displayName: "Skills",
-                    alternateNames: [],
                     format: "skill_levels"
                 },
                 {
                     id: "inventory",
-                    displayName: "Inventory",
-                    alternateNames: [],
                     format: "braced_list"
                 },
                 {
                     id: "relationships",
-                    displayName: "Relationships",
-                    alternateNames: [],
                     format: "equals_value"
                 },
                 {
                     id: "appearance",
-                    displayName: "Appearance",
-                    alternateNames: [],
                     format: "plain_text"
                 },
                 {
                     id: "personality",
-                    displayName: "Personality",
-                    alternateNames: [],
                     format: "plain_text"
                 },
                 {
                     id: "background",
-                    displayName: "Background",
-                    alternateNames: [],
                     format: "plain_text"
                 }
             ],
-            headerFormat: "## **{name}**{fullName}",
+            headerFormat: "## **{name}** {fullName}",
             infoLineFormat: "{dob|DOB: $ | }Gender: {gender} | HP: {hp.current}/{hp.max}{coreStats} | Level {level} ({xp.current}/{xp.max} XP) | Current Location: {location}",
             sectionOrder: ["appearance", "personality", "background", "attributes", "skills", "inventory", "relationships"],
-            customFields: {}
+            customFields: {},
+            sectionPatterns: {
+                appearance: "**Appearance**",
+                personality: "**Personality**",
+                background: "**Background**",
+                attributes: "**Attributes**",
+                skills: "**Skills**",
+                inventory: "**Inventory**",
+                relationships: "**Relationships**"
+            }
         };
     }
     
     function getDefaultFormatText() {
+        // Clean config with minimal comments - goes in description field (10k limit)
         return (
             `# Character Format Configuration\n` +
             `\n` +
             `## Section Definitions\n` +
-            `// Format: SectionID -> Display Name (Alternate Names)\n` +
-            `// The SectionID is used internally, Display Name shows in character cards\n` +
+            `appearance\n` +
+            `personality\n` +
+            `backstory\n` +
+            `ambition\n` +
+            `attributes\n` +
+            `skills\n` +
+            `inventory\n` +
+            `relationships\n` +
             `\n` +
-            `attributes -> Attributes (Stats, Ability Scores)\n` +
-            `skills -> Skills (Abilities, Proficiencies)\n` +
-            `inventory -> Inventory (Items, Equipment, Gear)\n` +
-            `relationships -> Relationships (Bonds, Connections)\n` +
-            `appearance -> Appearance (Description, Physical, Looks)\n` +
-            `personality -> Personality (Traits, Nature, Demeanor)\n` +
-            `background -> Background (History, Story, Bio, Backstory)\n` +
+            `## Section Patterns\n` +
+            `appearance: **Appearance**\n` +
+            `personality: **Personality**\n` +
+            `backstory: **Backstory**\n` +
+            `ambition: **Ambition**\n` +
+            `attributes: **Attributes**\n` +
+            `skills: **Skills**\n` +
+            `inventory: **Inventory**\n` +
+            `relationships: **Relationships**\n` +
             `\n` +
             `## Section Formats\n` +
-            `// How each section's data should be formatted\n` +
-            `// Options: pipe_delimited, skill_levels, braced_list, equals_value, plain_text, key_value, single_value\n` +
-            `\n` +
+            `appearance: inline_pipes\n` +
+            `personality: plain_text\n` +
+            `backstory: plain_text\n` +
+            `ambition: plain_text\n` +
             `attributes: pipe_delimited\n` +
             `skills: skill_levels\n` +
             `inventory: braced_list\n` +
-            `relationships: equals_value\n` +
-            `appearance: plain_text\n` +
-            `personality: plain_text\n` +
-            `background: plain_text\n` +
+            `relationships: plain_text\n` +
             `\n` +
             `## Section Order\n` +
-            `// The order sections appear when saving (one per line)\n` +
-            `\n` +
             `appearance\n` +
             `personality\n` +
-            `background\n` +
+            `backstory\n` +
+            `ambition\n` +
             `attributes\n` +
             `skills\n` +
             `inventory\n` +
             `relationships\n` +
             `\n` +
             `## Prefix Template\n` +
-            `// Text to add before the character sheet (for compatibility with other scripts)\n` +
-            `// Use conditionals: {isPlayer?<$# User>} or {isNPC?<$# Characters>}\n` +
-            `// Leave blank if not needed\n` +
             `{isPlayer?<$# User>}{isNPC?<$# Characters>}\n` +
             `\n` +
-            `## Header Template\n` +
-            `// Use {fieldname} for values, **text** for bold\n` +
-            `// Use {fullName?[{fullName}]} to wrap fullName in brackets only if it exists\n` +
-            `\n` +
+            `## Main Template\n` +
             `## **{name}**{fullName? [{fullName}]}\n` +
             `\n` +
-            `## Info Line Template\n` +
-            `// Use {field} for simple values\n` +
-            `// Use {field?text with {field}} for optional fields (only shows if field exists)\n` +
-            `// Special: {coreStats} inserts all core stats automatically\n` +
+            `## Info Template\n` +
+            `{dob?DOB: {dob} | }{race?Race: {race} | }Gender: {gender}\n` +
             `\n` +
-            `{dob?DOB: {dob} | }Gender: {gender} | HP: {hp.current}/{hp.max}{coreStats} | Level {level} ({xp.current}/{xp.max} XP) | Current Location: {location}\n` +
+            `## Footer Template\n` +
+            `{isPlayer?$name is a USER. Do not speak or act for them.}\n` +
             `\n` +
             `## Custom Field Mappings\n` +
-            `// Create shortcuts for commonly accessed fields\n` +
-            `// Format: alias -> field.path\n` +
-            `\n` +
             `health -> hp.current\n` +
             `max_health -> hp.max\n` +
             `hp -> hp.current\n` +
@@ -2131,26 +2631,448 @@ function GameState(hook, text) {
         Utilities.storyCard.add({
             title: '[RPG_SCHEMA] Character Format',
             type: 'data',
-            entry: getDefaultFormatText(),
-            description: (
-                'Defines how character cards are formatted and parsed. Edit the sections above to customize:\n\n' +
-                '• Section Definitions: Define section IDs, display names, and alternate names\n' +
-                '• Section Formats: Choose how each section\'s data is formatted\n' +
-                '• Section Order: Control the order sections appear\n' +
-                '• Header/Info Templates: Customize character header and info line\n' +
-                '• Custom Fields: Create aliases for nested field paths\n\n' +
-                'Format types:\n' +
-                '- pipe_delimited: KEY: VALUE | KEY: VALUE\n' +
-                '- skill_levels: skill: Level X (Y/Z XP)\n' +
-                '- braced_list: {item:qty, item:qty}\n' +
-                '- equals_value: name=value [flavor]\n' +
-                '- plain_text: Free-form text\n' +
-                '- key_value: key: value (one per line)\n' +
-                '- single_value: A single value'
+            description: getDefaultFormatText(),  // Config goes in description (10k limit)
+            entry: (  // Documentation goes in entry (2k limit)
+                'This card defines how character sheets are formatted and parsed.\n\n' +
+                '## Section Definitions\n' +
+                'List section IDs that become character properties (e.g., character.inventory)\n\n' +
+                '## Section Patterns\n' +
+                'Text patterns that mark each section. Can be ANY string:\n' +
+                '• **Section** for markdown bold\n' +
+                '• ===Section=== for separators\n' +
+                '• #^%^#Section#$@& works too!\n\n' +
+                '## Section Formats\n' +
+                'plain_text | inline_pipes | pipe_delimited | skill_levels | braced_list | equals_value | key_value\n\n' +
+                '## Templates\n' +
+                '{field} = value | {field?conditional} | $field in conditionals | {{literal}}\n' +
+                'Complex: {level>10?high level} | {hp.current<20?injured}\n\n' +
+                '## Custom Fields\n' +
+                'Create shortcuts: health -> hp.current allows {health} in templates'
             )
         });
         
         if (debug) console.log(`${MODULE_NAME}: Created default Character Format schema`);
+    }
+    
+    // ==========================
+    // Location Format Schema
+    // ==========================
+    let locationFormatCache = null;
+    
+    function loadLocationFormat() {
+        if (locationFormatCache !== null) return locationFormatCache;
+        
+        const formatCard = Utilities.storyCard.get('[RPG_SCHEMA] Location Format');
+        if (!formatCard) {
+            createDefaultLocationFormat();
+            locationFormatCache = validateFormatSchema(parseLocationFormatSchema(getDefaultLocationFormatText()));
+            return locationFormatCache;
+        }
+        
+        // Parse from description field (10k limit) instead of entry (2k limit)
+        try {
+            locationFormatCache = parseLocationFormatSchema(formatCard.description || formatCard.entry);
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error parsing location format: ${e}. Using defaults.`);
+            logError(e, 'Failed to parse location format schema');
+            // Create a basic valid location format
+            locationFormatCache = {
+                sections: [],
+                sectionPatterns: {},
+                sectionFormats: {},
+                sectionOrder: [],
+                customFields: {},
+                prefixTemplate: '',
+                mainTemplate: '## **{name}**',
+                infoTemplate: '',
+                footerTemplate: ''
+            };
+        }
+        
+        // Always validate to ensure all required properties exist
+        locationFormatCache = validateFormatSchema(locationFormatCache);
+        return locationFormatCache;
+    }
+    
+    function parseLocationFormatSchema(text) {
+        // Reuse the same parsing logic as character format
+        const format = parseCharacterFormatSchema(text);
+        // Add location-specific defaults if needed
+        // Ensure validation for location format too
+        return validateFormatSchema(format);
+    }
+    
+    function getDefaultLocationFormatText() {
+        // Clean config with minimal comments - goes in description field (10k limit)
+        return (
+            `# Location Format Configuration\n` +
+            `\n` +
+            `## Section Definitions\n` +
+            `description\n` +
+            `npcs\n` +
+            `connections\n` +
+            `resources\n` +
+            `quests\n` +
+            `atmosphere\n` +
+            `\n` +
+            `## Section Patterns\n` +
+            `description: **Description**\n` +
+            `npcs: **NPCs Present**\n` +
+            `connections: **Connections**\n` +
+            `resources: **Resources**\n` +
+            `quests: **Available Quests**\n` +
+            `atmosphere: **Atmosphere**\n` +
+            `\n` +
+            `## Section Formats\n` +
+            `description: plain_text\n` +
+            `npcs: name_list\n` +
+            `connections: directional\n` +
+            `resources: braced_list\n` +
+            `quests: name_list\n` +
+            `atmosphere: plain_text\n` +
+            `\n` +
+            `## Section Order\n` +
+            `description\n` +
+            `atmosphere\n` +
+            `connections\n` +
+            `npcs\n` +
+            `resources\n` +
+            `quests\n` +
+            `\n` +
+            `## Prefix Template\n` +
+            `{isSafeZone?<$# SafeZone>}{isDungeon?<$# Dungeon>}\n` +
+            `\n` +
+            `## Main Template\n` +
+            `## **{name}**\n` +
+            `\n` +
+            `## Info Template\n` +
+            `Type: {type} | Floor: {floor} | Controlled By: {controller}\n` +
+            `\n` +
+            `## Footer Template\n` +
+            `{isDungeon?DANGEROUS AREA - Monsters spawn here}\n` +
+            `\n` +
+            `## Custom Field Mappings\n` +
+            `zone -> type`
+        );
+    }
+    
+    function createDefaultLocationFormat() {
+        Utilities.storyCard.add({
+            title: '[RPG_SCHEMA] Location Format',
+            type: 'data',
+            description: getDefaultLocationFormatText(),  // Config goes in description (10k limit)
+            entry: (  // Documentation goes in entry (2k limit)
+                'This card defines how location cards are formatted and parsed.\n\n' +
+                '## Section Definitions\n' +
+                'List section IDs that become location properties (e.g., location.npcs)\n\n' +
+                '## Section Patterns\n' +
+                'Text patterns that mark each section. Can be ANY string.\n\n' +
+                '## Section Formats\n' +
+                'plain_text | name_list | directional | braced_list\n\n' +
+                '• name_list: Simple list of names, one per line\n' +
+                '• directional: North: Location | South: Location | etc.\n\n' +
+                '## Templates\n' +
+                'Same as Character Format - {field}, {field?conditional}, $field, {{literal}}\n\n' +
+                '## Custom Fields\n' +
+                'Create shortcuts for nested properties'
+            )
+        });
+        
+        if (debug) console.log(`${MODULE_NAME}: Created default Location Format schema`);
+    }
+    
+    // ==========================
+    // Location Management
+    // ==========================
+    function parseLocationCard(card) {
+        const format = loadLocationFormat();
+        
+        const location = {
+            title: card.title,
+            name: null,
+            type: null,
+            floor: null,
+            controller: null,
+            isSafeZone: false,
+            isDungeon: false,
+            rawSections: { sections: {}, footer: '' }
+        };
+        
+        // Extract name from title (e.g., "[LOCATION] Town_Of_Beginnings" -> "Town_Of_Beginnings")
+        const titleMatch = card.title.match(/^\[LOCATION\]\s+(.+)$/);
+        if (titleMatch) {
+            location.name = titleMatch[1].trim();
+        }
+        
+        const text = card.entry;
+        const lines = text.split('\n');
+        let currentSection = null;
+        let currentContent = [];
+        let footerLines = [];
+        let inFooter = false;
+        
+        // Parse main and info templates for metadata
+        for (let i = 0; i < Math.min(3, lines.length); i++) {
+            const line = lines[i];
+            
+            // Check for prefix flags
+            if (line.includes('<$# SafeZone>')) location.isSafeZone = true;
+            if (line.includes('<$# Dungeon>')) location.isDungeon = true;
+            
+            // Parse info line (Type: X | Floor: Y | etc)
+            if (line.includes('|')) {
+                const parts = line.split('|');
+                for (const part of parts) {
+                    const colonIdx = part.indexOf(':');
+                    if (colonIdx > -1) {
+                        const key = part.substring(0, colonIdx).trim().toLowerCase();
+                        const value = part.substring(colonIdx + 1).trim();
+                        
+                        // Map to location fields
+                        if (key === 'type' || key === 'zone') location.type = value;
+                        else if (key === 'floor') location.floor = parseInt(value) || value;
+                        else if (key === 'controlled by' || key === 'controller') location.controller = value;
+                    }
+                }
+            }
+        }
+        
+        // Parse sections
+        for (let i = 0; i < lines.length; i++) {
+            const line = lines[i];
+            
+            // Check if this line is a section pattern
+            let foundSection = false;
+            // Defensive: Ensure sectionPatterns exists and is an object
+            const patterns = (format.sectionPatterns && typeof format.sectionPatterns === 'object') 
+                ? format.sectionPatterns 
+                : {};
+            for (const [sectionId, pattern] of Object.entries(patterns)) {
+                if (line.trim() === pattern) {
+                    // Save previous section
+                    if (currentSection && currentContent.length > 0) {
+                        const content = currentContent.join('\n').trim();
+                        const sectionDef = format.sections.find(s => s.id === currentSection);
+                        if (sectionDef) {
+                            location[currentSection] = parseSectionContent(content, sectionDef.format);
+                        } else {
+                            location.rawSections.sections[currentSection] = content;
+                        }
+                    }
+                    
+                    currentSection = sectionId;
+                    currentContent = [];
+                    foundSection = true;
+                    break;
+                }
+            }
+            
+            if (!foundSection && currentSection) {
+                currentContent.push(line);
+            } else if (!foundSection && !currentSection && i > 2) {
+                // After headers, any unknown content goes to footer
+                footerLines.push(line);
+            }
+        }
+        
+        // Save last section
+        if (currentSection && currentContent.length > 0) {
+            const content = currentContent.join('\n').trim();
+            const sectionDef = format.sections.find(s => s.id === currentSection);
+            if (sectionDef) {
+                location[currentSection] = parseSectionContent(content, sectionDef.format);
+            } else {
+                location.rawSections.sections[currentSection] = content;
+            }
+        }
+        
+        // Store footer
+        if (footerLines.length > 0) {
+            location.rawSections.footer = footerLines.join('\n').trim();
+        }
+        
+        return location;
+    }
+    
+    function saveLocation(location) {
+        if (!location || !location.name) return false;
+        
+        const format = loadLocationFormat();
+        
+        // Locations ARE their cards - if the card doesn't exist, the location doesn't exist
+        const existingCard = Utilities.storyCard.get(location.title || `[LOCATION] ${location.name}`);
+        if (!existingCard) {
+            if (debug) console.log(`${MODULE_NAME}: ERROR: Attempted to save non-existent location ${location.name}`);
+            return false;
+        }
+        
+        // Try surgical update first
+        if (format.sectionPatterns) {
+            const surgicalResult = surgicalLocationUpdate(existingCard.entry, location, format);
+            if (surgicalResult.success) {
+                Utilities.storyCard.update(location.title, {
+                    entry: surgicalResult.text
+                });
+                if (debug) console.log(`${MODULE_NAME}: Surgically updated location ${location.name}`);
+                return true;
+            }
+            
+            if (debug) console.log(`${MODULE_NAME}: Surgical update failed for ${location.name}, rebuilding...`);
+        }
+        
+        // Fall back to full rebuild
+        let entry = '';
+        
+        // Add prefix from template
+        if (format.prefixTemplate) {
+            const prefix = formatTemplate(format.prefixTemplate, location);
+            if (prefix.trim()) {
+                entry += prefix + '\n';
+            }
+        }
+        
+        // Format main template (location name)
+        if (format.mainTemplate) {
+            entry += formatTemplate(format.mainTemplate, location) + '\n';
+        } else {
+            entry += `## **${location.name}**\n`;
+        }
+        
+        // Format info template
+        if (format.infoTemplate) {
+            entry += formatTemplate(format.infoTemplate, location) + '\n';
+        }
+        
+        // Add sections in order
+        for (const sectionId of format.sectionOrder) {
+            const sectionDef = format.sections.find(s => s.id === sectionId);
+            if (!sectionDef) continue;
+            
+            const data = location[sectionId];
+            const pattern = format.sectionPatterns[sectionId];
+            
+            if (data && Object.keys(data).length > 0) {
+                entry += '\n' + pattern + '\n';
+                entry += formatSectionData(data, sectionDef.format, location) + '\n';
+            }
+        }
+        
+        // Add any unknown sections from rawSections
+        if (location.rawSections?.sections) {
+            for (const [id, content] of Object.entries(location.rawSections.sections)) {
+                if (!format.sections.find(s => s.id === id)) {
+                    // Unknown section - preserve as-is
+                    const pattern = format.sectionPatterns[id] || `**${id.charAt(0).toUpperCase() + id.slice(1)}**`;
+                    entry += '\n' + pattern + '\n' + content + '\n';
+                }
+            }
+        }
+        
+        // Add footer from template or preserved footer
+        if (format.footerTemplate) {
+            const footer = formatTemplate(format.footerTemplate, location);
+            if (footer.trim()) {
+                entry += '\n' + footer;
+            }
+        } else if (location.rawSections?.footer) {
+            entry += '\n' + location.rawSections.footer;
+        }
+        
+        Utilities.storyCard.update(location.title, { entry: entry.trim() });
+        if (debug) console.log(`${MODULE_NAME}: Saved location ${location.name}`);
+        return true;
+    }
+    
+    function surgicalLocationUpdate(cardText, location, format) {
+        // Reuse the same surgical update logic as characters
+        let text = cardText;
+        let anyFailed = false;
+        
+        for (const sectionId of format.sectionOrder) {
+            const sectionDef = format.sections.find(s => s.id === sectionId);
+            if (!sectionDef) continue;
+            
+            const data = location[sectionId];
+            const pattern = format.sectionPatterns[sectionId];
+            
+            if (!pattern) continue;
+            
+            const sectionResult = updateSection(text, pattern, sectionId, data, sectionDef.format, location);
+            
+            if (sectionResult.updated) {
+                text = sectionResult.text;
+            } else if (data && Object.keys(data).length > 0) {
+                // Section not found but we have data - add it
+                const newSection = pattern + '\n' + formatSectionData(data, sectionDef.format, location) + '\n';
+                const insertPosition = findSectionInsertPosition(text, sectionId, format);
+                
+                if (insertPosition >= 0) {
+                    text = text.slice(0, insertPosition) + newSection + text.slice(insertPosition);
+                } else {
+                    text += '\n' + newSection;
+                }
+            }
+        }
+        
+        return { success: !anyFailed, text: text };
+    }
+    
+    function loadLocation(name) {
+        // Check cache first
+        const locations = loadAllLocations();
+        
+        // Try various forms of the name
+        const lowerName = name.toLowerCase();
+        if (locations[lowerName]) {
+            return locations[lowerName];
+        }
+        
+        // Try normalized form
+        const normalizedName = name.split(/[\s_]+/)
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+            .join('_');
+        
+        if (locations[normalizedName.toLowerCase()]) {
+            return locations[normalizedName.toLowerCase()];
+        }
+        
+        if (debug) console.log(`${MODULE_NAME}: Location ${name} not found`);
+        return null;
+    }
+    
+    function loadAllLocations() {
+        // Cache locations for performance (cleared at end of each hook)
+        if (locationCache !== null) return locationCache;
+        
+        locationCache = {};
+        
+        // Load all [LOCATION] cards
+        const cards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[LOCATION]'),
+            true // Get all matches
+        );
+        
+        if (!cards || cards.length === 0) return locationCache;
+        
+        for (const card of cards) {
+            const parsed = parseLocationCard(card);
+            if (parsed && parsed.name) {
+                // Store with normalized name as key (Title_Case_With_Underscores)
+                const normalizedName = parsed.name.split(/[\s_]+/)
+                    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+                    .join('_');
+                
+                locationCache[normalizedName.toLowerCase()] = parsed;
+                
+                // Also store with original name if different
+                if (parsed.name.toLowerCase() !== normalizedName.toLowerCase()) {
+                    locationCache[parsed.name.toLowerCase()] = parsed;
+                }
+            }
+        }
+        
+        if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(locationCache).length} locations`);
+        return locationCache;
     }
     
     // ==========================
@@ -2215,6 +3137,7 @@ function GameState(hook, text) {
     // Character Management
     // ==========================
     let characterCache = null;
+    let locationCache = null;
     
     function loadAllCharacters() {
         if (characterCache !== null) return characterCache;
@@ -2242,7 +3165,10 @@ function GameState(hook, text) {
             }
         }
         
-        if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(characterCache).length} characters`);
+        if (debug) {
+            console.log(`${MODULE_NAME}: Loaded ${Object.keys(characterCache).length} characters`);
+            logEvent(`${MODULE_NAME}: Loaded ${Object.keys(characterCache).length} characters`);
+        }
         return characterCache;
     }
     
@@ -2255,6 +3181,7 @@ function GameState(hook, text) {
             name: null,
             fullName: null,
             dob: null,
+            race: null,
             gender: null,
             hp: { current: 10, max: 10 },
             level: 1,
@@ -2266,7 +3193,12 @@ function GameState(hook, text) {
             inventory: {},
             relationships: {},
             rawSections: {},
-            prefixText: ''
+            prefixText: '',
+            // New sections for enhanced format
+            appearance: null,
+            personality: null,
+            backstory: null,
+            ambition: null
         };
         
         // Extract name from title - just [CHARACTER] Name or [PLAYER] Name
@@ -2281,10 +3213,13 @@ function GameState(hook, text) {
         
         // Extract all sections from the text
         const sections = {};
-        let currentSection = null;
-        let sectionContent = [];
         let foundMainHeader = false;
         let prefixLines = [];
+        
+        // Pattern-based parsing (no legacy support needed)
+        let currentSection = null;
+        let sectionContent = [];
+        let afterHeader = false;
         
         for (let i = 0; i < lines.length; i++) {
             const line = lines[i];
@@ -2296,6 +3231,7 @@ function GameState(hook, text) {
                                   line.match(/## (.+)/);
                 if (headerMatch) {
                     foundMainHeader = true;
+                    afterHeader = true;
                     character.name = headerMatch[1].trim().replace(/\*\*/g, '');
                     
                     // If there's text after the name, that's the full name
@@ -2323,51 +3259,178 @@ function GameState(hook, text) {
                     if (i + 1 < lines.length) {
                         const infoLine = lines[i + 1];
                         parseCharacterInfoLine(infoLine, character);
+                        i++; // Skip the info line
                     }
-                    i++; // Skip the info line
+                    continue;
                 }
             }
+            
             // If we haven't found the main header yet, accumulate prefix lines
-            else if (!foundMainHeader) {
+            if (!foundMainHeader) {
                 prefixLines.push(line);
+                continue;
             }
-            // Check for section headers (###)
-            else if (line.startsWith('### ')) {
-                // Save previous section if exists
-                if (currentSection) {
-                    sections[currentSection] = sectionContent.join('\n').trim();
+            
+            // Check for section patterns (e.g., **Appearance**)
+            if (afterHeader) {
+                let matchedSection = null;
+                // Defensive: Ensure sectionPatterns exists and is an object
+                const patterns = (format.sectionPatterns && typeof format.sectionPatterns === 'object')
+                    ? format.sectionPatterns
+                    : {};
+                if (Object.keys(patterns).length === 0 && debug) {
+                    console.log(`${MODULE_NAME}: WARNING: No section patterns defined in format`);
+                }
+                for (const [sectionId, pattern] of Object.entries(patterns)) {
+                    // Check if line starts with or contains the pattern
+                    if (line.includes(pattern)) {
+                        // Save previous section if exists
+                        if (currentSection) {
+                            sections[currentSection] = sectionContent.join('\n').trim();
+                        }
+                        matchedSection = sectionId;
+                        currentSection = sectionId;
+                        sectionContent = [];
+                        
+                        // If there's content on the same line after the pattern, capture it
+                        const contentAfterPattern = line.substring(line.indexOf(pattern) + pattern.length).trim();
+                        if (contentAfterPattern) {
+                            sectionContent.push(contentAfterPattern);
+                        }
+                        break;
+                    }
                 }
                 
-                currentSection = line.substring(4).trim().toLowerCase();
-                sectionContent = [];
-            }
-            // Accumulate section content
-            else if (currentSection) {
-                sectionContent.push(line);
+                // Also check for ### headers as fallback/unknown sections
+                if (!matchedSection && line.startsWith('### ')) {
+                    // Save previous section if exists
+                    if (currentSection) {
+                        sections[currentSection] = sectionContent.join('\n').trim();
+                    }
+                    
+                    // This is an unknown section - store in rawSections
+                    const unknownSectionName = line.substring(4).trim();
+                    currentSection = `_unknown_${unknownSectionName.toLowerCase()}`;
+                    sectionContent = [];
+                } else if (!matchedSection && currentSection) {
+                    // This line belongs to the current section
+                    sectionContent.push(line);
+                }
             }
         }
         
         // Save last section
         if (currentSection) {
-            sections[currentSection] = sectionContent.join('\n').trim();
-        }
-        
-        // Store raw sections for preservation
-        character.rawSections = sections;
-        
-        // Map sections to character properties using schema
-        for (const sectionDef of format.sections) {
-            // Check display name and all alternate names
-            const possibleNames = [sectionDef.displayName, ...sectionDef.alternateNames];
+            // Check if the last part might be footer text
+            let footerText = '';
+            let sectionLines = sectionContent;
             
-            for (const name of possibleNames) {
-                const normalizedName = name.toLowerCase();
-                if (sections[normalizedName]) {
-                    const content = sections[normalizedName];
-                    character[sectionDef.id] = parseSectionByFormat(content, sectionDef.format);
-                    break;
+            // Look for common footer patterns (especially for player characters)
+            if (sectionContent.length > 0) {
+                // Check if any lines match footer patterns
+                const footerPatterns = [
+                    /is a USER\. Do not speak or act for them/,
+                    /is a PLAYER\./,
+                    /^---+$/,  // Horizontal line separator
+                    /^===+$/   // Double line separator
+                ];
+                
+                // Find where footer might start
+                let footerStartIdx = -1;
+                for (let i = sectionContent.length - 1; i >= 0; i--) {
+                    const line = sectionContent[i];
+                    for (const pattern of footerPatterns) {
+                        if (pattern.test(line)) {
+                            footerStartIdx = i;
+                            break;
+                        }
+                    }
+                    if (footerStartIdx !== -1) break;
+                }
+                
+                // If we found a footer pattern, split the content
+                if (footerStartIdx !== -1) {
+                    sectionLines = sectionContent.slice(0, footerStartIdx);
+                    footerText = sectionContent.slice(footerStartIdx).join('\n').trim();
+                    
+                    // Store the footer separately
+                    if (footerText) {
+                        character.footerText = footerText;
+                        if (debug) console.log(`${MODULE_NAME}: Detected footer text: "${footerText.substring(0, 50)}..."`);
+                    }
                 }
             }
+            
+            sections[currentSection] = sectionLines.join('\n').trim();
+        }
+        
+        // Process sections - separate known from unknown
+        const knownSections = {};
+        const unknownSections = {};
+        
+        for (const [sectionKey, content] of Object.entries(sections)) {
+            if (sectionKey.startsWith('_unknown_')) {
+                // This is an unknown section - store with metadata
+                const sectionName = sectionKey.replace('_unknown_', '');
+                unknownSections[sectionName] = {
+                    content: content,
+                    pattern: `### ${sectionName.charAt(0).toUpperCase() + sectionName.slice(1)}`,
+                    position: 'after:last' // Track position relative to known sections
+                };
+            } else {
+                knownSections[sectionKey] = content;
+            }
+        }
+        
+        // Map known sections to character properties using schema
+        for (const sectionDef of format.sections) {
+            const sectionId = sectionDef.id;
+            
+            // Check if we have this section by its ID
+            if (knownSections[sectionId]) {
+                const content = knownSections[sectionId];
+                const parsedContent = parseSectionByFormat(content, sectionDef.format);
+                
+                // Special handling for relationships - ensure it's always an object
+                if (sectionId === 'relationships') {
+                    if (typeof parsedContent === 'string') {
+                        // If it's template text or a description, store in a special field
+                        character.relationshipsNote = parsedContent;
+                        character.relationships = {}; // Ensure relationships is always an object
+                    } else if (typeof parsedContent === 'object' && parsedContent !== null) {
+                        character[sectionId] = parsedContent;
+                    } else {
+                        character.relationships = {};
+                    }
+                } else {
+                    character[sectionId] = parsedContent;
+                }
+                
+                delete knownSections[sectionId]; // Remove from known sections
+            }
+        }
+        
+        // Any remaining known sections that weren't mapped are also unknown
+        for (const [sectionKey, content] of Object.entries(knownSections)) {
+            unknownSections[sectionKey] = {
+                content: content,
+                pattern: format.sectionPatterns[sectionKey] || `**${sectionKey.charAt(0).toUpperCase() + sectionKey.slice(1)}**`,
+                position: 'after:last'
+            };
+        }
+        
+        // Store raw sections for preservation during saves
+        if (Object.keys(unknownSections).length > 0) {
+            character.rawSections = { sections: unknownSections };
+        }
+        
+        // Ensure relationships is always an object, never a string or undefined
+        if (typeof character.relationships !== 'object' || character.relationships === null) {
+            if (typeof character.relationships === 'string') {
+                // Store any text content in a note field
+                character.relationshipsNote = character.relationships;
+            }
+            character.relationships = {};
         }
         
         // Initialize missing master attributes with defaults
@@ -2410,14 +3473,18 @@ function GameState(hook, text) {
     }
     
     function parseCharacterInfoLine(line, character) {
-        // Parse: DOB: YYYY-MM-DD | Gender: Female | HP: 10/10 | MP: 50/50 | Level 1 (0/100 XP) | Current Location: Town_of_Beginnings
-        // OR the older format without DOB
+        // Parse multiple formats:
+        // New: DOB: YYYY-MM-DD | Race: Human | Gender: Female
+        // Old: Gender: Female | HP: 10/10 | Level 1 (0/100 XP) | Current Location: Town_of_Beginnings
         
         const parts = line.split('|').map(p => p.trim());
         
         for (const part of parts) {
             if (part.startsWith('DOB:')) {
                 character.dob = part.substring(4).trim();
+            }
+            else if (part.startsWith('Race:')) {
+                character.race = part.substring(5).trim();
             }
             else if (part.startsWith('Gender:')) {
                 character.gender = part.substring(7).trim();
@@ -2460,6 +3527,21 @@ function GameState(hook, text) {
         switch (format) {
             case 'pipe_delimited':
                 return Utilities.parsing.parsePipeDelimited(content);
+            case 'inline_pipes':
+                // Parse inline format like "Hair: black | Eyes: blue | Misc: scar on left cheek"
+                const result = {};
+                const parts = content.split('|');
+                for (const part of parts) {
+                    const colonIdx = part.indexOf(':');
+                    if (colonIdx > -1) {
+                        const key = part.substring(0, colonIdx).trim().toLowerCase().replace(/\s+/g, '_');
+                        const value = part.substring(colonIdx + 1).trim();
+                        if (key && value) {
+                            result[key] = value;
+                        }
+                    }
+                }
+                return result;
             case 'skill_levels':
                 return parseSkillLevels(content);  // Keep specialized
             case 'braced_list':
@@ -2472,9 +3554,51 @@ function GameState(hook, text) {
                 return Utilities.parsing.parseColonKeyValue(content);
             case 'single_value':
                 return parseSingleValue(content);
+            case 'name_list':
+                // Simple list of names, one per line
+                return content.split('\n').map(line => line.trim()).filter(line => line);
+            case 'directional':
+                // Parse directional connections: North: Location | South: Location
+                return parseDirectional(content);
             default:
                 return content;
         }
+    }
+    
+    function parseDirectional(content) {
+        // Parse directional format: North: Location | South: Location
+        const connections = {};
+        
+        // Handle both inline and multi-line formats
+        if (content.includes('|')) {
+            // Inline format
+            const parts = content.split('|');
+            for (const part of parts) {
+                const colonIdx = part.indexOf(':');
+                if (colonIdx > -1) {
+                    const direction = part.substring(0, colonIdx).trim().toLowerCase();
+                    const location = part.substring(colonIdx + 1).trim();
+                    if (direction && location) {
+                        connections[direction] = location;
+                    }
+                }
+            }
+        } else {
+            // Multi-line format
+            const lines = content.split('\n');
+            for (const line of lines) {
+                const colonIdx = line.indexOf(':');
+                if (colonIdx > -1) {
+                    const direction = line.substring(0, colonIdx).trim().toLowerCase();
+                    const location = line.substring(colonIdx + 1).trim();
+                    if (direction && location) {
+                        connections[direction] = location;
+                    }
+                }
+            }
+        }
+        
+        return connections;
     }
     
     // parsePipeDelimited - moved to Utilities.parsing.parsePipeDelimited
@@ -2518,6 +3642,35 @@ function GameState(hook, text) {
         if (!character || !character.name) return false;
         
         const format = loadCharacterFormat();
+        
+        // Characters ARE their cards - if the card doesn't exist, the character doesn't exist
+        const existingCard = Utilities.storyCard.get(character.title);
+        if (!existingCard) {
+            if (debug) console.log(`${MODULE_NAME}: ERROR: Attempted to save non-existent character ${character.name}`);
+            return false;
+        }
+        
+        // Try surgical update approach first
+        if (format.sectionPatterns) {
+            const surgicalResult = surgicalCharacterUpdate(existingCard.entry, character, format);
+            if (surgicalResult.success) {
+                // Surgical update only modifies known sections, everything else is preserved
+                // This means footers, prefixes, and unknown sections all stay intact
+                // The footer will only be regenerated during a full rebuild
+                Utilities.storyCard.update(character.title, {
+                    entry: surgicalResult.text
+                });
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Surgically updated character ${character.name}`);
+                    logEvent(`${MODULE_NAME}: Surgically updated character ${character.name}`);
+                }
+                return true;
+            }
+            
+            if (debug) console.log(`${MODULE_NAME}: Surgical update failed for ${character.name}, rebuilding...`);
+        }
+        
+        // Fall back to full rebuild
         let entry = '';
         
         // Add prefix from template (for script compatibility headers)
@@ -2526,10 +3679,6 @@ function GameState(hook, text) {
             if (prefix.trim()) {
                 entry += prefix + '\n';
             }
-        }
-        // Legacy support: if character has old prefixText and no template is defined
-        else if (character.prefixText) {
-            entry += character.prefixText + '\n';
         }
         
         // Format header using template
@@ -2547,18 +3696,40 @@ function GameState(hook, text) {
             if (!data || (typeof data === 'object' && Object.keys(data).length === 0 && sectionDef.format !== 'plain_text')) continue;
             if (sectionDef.format === 'plain_text' && !data) continue;
             
-            entry += `### ${sectionDef.displayName}\n`;
+            // Use pattern format
+            if (format.sectionPatterns && format.sectionPatterns[sectionId]) {
+                entry += format.sectionPatterns[sectionId] + '\n';
+            } else {
+                // Fallback to ### format with ID if no pattern defined
+                const headerName = sectionId.charAt(0).toUpperCase() + sectionId.slice(1);
+                entry += `### ${headerName}\n`;
+            }
+            
             const sectionContent = formatSectionData(data, sectionDef.format, character);
             if (sectionContent) {
                 entry += sectionContent + '\n';
             }
         }
         
-        // Characters ARE their cards - if the card doesn't exist, the character doesn't exist
-        const existingCard = Utilities.storyCard.get(character.title);
-        if (!existingCard) {
-            if (debug) console.log(`${MODULE_NAME}: ERROR: Attempted to save non-existent character ${character.name}`);
-            return false;
+        // Add rawSections back in their original positions
+        if (character.rawSections && character.rawSections.sections) {
+            for (const [sectionName, sectionData] of Object.entries(character.rawSections.sections)) {
+                if (sectionData.pattern && sectionData.content) {
+                    entry += sectionData.pattern + '\n';
+                    entry += sectionData.content + '\n';
+                }
+            }
+        }
+        
+        // Add footer - use template or preserved footer text
+        if (format.footerTemplate) {
+            const footer = formatTemplate(format.footerTemplate, character);
+            if (footer.trim()) {
+                entry += '\n' + footer;
+            }
+        } else if (character.footerText) {
+            // Preserve any existing footer text that was detected
+            entry += '\n' + character.footerText;
         }
         
         // Update the card content
@@ -2566,8 +3737,342 @@ function GameState(hook, text) {
             entry: entry
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Updated character ${character.name}`);
+        if (debug) console.log(`${MODULE_NAME}: Rebuilt character ${character.name}`);
         return true;
+    }
+    
+    function surgicalCharacterUpdate(cardText, character, format) {
+        let text = cardText;
+        let anyFailed = false;
+        
+        // Ensure relationships is always an object before updating
+        if (character.relationships && typeof character.relationships === 'string') {
+            character.relationshipsNote = character.relationships;
+            character.relationships = {};
+            if (debug) console.log(`${MODULE_NAME}: Fixed string relationships during surgical update for ${character.name}`);
+        }
+        
+        // Update each section that has changed
+        for (const sectionId of format.sectionOrder) {
+            const sectionDef = format.sections.find(s => s.id === sectionId);
+            if (!sectionDef) continue;
+            
+            const data = character[sectionId];
+            const pattern = format.sectionPatterns[sectionId];
+            
+            if (!pattern) continue;
+            
+            // Try to find and update this section
+            const sectionResult = updateSection(text, pattern, sectionId, data, sectionDef.format, character);
+            
+            if (sectionResult.updated) {
+                text = sectionResult.text;
+            } else if (data && Object.keys(data).length > 0) {
+                // Section not found but we have data for it - try to add it
+                const newSection = pattern + '\n' + formatSectionData(data, sectionDef.format, character) + '\n';
+                
+                // Find appropriate place to insert (after previous section or before next)
+                const insertPosition = findSectionInsertPosition(text, sectionId, format);
+                if (insertPosition >= 0) {
+                    text = text.slice(0, insertPosition) + newSection + text.slice(insertPosition);
+                } else {
+                    // Just append at end if we can't find a good position
+                    text += '\n' + newSection;
+                }
+            }
+        }
+        
+        return { success: !anyFailed, text: text };
+    }
+    
+    function updateSection(text, pattern, sectionId, newData, format, character) {
+        // Escape pattern for regex use
+        const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        
+        // Find the section in the text
+        const sectionRegex = new RegExp(
+            `(${escapedPattern}\\n)([^\\n]*(?:\\n(?!\\*\\*|###|^\\s*$)[^\\n]*)*)`,
+            'gm'
+        );
+        
+        const match = sectionRegex.exec(text);
+        
+        if (!match) {
+            // Section not found - try quick-fix to recover data
+            const quickFixResult = attemptSectionQuickFix(text, pattern, sectionId, format);
+            if (quickFixResult.found) {
+                // Merge recovered data with new data
+                const mergedData = { ...quickFixResult.data, ...newData };
+                // Try update again with fixed section
+                const fixedText = quickFixResult.fixedText || text;
+                return updateSection(fixedText, pattern, sectionId, mergedData, format, character);
+            }
+            return { updated: false, text: text };
+        }
+        
+        // Format the new data
+        const newContent = formatSectionData(newData, format, character);
+        
+        if (!newContent && !newData) {
+            // Remove the section entirely if no data
+            const newText = text.replace(match[0] + '\n', '');
+            return { updated: true, text: newText };
+        }
+        
+        // Replace the section content
+        const newSection = match[1] + (newContent || '');
+        const newText = text.replace(match[0], newSection);
+        
+        return { updated: true, text: newText };
+    }
+    
+    function attemptSectionQuickFix(text, pattern, sectionId, format) {
+        // Try to find section with variations of the pattern
+        const variations = [
+            pattern,
+            pattern.replace(/\*\*/g, '###'), // **Section** → ### Section
+            pattern.replace(/\*\*/g, ''),     // **Section** → Section
+            `### ${sectionId.charAt(0).toUpperCase() + sectionId.slice(1)}`, // ### Sectionid
+        ];
+        
+        for (const variant of variations) {
+            const escapedVariant = variant.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const regex = new RegExp(
+                `(${escapedVariant}\\n)([^\\n]*(?:\\n(?!\\*\\*|###|^\\s*$)[^\\n]*)*)`,
+                'gm'
+            );
+            const match = regex.exec(text);
+            
+            if (match) {
+                // Found with variant pattern - extract and fix the content
+                const content = match[2];
+                const fixedData = quickFixSectionContent(content, format);
+                
+                if (fixedData) {
+                    // Replace variant pattern with correct pattern
+                    const fixedText = text.replace(match[1], pattern + '\n');
+                    return { found: true, data: fixedData, fixedText: fixedText };
+                }
+            }
+        }
+        
+        return { found: false };
+    }
+    
+    function quickFixSectionContent(content, format) {
+        if (!content) return null;
+        
+        switch (format) {
+            case 'braced_list':
+                return quickFixBracedList(content);
+            case 'inline_pipes':
+                return quickFixInlinePipes(content);
+            case 'key_value':
+                return quickFixKeyValue(content);
+            case 'skill_levels':
+                return quickFixSkillLevels(content);
+            case 'pipe_delimited':
+                return quickFixPipeDelimited(content);
+            default:
+                return content; // plain_text or unknown - return as-is
+        }
+    }
+    
+    function quickFixBracedList(text) {
+        let fixed = text.trim();
+        
+        // Fix missing comma between items
+        fixed = fixed.replace(/(\w+:\d+)\s+(\w+:)/g, '$1, $2');
+        
+        // Fix missing braces
+        if (!fixed.startsWith('{')) fixed = '{' + fixed;
+        if (!fixed.endsWith('}')) fixed = fixed + '}';
+        
+        // Fix double braces
+        fixed = fixed.replace(/^\{\{/, '{').replace(/\}\}$/, '}');
+        
+        // Fix spacing issues
+        fixed = fixed.replace(/\s*:\s*/g, ':').replace(/\s*,\s*/g, ', ');
+        
+        // Try to parse the fixed version
+        try {
+            const items = {};
+            const content = fixed.slice(1, -1); // Remove braces
+            
+            if (content.includes(',')) {
+                const parts = content.split(',');
+                for (const part of parts) {
+                    const [item, qty] = part.trim().split(':');
+                    if (item && qty) {
+                        items[item.trim()] = parseInt(qty) || 0;
+                    }
+                }
+            } else {
+                // No commas - try to extract item:qty patterns
+                const matches = content.matchAll(/(\w+)\s*:\s*(\d+)/g);
+                for (const match of matches) {
+                    items[match[1]] = parseInt(match[2]);
+                }
+            }
+            
+            return Object.keys(items).length > 0 ? items : null;
+        } catch (e) {
+            // If still can't parse, extract what we can
+            const items = {};
+            const matches = text.matchAll(/(\w+)\s*:\s*(\d+)/g);
+            for (const match of matches) {
+                items[match[1]] = parseInt(match[2]);
+            }
+            return Object.keys(items).length > 0 ? items : null;
+        }
+    }
+    
+    function quickFixInlinePipes(text) {
+        let fixed = text.trim();
+        
+        // Fix double pipes
+        fixed = fixed.replace(/\s*\|\|\s*/g, ' | ');
+        
+        // Fix spacing around pipes
+        fixed = fixed.replace(/\s*\|\s*/g, ' | ');
+        
+        // If no pipes, try to detect key:value patterns
+        if (!fixed.includes('|')) {
+            fixed = fixed.replace(/(\w+:\s*[^:]+)(\s+)(\w+:)/g, '$1 | $3');
+        }
+        
+        return fixed;
+    }
+    
+    function quickFixKeyValue(text) {
+        const lines = text.split('\n');
+        const result = {};
+        
+        for (let line of lines) {
+            line = line.trim();
+            if (!line) continue;
+            
+            // Fix missing colon
+            if (!line.includes(':')) {
+                const spaceIndex = line.indexOf(' ');
+                if (spaceIndex > 0) {
+                    line = line.slice(0, spaceIndex) + ': ' + line.slice(spaceIndex + 1);
+                }
+            }
+            
+            // Fix multiple colons
+            line = line.replace(/:\s*:/g, ':');
+            
+            // Fix spacing
+            line = line.replace(/^([^:]+):(\S)/, '$1: $2');
+            
+            // Extract key-value
+            const colonIndex = line.indexOf(':');
+            if (colonIndex > 0) {
+                const key = line.slice(0, colonIndex).trim();
+                const value = line.slice(colonIndex + 1).trim();
+                if (key) {
+                    result[key] = value;
+                }
+            }
+        }
+        
+        return Object.keys(result).length > 0 ? result : null;
+    }
+    
+    function quickFixSkillLevels(text) {
+        const skills = {};
+        
+        // Try to extract skill data in various formats
+        // Format 1: "Skill: Level X (Y/Z XP)"
+        let matches = text.matchAll(/(\w+(?:\s+\w+)*)\s*:\s*Level\s+(\d+)\s*\((\d+)\/(\d+)\s*XP\)/gi);
+        for (const match of matches) {
+            skills[match[1].trim()] = {
+                level: parseInt(match[2]),
+                xp: { current: parseInt(match[3]), max: parseInt(match[4]) }
+            };
+        }
+        
+        // Format 2: "Skill Level X"
+        if (Object.keys(skills).length === 0) {
+            matches = text.matchAll(/(\w+(?:\s+\w+)*)\s+Level\s+(\d+)/gi);
+            for (const match of matches) {
+                skills[match[1].trim()] = {
+                    level: parseInt(match[2]),
+                    xp: { current: 0, max: 100 }
+                };
+            }
+        }
+        
+        // Format 3: "Skill: X"
+        if (Object.keys(skills).length === 0) {
+            matches = text.matchAll(/(\w+(?:\s+\w+)*)\s*:\s*(\d+)/g);
+            for (const match of matches) {
+                skills[match[1].trim()] = {
+                    level: parseInt(match[2]),
+                    xp: { current: 0, max: 100 }
+                };
+            }
+        }
+        
+        return Object.keys(skills).length > 0 ? skills : null;
+    }
+    
+    function quickFixPipeDelimited(text) {
+        let fixed = text.trim();
+        
+        // Similar to inline pipes but expects key:value format
+        fixed = fixed.replace(/\s*\|\|\s*/g, ' | ');
+        fixed = fixed.replace(/\s*\|\s*/g, ' | ');
+        
+        // Ensure colons exist
+        const parts = fixed.split('|');
+        const fixedParts = parts.map(part => {
+            part = part.trim();
+            if (!part.includes(':') && part.includes(' ')) {
+                const spaceIndex = part.indexOf(' ');
+                return part.slice(0, spaceIndex) + ': ' + part.slice(spaceIndex + 1);
+            }
+            return part;
+        });
+        
+        return fixedParts.join(' | ');
+    }
+    
+    function findSectionInsertPosition(text, sectionId, format) {
+        const orderIndex = format.sectionOrder.indexOf(sectionId);
+        if (orderIndex < 0) return -1;
+        
+        // Look for the previous section that exists
+        for (let i = orderIndex - 1; i >= 0; i--) {
+            const prevSection = format.sectionOrder[i];
+            const prevPattern = format.sectionPatterns[prevSection];
+            if (prevPattern) {
+                const escapedPattern = prevPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const regex = new RegExp(`${escapedPattern}\\n[^\\n]*(?:\\n(?!\\*\\*|###)[^\\n]*)*`, 'gm');
+                const match = regex.exec(text);
+                if (match) {
+                    // Insert after this section
+                    return match.index + match[0].length + 1;
+                }
+            }
+        }
+        
+        // Look for the next section that exists
+        for (let i = orderIndex + 1; i < format.sectionOrder.length; i++) {
+            const nextSection = format.sectionOrder[i];
+            const nextPattern = format.sectionPatterns[nextSection];
+            if (nextPattern) {
+                const escapedPattern = nextPattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                const match = text.indexOf(nextPattern);
+                if (match >= 0) {
+                    // Insert before this section
+                    return match;
+                }
+            }
+        }
+        
+        return -1;
     }
     
     function formatString(template, data) {
@@ -2598,41 +4103,70 @@ function GameState(hook, text) {
     }
     
     function formatTemplate(template, character) {
-        // Handle conditional fields with the format {field?text with {field}}
-        // Use a more complex regex to handle nested braces
+        // Handle conditional fields with the format {field?text with $field or {{literal}}}
         let result = template;
         
         // First, find and replace all conditional blocks
-        // This regex matches {field?...} including nested {} inside
+        // This regex matches {field?...} including nested content
         const conditionalRegex = /\{([^?{}]+)\?([^{}]*(?:\{[^}]*\}[^{}]*)*)\}/g;
         result = result.replace(conditionalRegex, (match, fieldPath, conditionalText) => {
             fieldPath = fieldPath.trim();
             
+            // Evaluate the condition using expression evaluator for complex conditions
+            let conditionMet = false;
+            
             // Special check for isPlayer and isNPC
             if (fieldPath === 'isPlayer') {
-                const isPlayer = character.title && character.title.startsWith('[PLAYER]');
-                return isPlayer ? conditionalText : '';
-            }
-            if (fieldPath === 'isNPC') {
-                const isNPC = character.title && character.title.startsWith('[CHARACTER]');
-                return isNPC ? conditionalText : '';
+                conditionMet = character.title && character.title.startsWith('[PLAYER]');
+            } else if (fieldPath === 'isNPC') {
+                conditionMet = character.title && character.title.startsWith('[CHARACTER]');
+            } else if (fieldPath.includes('>') || fieldPath.includes('<') || fieldPath.includes('==') || 
+                       fieldPath.includes('&&') || fieldPath.includes('||')) {
+                // Complex expression - use expression evaluator
+                if (typeof Utilities !== 'undefined' && Utilities.expression) {
+                    try {
+                        // Create context with character fields at root level
+                        const context = { ...character };
+                        conditionMet = Utilities.expression.evaluate(fieldPath, context);
+                    } catch (e) {
+                        // Fall back to simple field check
+                        const value = getNestedValue(character, fieldPath);
+                        conditionMet = value !== null && value !== undefined && value !== '';
+                    }
+                } else {
+                    // No expression evaluator - simple field check
+                    const value = getNestedValue(character, fieldPath);
+                    conditionMet = value !== null && value !== undefined && value !== '';
+                }
+            } else {
+                // Simple field existence check
+                const value = getNestedValue(character, fieldPath);
+                conditionMet = value !== null && value !== undefined && value !== '';
             }
             
-            const value = getNestedValue(character, fieldPath);
-            
-            // If field has no value, remove the entire conditional block
-            if (value === null || value === undefined || value === '') {
+            if (!conditionMet) {
                 return '';
             }
             
-            // Replace nested {field} references within the conditional text
-            return conditionalText.replace(/\{([^}]+)\}/g, (m, field) => {
-                if (field === fieldPath) {
-                    return value; // Replace with the main field value
-                }
-                return getNestedValue(character, field) || '';
+            // Process the conditional text:
+            // 1. Replace $variable with actual values
+            // 2. Replace {{text}} with literal {text}
+            let processedText = conditionalText;
+            
+            // Replace $variable references
+            processedText = processedText.replace(/\$(\w+)/g, (m, field) => {
+                const value = getNestedValue(character, field);
+                return value !== null && value !== undefined ? value : '';
             });
+            
+            // Replace {{text}} with {text} for literal output
+            processedText = processedText.replace(/\{\{([^}]+)\}\}/g, '{$1}');
+            
+            return processedText;
         });
+        
+        // Handle {{text}} for literal braces outside conditionals
+        result = result.replace(/\{\{([^}]+)\}\}/g, '{$1}');
         
         // Handle simple field replacements {field}
         result = result.replace(/\{([^}]+)\}/g, (match, fieldPath) => {
@@ -2662,26 +4196,58 @@ function GameState(hook, text) {
     }
     
     function formatSectionData(data, format, character) {
+        // Protect against null/undefined data
+        if (!data) return '';
+        
+        // If data is a string when we expect an object, return it as-is or empty
+        if (typeof data === 'string' && format !== 'plain_text' && format !== 'single_value') {
+            if (debug) console.log(`${MODULE_NAME}: formatSectionData received string for ${format} format: "${data.substring(0, 50)}..."`);
+            return '';
+        }
+        
         switch (format) {
             case 'pipe_delimited':
-                return Object.entries(data)
+                // Extra safety check for object-based formats
+                if (typeof data !== 'object' || data === null) return '';
+                return Object.entries(data || {})
                     .map(([key, value]) => `${key.toUpperCase()}: ${value}`)
                     .join(' | ');
                 
+            case 'inline_pipes':
+                // For inline format like "Hair: black | Eyes: blue" 
+                // Data is expected to be an object with keys matching the template
+                if (typeof data === 'object' && !Array.isArray(data)) {
+                    const parts = [];
+                    for (const [key, value] of Object.entries(data || {})) {
+                        if (value) {
+                            // Format key nicely (hair -> Hair, eye_color -> Eye Color)
+                            const displayKey = key.split('_').map(word => 
+                                word.charAt(0).toUpperCase() + word.slice(1)
+                            ).join(' ');
+                            parts.push(`${displayKey}: ${value}`);
+                        }
+                    }
+                    return parts.join(' | ');
+                }
+                return data || '';
+                
             case 'skill_levels':
-                return Object.entries(data)
+                if (typeof data !== 'object' || data === null) return '';
+                return Object.entries(data || {})
                     .map(([skill, info]) => 
                         `${skill}: Level ${info.level} (${info.xp.current}/${info.xp.max} XP)`)
                     .join('\n');
                 
             case 'braced_list':
-                const items = Object.entries(data)
+                if (typeof data !== 'object' || data === null) return '{}';
+                const items = Object.entries(data || {})
                     .filter(([_, qty]) => qty > 0)
                     .map(([item, qty]) => `${item}:${qty}`);
                 return items.length > 0 ? `{${items.join(', ')}}` : '{}';
                 
             case 'equals_value':
-                return Object.entries(data)
+                if (typeof data !== 'object' || data === null) return '';
+                return Object.entries(data || {})
                     .map(([name, value]) => {
                         const flavor = getRelationshipFlavor(value, character.name, name);
                         return `${name}=${value} [${flavor}]`;
@@ -2692,12 +4258,34 @@ function GameState(hook, text) {
                 return data || '';
                 
             case 'key_value':
-                return Object.entries(data)
+                if (typeof data !== 'object' || data === null) return '';
+                return Object.entries(data || {})
                     .map(([key, value]) => `${key}: ${value}`)
                     .join('\n');
                 
             case 'single_value':
                 return data.toString();
+                
+            case 'name_list':
+                // Format array of names, one per line
+                if (Array.isArray(data)) {
+                    return data.join('\n');
+                }
+                return data || '';
+                
+            case 'directional':
+                // Format directional connections
+                if (typeof data === 'object' && !Array.isArray(data)) {
+                    const parts = [];
+                    for (const [direction, location] of Object.entries(data || {})) {
+                        // Capitalize direction (north -> North)
+                        const displayDir = direction.charAt(0).toUpperCase() + direction.slice(1);
+                        parts.push(`${displayDir}: ${location}`);
+                    }
+                    // Use pipes if few connections, newlines if many
+                    return parts.length <= 4 ? parts.join(' | ') : parts.join('\n');
+                }
+                return data || '';
                 
             default:
                 return typeof data === 'object' ? JSON.stringify(data, null, 2) : data;
@@ -3037,8 +4625,8 @@ function GameState(hook, text) {
     function processGetters(text) {
         if (!text) return text;
         
-        // Load runtime variables once for this pass
-        const runtimeVars = loadRuntimeVariables();
+        // Lazy load runtime variables only when needed
+        let runtimeVars = null;
         
         return text.replace(GETTER_PATTERN, function(match) {
             // Parse the getter: get_something(parameters)
@@ -3112,6 +4700,11 @@ function GameState(hook, text) {
                 default:
                     // CHECK RUNTIME VARIABLES using exact getter name (snake_case)
                     const varName = getterType; // Use exact name, no conversion!
+                    
+                    // Lazy load runtime variables when needed
+                    if (runtimeVars === null) {
+                        runtimeVars = loadRuntimeVariables();
+                    }
                     
                     if (runtimeVars[varName]) {
                         const value = getRuntimeValue(varName);
@@ -3467,7 +5060,10 @@ function GameState(hook, text) {
                 if (shouldTriggerGeneration(characterName)) {
                     addToEntityQueue(characterName);
                 }
-                if (debug) console.log(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
+                    logEvent(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
+                }
             } else {
                 character.location = location;
                 saveCharacter(character);
@@ -3499,7 +5095,10 @@ function GameState(hook, text) {
             const character = characters[characterName];
             
             if (!character) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                    logEvent(`${MODULE_NAME}: Character ${characterName} not found`);
+                }
                 return 'executed'; // Still executed, just no character
             }
             
@@ -3507,7 +5106,10 @@ function GameState(hook, text) {
             const newQty = Math.max(0, currentQty + quantity);
             
             character.inventory[itemName] = newQty;
-            if (debug) console.log(`${MODULE_NAME}: ${character.name}'s ${itemName}: ${currentQty} → ${newQty}`);
+            if (debug) {
+                console.log(`${MODULE_NAME}: ${character.name}'s ${itemName}: ${currentQty} → ${newQty}`);
+                logEvent(`${MODULE_NAME}: ${character.name}'s ${itemName}: ${currentQty} → ${newQty}`);
+            }
             
             saveCharacter(character);
             return 'executed';
@@ -3656,7 +5258,10 @@ function GameState(hook, text) {
             
             // Don't track for deal_damage - could be environmental/trap damage
             if (!target) {
-                if (debug) console.log(`${MODULE_NAME}: Target ${targetName} not found`);
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Target ${targetName} not found`);
+                    logEvent(`${MODULE_NAME}: Target ${targetName} not found`);
+                }
                 return 'executed';
             }
             
@@ -3887,8 +5492,27 @@ function GameState(hook, text) {
             }
             
             if (!char1 || !char2) {
-                if (debug) console.log(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
+                if (debug) {
+                    console.log(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
+                    logEvent(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
+                }
                 return 'executed';
+            }
+            
+            // Ensure relationships is an object (not a string or undefined)
+            if (typeof char1.relationships !== 'object' || char1.relationships === null) {
+                char1.relationships = {};
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Fixed relationships for ${char1.name} - was type: ${typeof char1.relationships}`);
+                    logEvent(`${MODULE_NAME}: Fixed relationships for ${char1.name} - was not an object`);
+                }
+            }
+            if (typeof char2.relationships !== 'object' || char2.relationships === null) {
+                char2.relationships = {};
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Fixed relationships for ${char2.name} - was type: ${typeof char2.relationships}`);
+                    logEvent(`${MODULE_NAME}: Fixed relationships for ${char2.name} - was not an object`);
+                }
             }
             
             // Update bidirectional relationships
@@ -3937,7 +5561,10 @@ function GameState(hook, text) {
             const character = characters[characterName];
             
             if (!character) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                    logEvent(`${MODULE_NAME}: Character ${characterName} not found`);
+                }
                 return 'malformed';
             }
             
@@ -4397,25 +6024,30 @@ function GameState(hook, text) {
         // Normalize entity name to lowercase for consistent tracking
         entityName = entityName.toLowerCase();
         
-        // Check if this character already exists in story cards
+        // First check if character exists in the loaded character cache
+        // This is the most reliable way to check for existing characters
+        const allCharacters = loadAllCharacters();
+        if (allCharacters[entityName]) {
+            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${entityName}`);
+            return;
+        }
+        
+        // Also check story cards directly as a fallback
         const characterCards = Utilities.storyCard.find(card => {
             if (!card.title.startsWith('[CHARACTER]') && !card.title.startsWith('[PLAYER]')) {
                 return false;
             }
             
-            // Check if title matches
+            // Check if title matches (case-insensitive)
             const titleMatch = card.title.match(/\[(CHARACTER|PLAYER)\]\s+(.+)/);
             if (titleMatch && titleMatch[2] && titleMatch[2].toLowerCase() === entityName) {
                 return true;
             }
             
-            // Check if any key matches
-            const keyMatch = card.entry.match(/Keys:\s*([^\n]+)/i);
-            if (keyMatch) {
-                const keys = keyMatch[1].split(',').map(k => k.trim().toLowerCase());
-                if (keys.includes(entityName)) {
-                    return true;
-                }
+            // Check if the card's parsed name matches
+            const parsed = parseCharacterCard(card);
+            if (parsed && parsed.name && parsed.name.toLowerCase() === entityName) {
+                return true;
             }
             
             return false;
@@ -4423,7 +6055,7 @@ function GameState(hook, text) {
         
         // If character already exists, don't track
         if (characterCards && characterCards.length > 0) {
-            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character: ${entityName}`);
+            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character card: ${entityName}`);
             return;
         }
         
@@ -4514,7 +6146,10 @@ function GameState(hook, text) {
             description: description
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Tracked unknown entity ${entityName} (unique turns: ${tracker[entityName].uniqueTurns.length})`);
+        if (debug) {
+            console.log(`${MODULE_NAME}: Tracked unknown entity ${entityName} (unique turns: ${tracker[entityName].uniqueTurns.length})`);
+            logEvent(`${MODULE_NAME}: Tracked unknown entity ${entityName} (unique turns: ${tracker[entityName].uniqueTurns.length})`);
+        }
     }
     
     function shouldTriggerGeneration(entityName) {
@@ -4747,7 +6382,7 @@ function GameState(hook, text) {
                 continue;
             }
             
-            if (debug) console.log(`${MODULE_NAME}: Found tool: ${toolName}(${paramString})`);
+            // Tool found - will log execution result below
             
             // Parse parameters
             const params = parseParameters(paramString);
@@ -4756,6 +6391,20 @@ function GameState(hook, text) {
             const revertData = captureRevertData(toolName.toLowerCase(), params);
             
             let result = processToolCall(toolName, params);
+            
+            // Log tool result
+            if (debug) {
+                const toolCall = `${toolName}(${params.join(',')})`;
+                if (result === 'executed') {
+                    logEvent(`${MODULE_NAME}: Tool EXECUTED: ${toolCall}`);
+                } else if (result === 'malformed') {
+                    console.log(`${MODULE_NAME}: Tool MALFORMED: ${toolCall}`);
+                    logEvent(`${MODULE_NAME}: Tool MALFORMED: ${toolCall}`);
+                } else if (result === 'unknown') {
+                    console.log(`${MODULE_NAME}: Tool UNKNOWN: ${toolCall}`);
+                    logEvent(`${MODULE_NAME}: Tool UNKNOWN: ${toolCall}`);
+                }
+            }
             
             // Track executed tools for RewindSystem
             if (result === 'executed') {
@@ -4814,7 +6463,10 @@ function GameState(hook, text) {
                     length: fullMatch.length,
                     reason: result
                 });
-                if (debug) console.log(`${MODULE_NAME}: Marking for removal (${result}): ${fullMatch}`);
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Marking for removal (${result}): ${fullMatch}`);
+                    logEvent(`${MODULE_NAME}: Marking for removal (${result}): ${fullMatch}`);
+                }
             }
         }
         
@@ -4830,6 +6482,9 @@ function GameState(hook, text) {
                 modifiedText = before + change.replacement + after;
             } else {
                 // Removal (malformed/unknown)
+                if (debug) {
+                    logEvent(`${MODULE_NAME}: Removed ${change.reason} tool: ${change.match}`);
+                }
                 let cleanedBefore = before;
                 let cleanedAfter = after;
                 
@@ -4914,9 +6569,18 @@ function GameState(hook, text) {
         
         // Check if it's a known tool
         if (toolProcessors[normalizedToolName]) {
-            // Execute the tool
-            const result = toolProcessors[normalizedToolName](...params);
-            return result;
+            try {
+                // Execute the tool
+                const result = toolProcessors[normalizedToolName](...params);
+                return result;
+            } catch (e) {
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Error in ${normalizedToolName}: ${e.message}`);
+                    logEvent(`${MODULE_NAME}: Error in ${normalizedToolName}: ${e.message}`);
+                }
+                logError(e, `Tool execution: ${normalizedToolName}(${params.join(', ')})`);
+                return 'malformed';
+            }
         }
         
         // Check for dynamic core stat tools (update_hp, update_mp, etc from schema)
@@ -4996,7 +6660,10 @@ function GameState(hook, text) {
             const characters = loadAllCharacters();
             const character = characters[characterName];
             if (!character) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Character ${characterName} not found`);
+                    logEvent(`${MODULE_NAME}: Character ${characterName} not found`);
+                }
                 return false;
             }
             
@@ -5281,12 +6948,13 @@ function GameState(hook, text) {
                 return result;
             },
             
-            // Clear all test entities
+            // Clear all test entities and clean up tracker
             cleanup: () => {
                 const testNames = ['Debug_Test_NPC', 'Debug_Test_Monster', 'Debug_Test_Boss', 
                                  'Debug_Test_Item', 'Debug_Test_Location', 'Debug_Test_Quest',
                                  'Debug_Character'];
                 let removed = 0;
+                let cleaned = 0;
                 
                 for (const name of testNames) {
                     if (Utilities.storyCard.remove(`[CHARACTER] ${name}`)) removed++;
@@ -5294,17 +6962,87 @@ function GameState(hook, text) {
                     if (Utilities.storyCard.remove(`[ENTITY_GEN] ${name}`)) removed++;
                 }
                 
-                // Clear entity tracker data
-                Utilities.storyCard.update('[RPG_RUNTIME] Entity Tracker Data', {
-                    entry: '// Entity tracking data\n// Format: # entity_name\n// tool_name:turn1,turn2,...'
-                });
+                // Clean up entity tracker - remove entities that already have character cards
+                const configCard = Utilities.storyCard.get('[RPG_RUNTIME] Entity Tracker Config');
+                if (configCard && configCard.description) {
+                    const allCharacters = loadAllCharacters();
+                    let tracker = {};
+                    
+                    try {
+                        // Parse current tracker data
+                        const lines = configCard.description.split('\n');
+                        let currentEntity = null;
+                        
+                        for (const line of lines) {
+                            if (line.startsWith('# ')) {
+                                currentEntity = line.substring(2).trim();
+                                // Only keep entities that DON'T have character cards
+                                if (!allCharacters[currentEntity]) {
+                                    tracker[currentEntity] = { uniqueTurns: [], lastTool: '' };
+                                } else {
+                                    cleaned++;
+                                    if (debug) console.log(`${MODULE_NAME}: Cleaning up tracked entity that now has character card: ${currentEntity}`);
+                                }
+                            } else if (currentEntity && !allCharacters[currentEntity] && line.includes(':')) {
+                                const [key, value] = line.split(':').map(s => s.trim());
+                                if (key === 'turns') {
+                                    tracker[currentEntity].uniqueTurns = value ? value.split(',').map(Number) : [];
+                                } else if (key === 'tool') {
+                                    tracker[currentEntity].lastTool = value || '';
+                                }
+                            }
+                        }
+                        
+                        // Rebuild description without entities that have character cards
+                        let description = '// Entity tracking data\n';
+                        for (const [name, data] of Object.entries(tracker)) {
+                            description += `# ${name}\n`;
+                            description += `turns: ${data.uniqueTurns.join(',')}\n`;
+                            description += `tool: ${data.lastTool}\n`;
+                        }
+                        
+                        Utilities.storyCard.update('[RPG_RUNTIME] Entity Tracker Config', {
+                            description: description
+                        });
+                    } catch (e) {
+                        if (debug) console.log(`${MODULE_NAME}: Error cleaning entity tracker: ${e}`);
+                    }
+                }
                 
                 // Clear entity queue
                 Utilities.storyCard.update('[RPG_RUNTIME] Entity Queue', {
                     entry: ''
                 });
                 
-                return `Cleanup complete - removed ${removed} test entities, cleared tracker and queue`;
+                // Always clean up debug state when cleanup is run manually
+                let stateCleanup = '';
+                const stateSize = JSON.stringify(state).length;
+                
+                // Reset debug logging
+                if (state.debugLog) {
+                    const oldTurnCount = state.debugLog.turns ? state.debugLog.turns.length : 0;
+                    state.debugLog = {
+                        turns: [],
+                        allErrors: state.debugLog.allErrors ? state.debugLog.allErrors.slice(-20) : [], // Keep last 20 errors
+                        lastRewindData: state.debugLog.lastRewindData // Keep the latest rewind data
+                    };
+                    stateCleanup = `, reset debug logs (was ${oldTurnCount} turns, ${Math.round(stateSize/1000)}KB)`;
+                }
+                
+                // Clean up old rewind backups
+                if (state.rewindBackups) {
+                    const oldBackupCount = state.rewindBackups.length;
+                    delete state.rewindBackups;
+                    stateCleanup += `, cleared ${oldBackupCount} rewind backups`;
+                }
+                
+                // Reset execution times but keep last 20
+                if (state.times && state.times.length > 20) {
+                    state.times = state.times.slice(-20);
+                    stateCleanup += `, trimmed execution times`;
+                }
+                
+                return `Cleanup complete - removed ${removed} test entities, cleaned ${cleaned} tracked entities${stateCleanup}`;
             }
         };
         
@@ -5322,17 +7060,27 @@ function GameState(hook, text) {
     // Handle debug commands directly
     function handleDebugCommand(commandName, args) {
         const debugCommands = [
-            'gw_activate', 'gw_npc', 'gw_monster', 'gw_boss', 
-            'gw_item', 'gw_location', 'gw_quest',
-            'entity_trigger', 'entity_status', 
-            'char_create', 'char_list',
-            'runtime_test', 'schema_all', 'cleanup', 'debug_help'
+            // GenerationWizard tests
+            'gw_activate', 'gw_npc', 'gw_quest', 'gw_location',
+            // Status and listing commands
+            'entity_status', 'char_list', 'schema_all',
+            // System tests
+            'runtime_test', 
+            // Maintenance
+            'cleanup', 
+            // Debug utilities
+            'debug_log', 'debug_help'
         ];
         
         // Check if it's a debug command
         if (debugCommands.includes(commandName)) {
             if (commandName === 'debug_help') {
                 return `\n<<<[DEBUG COMMANDS]\n${debugCommands.filter(c => c !== 'debug_help').map(c => `/${c}`).join('\n')}>>>\n`;
+            }
+            
+            if (commandName === 'debug_log') {
+                const result = outputDebugLog();
+                return `\n<<<${result}>>>\n`;
             }
             
             const result = debugTest(commandName);
@@ -5346,9 +7094,10 @@ function GameState(hook, text) {
     // Expose debug function to global API if debug mode is on
     if (debug) {
         GameState.debugTest = debugTest;
-        console.log(`${MODULE_NAME}: Debug test functions available - use GameState.debugTest('test_name')`);
-        console.log(`${MODULE_NAME}: Available tests: gw_activate, gw_npc, gw_monster, gw_boss, gw_item, gw_location, gw_quest`);
-        console.log(`${MODULE_NAME}: Also: entity_trigger, entity_status, char_create, char_list, runtime_test, health_tool, schema_all, cleanup`);
+        console.log(`${MODULE_NAME}: Debug commands available - use /command_name in input`);
+        console.log(`${MODULE_NAME}: Generation: gw_activate, gw_npc, gw_quest, gw_location`);
+        console.log(`${MODULE_NAME}: Status: entity_status, char_list, schema_all`);
+        console.log(`${MODULE_NAME}: Utilities: runtime_test, cleanup, debug_log, debug_help`);
     }
     
     // ==========================
@@ -5385,7 +7134,13 @@ function GameState(hook, text) {
 
     switch(hook) {
         case 'input':
+            // Initialize debug logging for this turn
+            initDebugLogging();
+            
             if (debug) console.log(`${MODULE_NAME}: Input received: "${text}"`);
+            
+            // Store original input for logging
+            const originalInput = text;
             
             // Load input systems
             loadInputCommands();
@@ -5450,12 +7205,30 @@ function GameState(hook, text) {
             // If GenerationWizard is active, delegate to it
             if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
                 const result = GenerationWizard.process('input', text);
-                return result.active ? '\n' : text;  // Block input if wizard is active
+                const finalResult = result.active ? '\n' : text;
+                
+                // Log the input turn
+                logDebugTurn('input', originalInput, finalResult, {
+                    commandsProcessed: commandResults.length > 0
+                });
+                
+                return finalResult;  // Block input if wizard is active
             }
+            
+            // Log the input turn
+            logDebugTurn('input', originalInput, text, {
+                commandsProcessed: commandResults.length > 0
+            });
             
             return text;
             
         case 'context':
+            // Initialize debug logging for this turn
+            initDebugLogging();
+            
+            // Store original context for logging
+            const originalContext = text;
+            
             // Clear caches for fresh load (before initialization)
             runtimeVariablesCache = null;
             characterCache = null;
@@ -5476,8 +7249,10 @@ function GameState(hook, text) {
             // Inject current scene into the context text
             modifiedText = injectCurrentScene(modifiedText);
             
-            // Process all getters in the entire context
-            modifiedText = processGetters(modifiedText);
+            // Process all getters in the entire context (only if getters exist)
+            if (GETTER_PATTERN.test(modifiedText)) {
+                modifiedText = processGetters(modifiedText);
+            }
             
             // Build trigger name to username mapping and replace in tool usages
             const triggerNameMap = {};
@@ -5530,16 +7305,17 @@ function GameState(hook, text) {
                 ).join('|');
                 
                 const toolPattern = new RegExp(
-                    `(\\w+\\()\\s*(${triggerNames})\\s*(,|\\))`,
+                    `(\\w+\\()(\\s*)(${triggerNames})(\\s*)(,|\\))`,
                     'gi'
                 );
                 
-                modifiedText = modifiedText.replace(toolPattern, (match, func, triggerName, delimiter) => {
+                modifiedText = modifiedText.replace(toolPattern, (match, func, space1, triggerName, space2, delimiter) => {
                     const username = triggerNameMap[triggerName] || triggerName;
                     if (debug && username !== triggerName) {
                         console.log(`${MODULE_NAME}: Replaced trigger name "${triggerName}" with "${username}" in tool usage`);
+                        logEvent(`${MODULE_NAME}: Replaced trigger name "${triggerName}" with "${username}"`)
                     }
-                    return `${func}${username}${delimiter}`;
+                    return `${func}${space1}${username}${space2}${delimiter}`;
                 });
             }
             
@@ -5586,9 +7362,21 @@ function GameState(hook, text) {
                 }
             }
             
+            // Log the context turn
+            logDebugTurn('context', originalContext, modifiedText, {
+                context: modifiedText.substring(0, 1000), // Include first 1000 chars of modified context
+                triggerNamesReplaced: Object.keys(triggerNameMap).length
+            });
+            
             return modifiedText;  // Return the fully modified text
             
         case 'output':
+            // Initialize debug logging for this turn
+            initDebugLogging();
+            
+            // Store original output for logging
+            const originalOutput = text;
+            
             // Log raw output in debug mode
             if (debug) {
                 console.log(`${MODULE_NAME}: Raw output from AI:`);
@@ -5602,22 +7390,32 @@ function GameState(hook, text) {
             if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
                 const result = GenerationWizard.process('output', text);
                 if (result.active) {
+                    // Log early return
+                    logDebugTurn('output', null, null, {
+                        rawOutput: originalOutput,
+                        generationWizardActive: true
+                    });
                     return result.text;  // Return wizard's output (hidden message)
                 }
             }
 
-            loadRuntimeTools();
-            
             // Process tools in LLM's output
             if (text) {
+                // Check if there are any tool patterns first
+                const hasToolPatterns = TOOL_PATTERN.test(text);
+                TOOL_PATTERN.lastIndex = 0; // Reset regex state
+                
+                if (hasToolPatterns) {
+                    loadRuntimeTools();
+                }
+                
                 const result = processTools(text);
                 let modifiedText = result.modifiedText;
                 const executedTools = result.executedTools || [];
                 
                 // Record this output immediately - it will become history next turn
-                // Use the current data position + 1 if we're tracking, otherwise use history length
-                const data = RewindSystem.getStorage();
-                const futurePosition = data.position !== undefined ? data.position + 1 : (history ? history.length : 0);
+                // Position should be current history.length (will be the next index)
+                const futurePosition = history ? Math.min(history.length, RewindSystem.MAX_HISTORY - 1) : 0;
                 RewindSystem.recordAction(text, executedTools, futurePosition);
                 // Log message removed - recordAction logs internally
                 
@@ -5645,8 +7443,17 @@ function GameState(hook, text) {
                     }
                 }
                 
+                // Log the output turn with tools executed
+                logDebugTurn('output', null, null, {
+                    rawOutput: originalOutput,
+                    toolsExecuted: executedTools,
+                    entityQueued: entityQueued,
+                    generationWizardActive: typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()
+                });
+                
                 // Clear caches after processing
                 characterCache = null;
+                locationCache = null;
                 // Clear runtime cache to force refresh on next access
                 runtimeVariablesCache = null;
                 
@@ -5668,6 +7475,13 @@ function GameState(hook, text) {
     };
     GameState.saveCharacter = saveCharacter;
     GameState.createCharacter = createCharacter;
+    
+    // Location management API
+    GameState.loadLocation = loadLocation;
+    GameState.loadAllLocations = loadAllLocations;
+    GameState.saveLocation = saveLocation;
+    GameState.parseLocationCard = parseLocationCard;
+    
     GameState.getPlayerName = function() {
         // Find the first [PLAYER] card
         const playerCard = Utilities.storyCard.find(card => {
@@ -5713,6 +7527,16 @@ function GameState(hook, text) {
         if (current === null || typeof current !== 'number') return false;
         
         return GameState.setField(characterName, fieldPath, current + delta);
+    };
+    
+    // Log execution time
+    const logTime = () => {
+        const duration = Date.now() - begin;
+        state.times.push(duration);
+        if (debug) {
+            console.log(`${MODULE_NAME}: Execution time: ${duration} ms`);
+            logEvent(`${MODULE_NAME}: Execution time: ${duration} ms`);
+        }
     };
     
     return GameState;
