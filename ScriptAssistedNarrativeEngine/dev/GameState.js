@@ -2551,23 +2551,22 @@ function GameState(hook, text) {
             entry += formatSectionData(data, sectionDef.format, character) + '\n';
         }
         
-        // Build keys array - include all names the character might be known by
-        const keys = [character.name];
-        if (character.fullName && character.fullName !== character.name) {
-            keys.push(character.fullName);
-        }
-        if (character.triggerName && character.triggerName !== character.name) {
-            keys.push(character.triggerName);
+        // Characters ARE their cards - if the card doesn't exist, the character doesn't exist
+        // We should only ever be updating existing cards, never creating new ones here
+        const existingCard = Utilities.storyCard.get(character.title);
+        if (!existingCard) {
+            if (debug) console.log(`${MODULE_NAME}: ERROR: Attempted to save non-existent character ${character.name}`);
+            return false;
         }
         
-        // Save the card with multiple keys
-        Utilities.storyCard.upsert({
-            title: character.title,
-            entry: entry,
-            keys: keys.join(',')
+        // Update the card content but NEVER touch the keys
+        // Users may have customized keys for specific purposes
+        Utilities.storyCard.update(character.title, {
+            entry: entry
+            // Deliberately not updating keys - they should only be set during initial creation
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Saved character ${character.name} with keys: ${keys.join(', ')}`);
+        if (debug) console.log(`${MODULE_NAME}: Updated character ${character.name} (preserved existing keys)`);
         return true;
     }
     
@@ -4103,11 +4102,13 @@ function GameState(hook, text) {
             let stageRanges = {};
             
             if (questSchema && questSchema.value) {
-                const parsed = Utilities.config.load('[RPG_SCHEMA] Quest Types');
-                validTypes = [];
-                
-                // Parse quest types and their stage counts
-                for (const [type, stages] of Object.entries(parsed)) {
+                try {
+                    const parsed = Utilities.config.load('[RPG_SCHEMA] Quest Types');
+                    if (parsed && typeof parsed === 'object') {
+                        validTypes = [];
+                        
+                        // Parse quest types and their stage counts
+                        for (const [type, stages] of Object.entries(parsed)) {
                     const typeLower = type.toLowerCase();
                     validTypes.push(typeLower);
                     
@@ -4120,6 +4121,11 @@ function GameState(hook, text) {
                         const exact = parseInt(stageStr);
                         stageRanges[typeLower] = { min: exact, max: exact };
                     }
+                }
+                    }
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Error parsing quest types schema: ${e.message}`);
+                    // Keep default fallback values
                 }
             } else {
                 // Fallback to defaults if schema not found
@@ -4215,33 +4221,38 @@ function GameState(hook, text) {
         complete_quest: function(characterName, questName) {
             if (!characterName || !questName) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
+            try {
+                // Validate character name before processing
+                if (!isValidCharacterName(characterName)) {
+                    return 'malformed';
+                }
+                
+                characterName = String(characterName).toLowerCase();
+                questName = String(questName).toLowerCase().replace(/\s+/g, '_');
+                
+                // Find the quest card
+                const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
+                if (!questCard) {
+                    if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
+                    return 'executed';
+                }
+                
+                // Replace the first line to mark as completed
+                let entry = questCard.entry;
+                entry = entry.replace(
+                    '<\$# Quests><\$## Active Quests>',
+                    '<\$# Quests><\$## Completed Quests>'
+                );
+                
+                // Update the card
+                Utilities.storyCard.update(questCard.title, { entry: entry });
+                
+                if (debug) console.log(`${MODULE_NAME}: Completed quest: ${questName}`);
+                return 'executed';
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Error in complete_quest: ${e.message}`);
                 return 'malformed';
             }
-            
-            characterName = String(characterName).toLowerCase();
-            questName = String(questName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Find the quest card
-            const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
-            if (!questCard) {
-                if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                return 'executed';
-            }
-            
-            // Replace the first line to mark as completed
-            let entry = questCard.entry;
-            entry = entry.replace(
-                '<\$# Quests><\$## Active Quests>',
-                '<\$# Quests><\$## Completed Quests>'
-            );
-            
-            // Update the card
-            Utilities.storyCard.update(questCard.title, { entry: entry });
-            
-            if (debug) console.log(`${MODULE_NAME}: Completed quest: ${questName}`);
-            return 'executed';
         },
 
         abandon_quest: function(characterName, questName) {

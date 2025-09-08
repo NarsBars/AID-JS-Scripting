@@ -1848,7 +1848,8 @@ function GenerationWizard(hook, text) {
             ? collectedData.triggerName 
             : (collectedData.triggerName?.name || null);
         if (triggerNameStr && triggerNameStr !== name) {
-            keysList.push(triggerNameStr);
+            keysList.push(' ' + triggerNameStr);
+            keysList.push('(' + triggerNameStr);
         }
         const keys = keysList.join(', ');
         
