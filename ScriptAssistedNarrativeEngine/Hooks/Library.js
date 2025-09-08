@@ -3643,15 +3643,6 @@ const Utilities = (function() {
     return UtilitiesAPI;
 })();
 
-    // Log execution time
-state.times ??= [];
-    const begin = Date.now();
-    const logTime = () => {
-        const duration = Date.now() - begin;
-        state.times.push(duration);
-            log(`Execution time: ${duration} ms`);
-};
-
 // optional but built in functionality
 function Calendar(hook, text) {
     'use strict';
@@ -8685,12 +8676,77 @@ function GameState(hook, text) {
     
     const debug = true;
     const MODULE_NAME = 'GameState';
+    const begin = Date.now(); // Start timing execution
+    
+    // Initialize execution times array if needed  
+    if (!state.times) {
+        state.times = []; // Array of {hash, hook, duration}
+    }
+    
+    // Variable to track current hash
+    let currentHash = null;
+    
+    // Log execution time on function exit
+    const logTime = () => {
+        const duration = Date.now() - begin;
+        
+        // For output hooks, we have the hash we calculated
+        // For context/input hooks, we'll associate with the next output's hash
+        const timeEntry = {
+            hash: currentHash || 'pending',
+            hook: hook,
+            duration: duration
+        };
+        
+        state.times.push(timeEntry);
+        
+        // Associate pending CONTEXT entries with current output hash
+        // (Input entries keep their own hash from the modified input text)
+        if (hook === 'output' && currentHash) {
+            // Only update pending CONTEXT entries, not input entries
+            for (let i = state.times.length - 2; i >= 0; i--) {
+                if (state.times[i].hash === 'pending' && state.times[i].hook === 'context') {
+                    state.times[i].hash = currentHash;
+                } else if (state.times[i].hash !== 'pending') {
+                    break; // Stop when we hit a non-pending entry
+                }
+            }
+            
+            // Clean up timing entries for hashes no longer in history
+            // Get all valid hashes from RewindSystem
+            const validHashes = new Set();
+            validHashes.add('pending'); // Keep pending entries
+            
+            try {
+                const rewindCards = RewindSystem.getAllCards();
+                rewindCards.forEach(card => {
+                    if (card.data && card.data.entries) {
+                        card.data.entries.forEach(entry => {
+                            if (entry && entry.h) {
+                                validHashes.add(entry.h);
+                            }
+                        });
+                    }
+                });
+            } catch (e) {
+                // If we can't get RewindSystem data, keep all times for safety
+                return;
+            }
+            
+            // Filter to keep only times with valid hashes
+            state.times = state.times.filter(t => validHashes.has(t.hash));
+        }
+        
+        if (debug) {
+            console.log(`${MODULE_NAME} [${hook}]: Execution time: ${duration} ms`);
+        }
+    };
     
     // Check for automatic cleanup FIRST before any processing
     const stateSize = JSON.stringify(state).length;
-    if (stateSize > 60000) {
+    if (stateSize > 50000) {
         if (debug) {
-            console.log(`${MODULE_NAME}: State size ${Math.round(stateSize/1000)}KB exceeds 60KB limit - performing automatic cleanup`);
+            console.log(`${MODULE_NAME}: State size ${Math.round(stateSize/1000)}KB exceeds 50KB limit - performing automatic cleanup`);
         }
         
         // Reset debug logs
@@ -8707,10 +8763,7 @@ function GameState(hook, text) {
             delete state.rewindBackups;
         }
         
-        // Trim execution times
-        if (state.times && state.times.length > 20) {
-            state.times = state.times.slice(-20);
-        }
+        // Times are automatically cleaned up when hashes are removed from history
     }
     
     // Entity generation tracking 
@@ -8761,14 +8814,30 @@ function GameState(hook, text) {
         
         state.debugLog.allErrors.push(errorEntry);
         
-        // Keep only last 100 errors to prevent state bloat
-        if (state.debugLog.allErrors.length > 100) {
-            state.debugLog.allErrors = state.debugLog.allErrors.slice(-100);
+        // When we exceed 40 errors, keep only the last 10
+        // This maintains 10-40 errors in history with full details for debugging
+        if (state.debugLog.allErrors.length > 40) {
+            state.debugLog.allErrors = state.debugLog.allErrors.slice(-10);
         }
     }
     
     // Track processing events for this turn
     let currentTurnEvents = [];
+    
+    // Intercept console.log to capture all debug messages
+    const originalConsoleLog = console.log;
+    console.log = function(...args) {
+        // Call the original console.log
+        originalConsoleLog.apply(console, args);
+        
+        // If in debug mode and message contains MODULE_NAME, capture it
+        if (debug && args.length > 0) {
+            const message = args.join(' ');
+            if (message.includes(MODULE_NAME)) {
+                currentTurnEvents.push(message);
+            }
+        }
+    };
     
     function logEvent(message) {
         if (!debug) return;
@@ -8784,29 +8853,28 @@ function GameState(hook, text) {
         const turnData = {
             hook: hook,
             actionCount: info?.actionCount || state.actionCount || 0,
-            timestamp: new Date().toISOString(),
             events: [...currentTurnEvents], // Capture all events for this turn
-            ...extraData
+            ...extraData // Include all extra data passed in
         };
         
         // Clear events after capturing
         currentTurnEvents = [];
         
-        // Store different data based on hook
+        // Store hook-specific data
         if (hook === 'input') {
-            turnData.inputSummary = inputText ? inputText.substring(0, 100) : '';
             // Track any commands processed
             if (inputText && inputText.includes('/')) {
                 turnData.commandDetected = true;
+                // Extract command names
+                const commandMatches = inputText.match(/\/([a-z_]+)/gi);
+                if (commandMatches) {
+                    turnData.commands = commandMatches;
+                }
             }
         } else if (hook === 'context') {
-            // Track context size and key indicators
+            // Track context size
             turnData.contextSize = inputText ? inputText.length : 0;
         } else if (hook === 'output') {
-            // Store ONLY the raw output
-            turnData.rawOutput = extraData.rawOutput || outputText || '';
-            turnData.outputSize = turnData.rawOutput.length;
-            
             // Check for tools in output
             const toolMatches = outputText ? outputText.match(/([a-z_]+)\s*\([^)]*\)/gi) : [];
             if (toolMatches && toolMatches.length > 0) {
@@ -8912,8 +8980,15 @@ function GameState(hook, text) {
             output += `### Action ${turn.actionCount} - ${turn.hook.toUpperCase()} Hook\n`;
             
             // Show hook-specific debug info
-            if (turn.hook === 'output') {
-                // Extra flags only
+            if (turn.hook === 'input') {
+                if (turn.commands) output += `Commands: ${turn.commands.join(', ')}\n`;
+            } else if (turn.hook === 'context') {
+                if (turn.contextSize) output += `Context Size: ${turn.contextSize} chars\n`;
+                if (turn.triggerNamesReplaced) output += `Trigger Names Replaced: ${turn.triggerNamesReplaced}\n`;
+                if (turn.gettersReplaced) output += `Getters Replaced: ${turn.gettersReplaced}\n`;
+                if (turn.variablesReplaced) output += `Variables Replaced: ${turn.variablesReplaced}\n`;
+            } else if (turn.hook === 'output') {
+                if (turn.toolsInOutput) output += `Tools in Output: ${turn.toolsInOutput.length}\n`;
                 if (turn.entityQueued) output += `Entity Queued: ${turn.entityQueued}\n`;
                 if (turn.generationWizardActive) output += `GenerationWizard Active: ${turn.generationWizardActive}\n`;
             }
@@ -8932,8 +9007,24 @@ function GameState(hook, text) {
         // Get COMPLETE RewindSystem data from the separate storage
         let latestRewindData = state.debugLog.lastRewindData;
         
-        // Add RewindSystem data
-        output += `## Rewind System Data\n\n`;
+        // Build hash to execution times mapping
+        const hashToTimes = {};
+        if (state.times && state.times.length > 0) {
+            state.times.forEach(entry => {
+                if (entry.hash && entry.hash !== 'pending') {
+                    if (!hashToTimes[entry.hash]) {
+                        hashToTimes[entry.hash] = [];
+                    }
+                    hashToTimes[entry.hash].push({
+                        hook: entry.hook,
+                        duration: entry.duration
+                    });
+                }
+            });
+        }
+        
+        // Add RewindSystem data with execution times
+        output += `## Rewind System Data (with Execution Times)\n\n`;
         
         if (latestRewindData) {
             if (latestRewindData.error) {
@@ -8949,7 +9040,16 @@ function GameState(hook, text) {
                         output += `[${entryIndex}]: `;
                         if (entry) {
                             if (entry.h) output += `hash:${entry.h.substring(0, 8)} `;
-                            if (entry.t && entry.t.length > 0) {
+                            
+                            // Check if this is an input entry (has input timing)
+                            const hasInputTiming = entry.h && hashToTimes[entry.h] && 
+                                                  hashToTimes[entry.h].some(t => t.hook === 'input');
+                            
+                            if (hasInputTiming) {
+                                // Input entries show commands instead of tools
+                                output += `(player input)`;
+                            } else if (entry.t && entry.t.length > 0) {
+                                // Output entries show tools
                                 const toolList = entry.t.map(t => {
                                     if (Array.isArray(t)) {
                                         return `${t[0]}(${t[1] ? t[1].join(',') : ''})`;
@@ -8959,6 +9059,13 @@ function GameState(hook, text) {
                                 output += `tools:[${toolList}]`;
                             } else {
                                 output += `no tools`;
+                            }
+                            
+                            // Add execution times if available
+                            if (entry.h && hashToTimes[entry.h]) {
+                                const times = hashToTimes[entry.h];
+                                const timesStr = times.map(t => `${t.hook}:${t.duration}ms`).join(', ');
+                                output += ` | times:[${timesStr}]`;
                             }
                         } else {
                             output += `null entry`;
@@ -8974,12 +9081,10 @@ function GameState(hook, text) {
             output += `No rewind data found in stored turns.\n\n`;
         }
         
-        output += `---\n`;
-        
         // Add ALL ERRORS from the entire adventure
         if (state.debugLog.allErrors && state.debugLog.allErrors.length > 0) {
-            output += `## ALL ERRORS (Entire Adventure)\n\n`;
-            output += `Total Errors: ${state.debugLog.allErrors.length}\n\n`;
+            output += `## Recent Errors (Rolling History)\n\n`;
+            output += `Showing: ${state.debugLog.allErrors.length} errors\n\n`;
             
             state.debugLog.allErrors.forEach((err, index) => {
                 output += `### Error ${index + 1} (Action ${err.actionCount})\n`;
@@ -8994,29 +9099,30 @@ function GameState(hook, text) {
             output += `---\n`;
         }
         
-        // Add execution times
+        // Add execution time averages and context info
         if (state.times && state.times.length > 0) {
-            // Get last 100 times for analysis
-            const recentTimes = state.times.slice(-100);
+            output += `## Execution Time Summary\n\n`;
             
-            // Find the 10 highest times with their turn numbers
-            const timesWithTurns = recentTimes.map((time, index) => ({
-                turn: state.times.length - recentTimes.length + index + 1,
-                time: time
-            }));
+            const byHook = {
+                input: state.times.filter(t => t.hook === 'input'),
+                context: state.times.filter(t => t.hook === 'context'),  
+                output: state.times.filter(t => t.hook === 'output')
+            };
             
-            // Sort by time descending and take top 10
-            const highestTimes = [...timesWithTurns]
-                .sort((a, b) => b.time - a.time)
-                .slice(0, 10);
-            
-            output += `## Execution Times (Highest 10 from last ${recentTimes.length})\n`;
-            highestTimes.forEach(entry => {
-                output += `${entry.turn}: ${entry.time}ms\n`;
+            ['input', 'context', 'output'].forEach(hookType => {
+                const entries = byHook[hookType];
+                if (entries && entries.length > 0) {
+                    const average = Math.round(entries.reduce((sum, e) => sum + e.duration, 0) / entries.length);
+                    const max = Math.max(...entries.map(e => e.duration));
+                    const min = Math.min(...entries.map(e => e.duration));
+                    output += `${hookType.toUpperCase()}: avg ${average}ms (min ${min}ms, max ${max}ms) from ${entries.length} samples\n`;
+                }
             });
             
-            const avgTime = recentTimes.reduce((a, b) => a + b, 0) / recentTimes.length;
-            output += `Average (last ${recentTimes.length}): ${Math.round(avgTime)}ms`;
+            // Add context length
+            if (state.lastContextLength !== undefined) {
+                output += `\nLast Context Length: ${state.lastContextLength} characters\n`;
+            }
         }
         
         // Save to Story Card using upsert
@@ -9429,7 +9535,6 @@ function GameState(hook, text) {
             
             if (debug) {
                 console.log(`${MODULE_NAME}: Loaded ${Object.keys(customTools).length} runtime tools`);
-                logEvent(`${MODULE_NAME}: Loaded ${Object.keys(customTools).length} runtime tools`);
             }
         } catch(e) {
             if (debug) console.log(`${MODULE_NAME}: Failed to load runtime tools: ${e}`);
@@ -9743,7 +9848,6 @@ function GameState(hook, text) {
             if (shouldBackup) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: WARNING: ${backupReason} - creating backup in state`);
-                    logEvent(`${MODULE_NAME}: WARNING: RewindSystem backup created - ${backupReason}`);
                 }
                 
                 // Store backup in state with turn number
@@ -10631,7 +10735,6 @@ function GameState(hook, text) {
         
         if (debug) {
             console.log(`${MODULE_NAME}: Loaded RPG schema`);
-            logEvent(`${MODULE_NAME}: Loaded RPG schema`);
         }
         return schemaCache;
     }
@@ -11196,7 +11299,7 @@ function GameState(hook, text) {
         return {
             prefixTemplate: '{isPlayer?<$# User>}{isNPC?<$# Characters>}',
             mainTemplate: '## **{name}**{fullName? [{fullName}]}',
-            infoTemplate: 'DOB: {dob} | Race: {race} | Gender: {gender}',
+            infoTemplate: '{dob?DOB: {dob} | }{race?Race: {race} | }Gender: {gender}',
             footerTemplate: '{isPlayer?$name is a USER. Do not speak or act for them.}',
             sections: [
                 {
@@ -11296,7 +11399,7 @@ function GameState(hook, text) {
             `## **{name}**{fullName? [{fullName}]}\n` +
             `\n` +
             `## Info Template\n` +
-            `DOB: {dob} | Race: {race} | Gender: {gender}\n` +
+            `{dob?DOB: {dob} | }{race?Race: {race} | }Gender: {gender}\n` +
             `\n` +
             `## Footer Template\n` +
             `{isPlayer?$name is a USER. Do not speak or act for them.}\n` +
@@ -11839,17 +11942,11 @@ function GameState(hook, text) {
             if (parsed && parsed.name) {
                 // Store with lowercase name as key
                 characterCache[parsed.name.toLowerCase()] = parsed;
-                
-                // For [PLAYER] cards, also add 'you' as a key
-                if (card.title.startsWith('[PLAYER]')) {
-                    characterCache['you'] = parsed;
-                }
             }
         }
         
         if (debug) {
             console.log(`${MODULE_NAME}: Loaded ${Object.keys(characterCache).length} characters`);
-            logEvent(`${MODULE_NAME}: Loaded ${Object.keys(characterCache).length} characters`);
         }
         return characterCache;
     }
@@ -12344,7 +12441,6 @@ function GameState(hook, text) {
                 });
                 if (debug) {
                     console.log(`${MODULE_NAME}: Surgically updated character ${character.name}`);
-                    logEvent(`${MODULE_NAME}: Surgically updated character ${character.name}`);
                 }
                 return true;
             }
@@ -13575,66 +13671,127 @@ function GameState(hook, text) {
             title: '[CURRENT SCENE]',
             type: 'data',
             entry: defaultText,
-            description: 'Edit this card to customize what appears in the scene block. Use get_*(params) for dynamic values.'
+            description: 'Edit this card to customize what appears in the scene block. Use get_*(params) for dynamic values.',
+            keys: '.,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"'
         });
         
         if (debug) console.log(`${MODULE_NAME}: Created default Current Scene template with player: ${playerName}`);
         return defaultText;
     }
     
-    function injectCurrentScene(contextText) {
-        // If no history or very early in adventure, don't inject scene yet
-        if (!history || history.length < 3) {
-            return contextText;
-        }
-        
+    function moveCurrentSceneCard(contextText) {
         // Get or create the Current Scene card
         let sceneCard = Utilities.storyCard.get('[CURRENT SCENE]');
         if (!sceneCard) {
+            // Create the default scene card
             createDefaultCurrentScene();
             sceneCard = Utilities.storyCard.get('[CURRENT SCENE]');
         }
         
-        // Just use the raw entry text - getters will be processed later
-        const sceneText = sceneCard.entry;
+        // Look for the scene card content in the context
+        const sceneContent = sceneCard.entry;
+        const sceneIndex = contextText.indexOf(sceneContent);
         
-        // Use -3 to give more breathing room for the actual scene
+        // If no history or very early in adventure, just remove the scene from context
+        if (!history || history.length < 3) {
+            if (sceneIndex === -1) {
+                // Not in context anyway
+                return contextText;
+            }
+            
+            // Remove it from context
+            let beforeScene = contextText.substring(0, sceneIndex);
+            let afterScene = contextText.substring(sceneIndex + sceneContent.length);
+            
+            // Clean up double newlines at both ends
+            if (beforeScene.endsWith('\n\n')) {
+                beforeScene = beforeScene.substring(0, beforeScene.length - 2);
+            }
+            if (afterScene.startsWith('\n\n')) {
+                afterScene = afterScene.substring(2);
+            }
+            
+            // Join with proper spacing
+            if (beforeScene && afterScene) {
+                if (!beforeScene.endsWith('\n')) {
+                    return beforeScene + '\n\n' + afterScene;
+                } else if (!beforeScene.endsWith('\n\n')) {
+                    return beforeScene + '\n' + afterScene;
+                }
+            }
+            return beforeScene + afterScene;
+        }
+        
+        // If scene card isn't in context, nothing to move
+        if (sceneIndex === -1) {
+            return contextText;
+        }
+        
+        // Remove the scene from its current position
+        // Account for potential extra newlines around it
+        let beforeScene = contextText.substring(0, sceneIndex);
+        let afterScene = contextText.substring(sceneIndex + sceneContent.length);
+        
+        // Clean up double newlines at both ends where scene was removed
+        if (beforeScene.endsWith('\n\n')) {
+            beforeScene = beforeScene.substring(0, beforeScene.length - 2);
+        }
+        if (afterScene.startsWith('\n\n')) {
+            afterScene = afterScene.substring(2);
+        }
+        
+        // Ensure we still have proper spacing between remaining entries
+        let cleanedContext = beforeScene;
+        if (beforeScene && afterScene) {
+            // Make sure there's still a double newline between the remaining parts
+            if (!beforeScene.endsWith('\n')) {
+                cleanedContext += '\n\n';
+            } else if (!beforeScene.endsWith('\n\n')) {
+                cleanedContext += '\n';
+            }
+        }
+        cleanedContext += afterScene;
+        
+        // Now find where to insert it (after first sentence of entry at -3)
         const targetIndex = history.length - 3;
         const historyEntry = history[targetIndex];
         
         if (!historyEntry || !historyEntry.text) {
-            return contextText;
+            // If we can't find the target, put it back at the start
+            return sceneContent + '\n\n' + cleanedContext;
         }
         
         const lastEntry = historyEntry.text;
         
-        // Find where this history entry appears in the context
-        const entryIndex = contextText.indexOf(lastEntry);
+        // Find where this history entry appears in the cleaned context
+        const entryIndex = cleanedContext.indexOf(lastEntry);
         if (entryIndex === -1) {
-            return sceneText + '\n\n' + contextText;
+            // If we can't find the entry, put scene at the start
+            return sceneContent + '\n\n' + cleanedContext;
         }
         
         // Find end of first sentence within that entry
         const firstSentenceMatch = lastEntry.match(/^[^.!?]+[.!?]/);
         if (!firstSentenceMatch) {
-            return sceneText + '\n\n' + contextText;
+            // No sentence found, put scene at start
+            return sceneContent + '\n\n' + cleanedContext;
         }
         
         const firstSentence = firstSentenceMatch[0];
         const insertPosition = entryIndex + firstSentence.length;
         
-        // Check what comes after the first sentence
-        const afterSentence = contextText.substring(insertPosition);
+        // Build the new context with scene at new position
+        const beforeInsert = cleanedContext.substring(0, insertPosition);
+        const afterInsert = cleanedContext.substring(insertPosition);
+        
+        // Ensure proper spacing (entries should be separated by double \n)
         let separator = '\n\n';
-        if (afterSentence.startsWith('\n')) {
-            separator = afterSentence.match(/^\n+/)[0].length >= 2 ? '' : '\n';
+        if (afterInsert.startsWith('\n')) {
+            // Already has at least one newline
+            separator = afterInsert.startsWith('\n\n') ? '' : '\n';
         }
         
-        // Build the new context with scene inserted
-        const beforeInsert = contextText.substring(0, insertPosition);
-        const afterInsert = contextText.substring(insertPosition).trimStart();
-        
-        return beforeInsert + separator + sceneText + '\n\n' + afterInsert;
+        return beforeInsert + separator + sceneContent + '\n\n' + afterInsert.trimStart();
     }
     
     // ==========================
@@ -13744,7 +13901,6 @@ function GameState(hook, text) {
                 }
                 if (debug) {
                     console.log(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
-                    logEvent(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
                 }
             } else {
                 character.location = location;
@@ -13765,7 +13921,14 @@ function GameState(hook, text) {
             
             characterName = String(characterName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            quantity = parseInt(quantity);
+            
+            // Strict number validation
+            const qtyStr = String(quantity).trim();
+            if (!/^-?\d+$/.test(qtyStr)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for add_item: ${quantity}`);
+                return 'malformed';
+            }
+            quantity = parseInt(qtyStr);
             
             // 0 or invalid quantity is malformed
             if (isNaN(quantity) || quantity === 0) {
@@ -13779,7 +13942,6 @@ function GameState(hook, text) {
             if (!character) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                    logEvent(`${MODULE_NAME}: Character ${characterName} not found`);
                 }
                 return 'executed'; // Still executed, just no character
             }
@@ -13790,7 +13952,6 @@ function GameState(hook, text) {
             character.inventory[itemName] = newQty;
             if (debug) {
                 console.log(`${MODULE_NAME}: ${character.name}'s ${itemName}: ${currentQty} → ${newQty}`);
-                logEvent(`${MODULE_NAME}: ${character.name}'s ${itemName}: ${currentQty} → ${newQty}`);
             }
             
             saveCharacter(character);
@@ -13807,7 +13968,14 @@ function GameState(hook, text) {
             
             characterName = String(characterName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            quantity = parseInt(quantity);
+            
+            // Strict number validation
+            const qtyStr = String(quantity).trim();
+            if (!/^\d+$/.test(qtyStr)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for remove_item: ${quantity}`);
+                return 'malformed';
+            }
+            quantity = parseInt(qtyStr);
             
             // 0 or invalid quantity is malformed
             if (isNaN(quantity) || quantity <= 0) {
@@ -13852,7 +14020,14 @@ function GameState(hook, text) {
             giverName = String(giverName).toLowerCase();
             receiverName = String(receiverName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            const requestedQty = parseInt(quantity);
+            
+            // Strict number validation
+            const qtyStr = String(quantity).trim();
+            if (!/^\d+$/.test(qtyStr)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for transfer_item: ${quantity}`);
+                return 'malformed';
+            }
+            const requestedQty = parseInt(qtyStr);
             
             // 0 or invalid quantity is malformed
             if (isNaN(requestedQty) || requestedQty <= 0) {
@@ -13926,7 +14101,14 @@ function GameState(hook, text) {
             
             sourceName = sourceName ? String(sourceName).toLowerCase() : 'unknown';
             targetName = String(targetName).toLowerCase();
-            damageAmount = parseInt(damageAmount);
+            
+            // Strict number validation - must be a clean integer
+            const damageStr = String(damageAmount).trim();
+            if (!/^\d+$/.test(damageStr)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid damage amount format: ${damageAmount}`);
+                return 'malformed';
+            }
+            damageAmount = parseInt(damageStr);
             
             // 0 or negative damage is malformed
             if (isNaN(damageAmount) || damageAmount <= 0) {
@@ -13942,7 +14124,6 @@ function GameState(hook, text) {
             if (!target) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Target ${targetName} not found`);
-                    logEvent(`${MODULE_NAME}: Target ${targetName} not found`);
                 }
                 return 'executed';
             }
@@ -13970,7 +14151,14 @@ function GameState(hook, text) {
             }
             
             characterName = String(characterName).toLowerCase();
-            xpAmount = parseInt(xpAmount);
+            
+            // Strict number validation
+            const xpStr = String(xpAmount).trim();
+            if (!/^\d+$/.test(xpStr)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid XP format for add_levelxp: ${xpAmount}`);
+                return 'malformed';
+            }
+            xpAmount = parseInt(xpStr);
             
             // 0 or invalid XP is malformed
             if (isNaN(xpAmount) || xpAmount <= 0) {
@@ -14009,7 +14197,14 @@ function GameState(hook, text) {
             
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
-            xpAmount = parseInt(xpAmount);
+            
+            // Strict number validation
+            const xpStr = String(xpAmount).trim();
+            if (!/^\d+$/.test(xpStr)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid XP format for add_skillxp: ${xpAmount}`);
+                return 'malformed';
+            }
+            xpAmount = parseInt(xpStr);
             
             // 0 or invalid XP is malformed
             if (isNaN(xpAmount) || xpAmount <= 0) {
@@ -14030,7 +14225,7 @@ function GameState(hook, text) {
             
             if (!character.skills[skillName]) {
                 if (debug) console.log(`${MODULE_NAME}: Skill ${skillName} not found on ${character.name}`);
-                return 'executed';
+                return 'malformed';
             }
             
             const schema = loadRPGSchema();
@@ -14070,12 +14265,12 @@ function GameState(hook, text) {
             
             if (!schema.skills.definitions[skillName]) {
                 if (debug) console.log(`${MODULE_NAME}: Skill ${skillName} not in schema`);
-                return 'executed';
+                return 'malformed';
             }
             
             if (character.skills[skillName]) {
                 if (debug) console.log(`${MODULE_NAME}: ${character.name} already has ${skillName}`);
-                return 'executed';
+                return 'malformed';
             }
             
             const maxXP = calculateSkillXPRequirement(skillName, 2, schema);
@@ -14147,7 +14342,14 @@ function GameState(hook, text) {
             
             name1 = String(name1).toLowerCase();
             name2 = String(name2).toLowerCase();
-            changeAmount = parseInt(changeAmount);
+            
+            // Strict number validation (can be negative)
+            const changeStr = String(changeAmount).trim();
+            if (!/^-?\d+$/.test(changeStr)) {
+                if (debug) console.log(`${MODULE_NAME}: Invalid change amount format: ${changeAmount}`);
+                return 'malformed';
+            }
+            changeAmount = parseInt(changeStr);
             
             // 0 change is malformed (why call it?)
             if (isNaN(changeAmount) || changeAmount === 0) {
@@ -14176,7 +14378,6 @@ function GameState(hook, text) {
             if (!char1 || !char2) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
-                    logEvent(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
                 }
                 return 'executed';
             }
@@ -14186,14 +14387,12 @@ function GameState(hook, text) {
                 char1.relationships = {};
                 if (debug) {
                     console.log(`${MODULE_NAME}: Fixed relationships for ${char1.name} - was type: ${typeof char1.relationships}`);
-                    logEvent(`${MODULE_NAME}: Fixed relationships for ${char1.name} - was not an object`);
                 }
             }
             if (typeof char2.relationships !== 'object' || char2.relationships === null) {
                 char2.relationships = {};
                 if (debug) {
                     console.log(`${MODULE_NAME}: Fixed relationships for ${char2.name} - was type: ${typeof char2.relationships}`);
-                    logEvent(`${MODULE_NAME}: Fixed relationships for ${char2.name} - was not an object`);
                 }
             }
             
@@ -14245,7 +14444,6 @@ function GameState(hook, text) {
             if (!character) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                    logEvent(`${MODULE_NAME}: Character ${characterName} not found`);
                 }
                 return 'malformed';
             }
@@ -14830,7 +15028,6 @@ function GameState(hook, text) {
         
         if (debug) {
             console.log(`${MODULE_NAME}: Tracked unknown entity ${entityName} (unique turns: ${tracker[entityName].uniqueTurns.length})`);
-            logEvent(`${MODULE_NAME}: Tracked unknown entity ${entityName} (unique turns: ${tracker[entityName].uniqueTurns.length})`);
         }
     }
     
@@ -15078,13 +15275,11 @@ function GameState(hook, text) {
             if (debug) {
                 const toolCall = `${toolName}(${params.join(',')})`;
                 if (result === 'executed') {
-                    logEvent(`${MODULE_NAME}: Tool EXECUTED: ${toolCall}`);
+                    console.log(`${MODULE_NAME}: Tool EXECUTED: ${toolCall}`);
                 } else if (result === 'malformed') {
                     console.log(`${MODULE_NAME}: Tool MALFORMED: ${toolCall}`);
-                    logEvent(`${MODULE_NAME}: Tool MALFORMED: ${toolCall}`);
                 } else if (result === 'unknown') {
                     console.log(`${MODULE_NAME}: Tool UNKNOWN: ${toolCall}`);
-                    logEvent(`${MODULE_NAME}: Tool UNKNOWN: ${toolCall}`);
                 }
             }
             
@@ -15147,7 +15342,6 @@ function GameState(hook, text) {
                 });
                 if (debug) {
                     console.log(`${MODULE_NAME}: Marking for removal (${result}): ${fullMatch}`);
-                    logEvent(`${MODULE_NAME}: Marking for removal (${result}): ${fullMatch}`);
                 }
             }
         }
@@ -15165,7 +15359,7 @@ function GameState(hook, text) {
             } else {
                 // Removal (malformed/unknown)
                 if (debug) {
-                    logEvent(`${MODULE_NAME}: Removed ${change.reason} tool: ${change.match}`);
+                    console.log(`${MODULE_NAME}: Removed ${change.reason} tool: ${change.match}`);
                 }
                 let cleanedBefore = before;
                 let cleanedAfter = after;
@@ -15258,7 +15452,6 @@ function GameState(hook, text) {
             } catch (e) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Error in ${normalizedToolName}: ${e.message}`);
-                    logEvent(`${MODULE_NAME}: Error in ${normalizedToolName}: ${e.message}`);
                 }
                 logError(e, `Tool execution: ${normalizedToolName}(${params.join(', ')})`);
                 return 'malformed';
@@ -15344,7 +15537,6 @@ function GameState(hook, text) {
             if (!character) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                    logEvent(`${MODULE_NAME}: Character ${characterName} not found`);
                 }
                 return false;
             }
@@ -15638,6 +15830,21 @@ function GameState(hook, text) {
                 let removed = 0;
                 let cleaned = 0;
                 
+                // Clean up old debug data from state
+                if (state.debugLog && state.debugLog.turns) {
+                    // Remove any old fields from turns that we no longer use
+                    state.debugLog.turns.forEach(turn => {
+                        // Remove old fields we were accidentally storing
+                        delete turn.timestamp;
+                        delete turn.inputSummary;
+                        delete turn.commandDetected;
+                        delete turn.outputSize;
+                        delete turn.rawOutput;
+                        delete turn.context;
+                        delete turn.toolsExecuted; // We show this in events now
+                    });
+                }
+                
                 for (const name of testNames) {
                     if (Utilities.storyCard.remove(`[CHARACTER] ${name}`)) removed++;
                     if (Utilities.storyCard.remove(`[PLAYER] ${name}`)) removed++;
@@ -15718,13 +15925,13 @@ function GameState(hook, text) {
                     stateCleanup += `, cleared ${oldBackupCount} rewind backups`;
                 }
                 
-                // Reset execution times but keep last 20
-                if (state.times && state.times.length > 20) {
-                    state.times = state.times.slice(-20);
+                // Reset execution times but keep last 100 (just integers)
+                if (state.times && state.times.length > 100) {
+                    state.times = state.times.slice(-100);
                     stateCleanup += `, trimmed execution times`;
                 }
                 
-                return `Cleanup complete - removed ${removed} test entities, cleaned ${cleaned} tracked entities${stateCleanup}`;
+                return `<<<Cleanup complete - removed ${removed} test entities, cleaned ${cleaned} tracked entities${stateCleanup}>>>`;
             }
         };
         
@@ -15881,7 +16088,12 @@ function GameState(hook, text) {
             
             // If any commands were processed, return their combined results
             if (commandResults.length > 0) {
-                return commandResults.join('\n');
+                logTime();
+                const result = commandResults.join('\n');
+                // Calculate hash of the result
+                currentHash = RewindSystem.quickHash(result);
+                logTime();
+                return result;
             }
             
             // If GenerationWizard is active, delegate to it
@@ -15894,6 +16106,9 @@ function GameState(hook, text) {
                     commandsProcessed: commandResults.length > 0
                 });
                 
+                // Calculate hash of the final result
+                currentHash = RewindSystem.quickHash(finalResult);
+                logTime();
                 return finalResult;  // Block input if wizard is active
             }
             
@@ -15902,6 +16117,10 @@ function GameState(hook, text) {
                 commandsProcessed: commandResults.length > 0
             });
             
+            // Calculate hash of the modified input text (what will be stored in history)
+            currentHash = RewindSystem.quickHash(text);
+            
+            logTime();
             return text;
             
         case 'context':
@@ -15910,6 +16129,12 @@ function GameState(hook, text) {
             
             // Store original context for logging
             const originalContext = text;
+            
+            // Store context length for debug output
+            if (!state.lastContextLength) {
+                state.lastContextLength = 0;
+            }
+            state.lastContextLength = text ? text.length : 0;
             
             // Clear caches for fresh load (before initialization)
             runtimeVariablesCache = null;
@@ -15928,11 +16153,14 @@ function GameState(hook, text) {
             // Remove any hidden message markers from previous turns (including surrounding newlines)
             let modifiedText = text.replace(/\n*<<<[^>]*>>>\n*/g, '');
             
-            // Inject current scene into the context text
-            modifiedText = injectCurrentScene(modifiedText);
+            // Move current scene card if it exists (before processing getters)
+            modifiedText = moveCurrentSceneCard(modifiedText);
             
             // Process all getters in the entire context (only if getters exist)
+            let gettersReplaced = 0;
             if (GETTER_PATTERN.test(modifiedText)) {
+                const getterMatches = modifiedText.match(GETTER_PATTERN);
+                gettersReplaced = getterMatches ? getterMatches.length : 0;
                 modifiedText = processGetters(modifiedText);
             }
             
@@ -15987,17 +16215,16 @@ function GameState(hook, text) {
                 ).join('|');
                 
                 const toolPattern = new RegExp(
-                    `(\\w+\\()\\s*(${triggerNames})\\s*(,|\\))`,
+                    `(\\w+\\()(\\s*)(${triggerNames})(\\s*)(,|\\))`,
                     'gi'
                 );
                 
-                modifiedText = modifiedText.replace(toolPattern, (match, func, triggerName, delimiter) => {
+                modifiedText = modifiedText.replace(toolPattern, (match, func, space1, triggerName, space2, delimiter) => {
                     const username = triggerNameMap[triggerName] || triggerName;
                     if (debug && username !== triggerName) {
                         console.log(`${MODULE_NAME}: Replaced trigger name "${triggerName}" with "${username}" in tool usage`);
-                        logEvent(`${MODULE_NAME}: Replaced trigger name "${triggerName}" with "${username}"`)
                     }
-                    return `${func}${username}${delimiter}`;
+                    return `${func}${space1}${username}${space2}${delimiter}`;
                 });
             }
             
@@ -16046,10 +16273,12 @@ function GameState(hook, text) {
             
             // Log the context turn
             logDebugTurn('context', originalContext, modifiedText, {
-                context: modifiedText.substring(0, 1000), // Include first 1000 chars of modified context
-                triggerNamesReplaced: Object.keys(triggerNameMap).length
+                // Don't include actual context text to save state space
+                triggerNamesReplaced: Object.keys(triggerNameMap).length,
+                gettersReplaced: gettersReplaced
             });
             
+            logTime();
             return modifiedText;  // Return the fully modified text
             
         case 'output':
@@ -16074,7 +16303,6 @@ function GameState(hook, text) {
                 if (result.active) {
                     // Log early return
                     logDebugTurn('output', null, null, {
-                        rawOutput: originalOutput,
                         generationWizardActive: true
                     });
                     return result.text;  // Return wizard's output (hidden message)
@@ -16094,6 +16322,9 @@ function GameState(hook, text) {
                 const result = processTools(text);
                 let modifiedText = result.modifiedText;
                 const executedTools = result.executedTools || [];
+                
+                // Calculate hash AFTER tool removal so it matches what gets stored
+                currentHash = RewindSystem.quickHash(modifiedText);
                 
                 // Record this output immediately - it will become history next turn
                 // Position should be current history.length (will be the next index)
@@ -16127,7 +16358,6 @@ function GameState(hook, text) {
                 
                 // Log the output turn with tools executed
                 logDebugTurn('output', null, null, {
-                    rawOutput: originalOutput,
                     toolsExecuted: executedTools,
                     entityQueued: entityQueued,
                     generationWizardActive: typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()
@@ -16139,6 +16369,7 @@ function GameState(hook, text) {
                 // Clear runtime cache to force refresh on next access
                 runtimeVariablesCache = null;
                 
+                logTime();
                 return modifiedText;
             }
             break;
@@ -16211,15 +16442,7 @@ function GameState(hook, text) {
         return GameState.setField(characterName, fieldPath, current + delta);
     };
     
-    // Log execution time
-    const logTime = () => {
-        const duration = Date.now() - begin;
-        state.times.push(duration);
-        if (debug) {
-            console.log(`${MODULE_NAME}: Execution time: ${duration} ms`);
-            logEvent(`${MODULE_NAME}: Execution time: ${duration} ms`);
-        }
-    };
-    
+    // Log execution time before returning
+    logTime();
     return GameState;
 }
