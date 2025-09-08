@@ -2548,25 +2548,25 @@ function GameState(hook, text) {
             if (sectionDef.format === 'plain_text' && !data) continue;
             
             entry += `### ${sectionDef.displayName}\n`;
-            entry += formatSectionData(data, sectionDef.format, character) + '\n';
+            const sectionContent = formatSectionData(data, sectionDef.format, character);
+            if (sectionContent) {
+                entry += sectionContent + '\n';
+            }
         }
         
         // Characters ARE their cards - if the card doesn't exist, the character doesn't exist
-        // We should only ever be updating existing cards, never creating new ones here
         const existingCard = Utilities.storyCard.get(character.title);
         if (!existingCard) {
             if (debug) console.log(`${MODULE_NAME}: ERROR: Attempted to save non-existent character ${character.name}`);
             return false;
         }
         
-        // Update the card content but NEVER touch the keys
-        // Users may have customized keys for specific purposes
+        // Update the card content
         Utilities.storyCard.update(character.title, {
             entry: entry
-            // Deliberately not updating keys - they should only be set during initial creation
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Updated character ${character.name} (preserved existing keys)`);
+        if (debug) console.log(`${MODULE_NAME}: Updated character ${character.name}`);
         return true;
     }
     
