@@ -17,8 +17,7 @@ function GameState(hook, text) {
     const logTime = () => {
         const duration = Date.now() - begin;
         
-        // For output hooks, we have the hash we calculated
-        // For context/input hooks, we'll associate with the next output's hash
+        // hash track hash track
         const timeEntry = {
             hash: currentHash || 'pending',
             hook: hook,
@@ -80,8 +79,8 @@ function GameState(hook, text) {
         if (state.debugLog) {
             state.debugLog = {
                 turns: [],
-                allErrors: state.debugLog.allErrors ? state.debugLog.allErrors.slice(-10) : [], // Keep only last 10 errors
-                lastRewindData: null // Clear rewind data too
+                allErrors: state.debugLog.allErrors ? state.debugLog.allErrors.slice(-10) : [], // Keep last X errors
+                lastRewindData: null // Clear rewind data backup too
             };
         }
         
@@ -105,7 +104,7 @@ function GameState(hook, text) {
     // ==========================
     // Debug Logging System
     // ==========================
-    const MAX_DEBUG_TURNS = 20; // Keep only last 20 turns
+    const MAX_DEBUG_TURNS = 5; // Keep only last 5 turns to save state space
     
     function initDebugLogging() {
         if (!debug) return;
@@ -141,8 +140,7 @@ function GameState(hook, text) {
         
         state.debugLog.allErrors.push(errorEntry);
         
-        // When we exceed 40 errors, keep only the last 10
-        // This maintains 10-40 errors in history with full details for debugging
+        // When we exceed X errors, keep only the last Y
         if (state.debugLog.allErrors.length > 40) {
             state.debugLog.allErrors = state.debugLog.allErrors.slice(-10);
         }
@@ -208,7 +206,7 @@ function GameState(hook, text) {
                 turnData.toolsInOutput = toolMatches;
             }
             
-            // Capture ENTIRE RewindSystem data from all Story Cards
+            // Capture RewindSystem data - store only essential info to prevent memory issues
             let rewindData = {
                 cards: [],
                 totalEntries: 0,
@@ -218,14 +216,23 @@ function GameState(hook, text) {
             try {
                 const rewindCards = RewindSystem.getAllCards();
                 rewindCards.forEach(card => {
-                    // Store complete card data including title and all entries
+                    // For each entry, store only hash and tools (not full text)
+                    const compactEntries = (card.data?.entries || []).map(entry => {
+                        if (!entry) return null;
+                        // Keep only essential fields
+                        return {
+                            h: entry.h,  // hash
+                            t: entry.t   // tools (if any)
+                        };
+                    }).filter(e => e !== null);
+                    
                     const cardData = {
                         title: card.title,
-                        entries: card.data ? card.data.entries : [],
+                        entries: compactEntries,
                         position: card.data ? card.data.position : -1
                     };
                     rewindData.cards.push(cardData);
-                    rewindData.totalEntries += cardData.entries.length;
+                    rewindData.totalEntries += compactEntries.length;
                     if (cardData.position > rewindData.position) {
                         rewindData.position = cardData.position;
                     }
@@ -236,7 +243,7 @@ function GameState(hook, text) {
                 logError(e, 'Failed to read RewindSystem cards');
             }
             
-            // Store the ENTIRE RewindSystem data in state
+            // Store the compact RewindSystem data in state as backup
             turnData.rewindData = rewindData;
             
             // Track state size at this point
@@ -266,8 +273,7 @@ function GameState(hook, text) {
             }
         }
         
-        // Always store RewindSystem data in a separate location for the last turn only
-        // This ensures we have it for debugging without bloating the turn history
+        // Store complete RewindSystem data as backup (includes position info)
         state.debugLog.lastRewindData = turnData.rewindData;
     }
     
@@ -312,7 +318,12 @@ function GameState(hook, text) {
             } else if (turn.hook === 'context') {
                 if (turn.contextSize) output += `Context Size: ${turn.contextSize} chars\n`;
                 if (turn.triggerNamesReplaced) output += `Trigger Names Replaced: ${turn.triggerNamesReplaced}\n`;
-                if (turn.gettersReplaced) output += `Getters Replaced: ${turn.gettersReplaced}\n`;
+                if (turn.gettersReplaced && Object.keys(turn.gettersReplaced).length > 0) {
+                    const getterList = Object.entries(turn.gettersReplaced)
+                        .map(([name, count]) => count > 1 ? `${name}(${count})` : name)
+                        .join(', ');
+                    output += `Getters Replaced: ${getterList}\n`;
+                }
                 if (turn.variablesReplaced) output += `Variables Replaced: ${turn.variablesReplaced}\n`;
             } else if (turn.hook === 'output') {
                 if (turn.toolsInOutput) output += `Tools in Output: ${turn.toolsInOutput.length}\n`;
@@ -462,22 +473,32 @@ function GameState(hook, text) {
         
         Utilities.storyCard.upsert(debugCard);
         
-        // Pin debug card to top for easy access
+        // Pin debug card after player cards for easy access
         try {
             const debugCardObj = Utilities.storyCard.get('[DEBUG] Debug Log');
-            if (debugCardObj && typeof worldInfo !== 'undefined' && worldInfo.length > 1) {
+            if (debugCardObj && typeof storyCards !== 'undefined' && storyCards.length > 1) {
                 // Sort by update time (newest first)
-                worldInfo.sort((a, b) => {
+                storyCards.sort((a, b) => {
                     const timeA = a.updatedAt ? Date.parse(a.updatedAt) : 0;
                     const timeB = b.updatedAt ? Date.parse(b.updatedAt) : 0;
                     return timeB - timeA;
                 });
                 
-                // Move debug card to top
-                const debugIndex = worldInfo.findIndex(card => card.title === '[DEBUG] Debug Log');
-                if (debugIndex > 0) {
-                    const [debugEntry] = worldInfo.splice(debugIndex, 1);
-                    worldInfo.unshift(debugEntry);
+                // Count player cards at top
+                let playerCount = 0;
+                for (const card of storyCards) {
+                    if (card && card.title && card.title.startsWith('[PLAYER]')) {
+                        playerCount++;
+                    } else {
+                        break; // Stop when we hit non-player cards
+                    }
+                }
+                
+                // Move debug card after player cards
+                const debugIndex = storyCards.findIndex(card => card.title === '[DEBUG] Debug Log');
+                if (debugIndex >= 0 && debugIndex !== playerCount) {
+                    const [debugEntry] = storyCards.splice(debugIndex, 1);
+                    storyCards.splice(playerCount, 0, debugEntry);
                 }
             }
         } catch (e) {
@@ -544,7 +565,7 @@ function GameState(hook, text) {
             false  // Don't cache in Utilities (we cache locally)
         ) || {};
         
-        if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(runtimeVariablesCache).length} runtime variables`);
+        if (debug) log(`${MODULE_NAME}: Loaded ${Object.keys(runtimeVariablesCache).length} runtime variables`);
         return runtimeVariablesCache;
     }
     
@@ -861,7 +882,7 @@ function GameState(hook, text) {
             }
             
             if (debug) {
-                console.log(`${MODULE_NAME}: Loaded ${Object.keys(customTools).length} runtime tools`);
+                log(`${MODULE_NAME}: Loaded ${Object.keys(customTools).length} runtime tools`);
             }
         } catch(e) {
             if (debug) console.log(`${MODULE_NAME}: Failed to load runtime tools: ${e}`);
@@ -876,7 +897,7 @@ function GameState(hook, text) {
     function loadInputCommands() {
         const commandsCard = Utilities.storyCard.get('[RPG_RUNTIME] INPUT_COMMANDS');
         if (!commandsCard) {
-            if (debug) console.log(`${MODULE_NAME}: No input commands card found`);
+            if (debug) log(`${MODULE_NAME}: No input commands card found`);
             return;
         }
         
@@ -887,7 +908,7 @@ function GameState(hook, text) {
             // Check if only comments (no actual code)
             const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
             if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: No commands defined (only comments)`);
+                if (debug) log(`${MODULE_NAME}: No commands defined (only comments)`);
                 return;
             }
             
@@ -897,7 +918,7 @@ function GameState(hook, text) {
             try {
                 commands = eval(code);
             } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse commands, using empty object: ${e}`);
+                if (debug) log(`${MODULE_NAME}: Failed to parse commands, using empty object: ${e}`);
                 logError(e, 'Failed to parse INPUT_COMMANDS');
                 commands = {};
             }
@@ -909,9 +930,9 @@ function GameState(hook, text) {
                 inputCommands[name] = createCommandHandler(name, func);
             }
             
-            if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(commands).length} input commands`);
+            if (debug) log(`${MODULE_NAME}: Loaded ${Object.keys(commands).length} input commands`);
         } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load input commands: ${e}`);
+            if (debug) log(`${MODULE_NAME}: Failed to load input commands: ${e}`);
         }
         
     }
@@ -970,7 +991,7 @@ function GameState(hook, text) {
     function loadContextModifier() {
         const modifierCard = Utilities.storyCard.get('[RPG_RUNTIME] CONTEXT_MODIFIER');
         if (!modifierCard) {
-            if (debug) console.log(`${MODULE_NAME}: No context modifier card found`);
+            if (debug) log(`${MODULE_NAME}: No context modifier card found`);
             return;
         }
         
@@ -981,7 +1002,7 @@ function GameState(hook, text) {
             // Skip if only comments
             const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
             if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: Context modifier is empty (only comments), using pass-through`);
+                if (debug) log(`${MODULE_NAME}: Context modifier is empty (only comments), using pass-through`);
                 contextModifier = (text) => text;
                 return;
             }
@@ -991,15 +1012,15 @@ function GameState(hook, text) {
             const funcCode = `(function(text) { ${codeWithReturn} })`;
             contextModifier = eval(funcCode);
             
-            if (debug) console.log(`${MODULE_NAME}: Loaded context modifier`);
+            if (debug) log(`${MODULE_NAME}: Loaded context modifier`);
         } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load context modifier: ${e}`);
+            if (debug) log(`${MODULE_NAME}: Failed to load context modifier: ${e}`);
             contextModifier = null;
         }
     }
     
     // ==========================
-    // Input/Output Modifiers (Pure JavaScript Sandboxes)
+    // Input/Output Modifiers
     // ==========================
     let inputModifier = null;
     let outputModifier = null;
@@ -1007,7 +1028,7 @@ function GameState(hook, text) {
     function loadInputModifier() {
         const modifierCard = Utilities.storyCard.get('[RPG_RUNTIME] INPUT_MODIFIER');
         if (!modifierCard) {
-            if (debug) console.log(`${MODULE_NAME}: No input modifier card found`);
+            if (debug) log(`${MODULE_NAME}: No input modifier card found`);
             return;
         }
         
@@ -1018,7 +1039,7 @@ function GameState(hook, text) {
             // Skip if only comments
             const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
             if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: Input modifier is empty (only comments), using pass-through`);
+                if (debug) log(`${MODULE_NAME}: Input modifier is empty (only comments), using pass-through`);
                 inputModifier = (text) => text;
                 return;
             }
@@ -1028,10 +1049,10 @@ function GameState(hook, text) {
             const funcCode = `(function(text) { ${codeWithReturn} })`;
             inputModifier = eval(funcCode);
             
-            if (debug) console.log(`${MODULE_NAME}: Loaded input modifier`);
+            if (debug) log(`${MODULE_NAME}: Loaded input modifier`);
         } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load input modifier: ${e}`);
-            if (debug) console.log(`${MODULE_NAME}: Input modifier code was: ${modifierCard.entry}`);
+            if (debug) log(`${MODULE_NAME}: Failed to load input modifier: ${e}`);
+            if (debug) log(`${MODULE_NAME}: Input modifier code was: ${modifierCard.entry}`);
             inputModifier = null;
         }
     }
@@ -1039,7 +1060,7 @@ function GameState(hook, text) {
     function loadOutputModifier() {
         const modifierCard = Utilities.storyCard.get('[RPG_RUNTIME] OUTPUT_MODIFIER');
         if (!modifierCard) {
-            if (debug) console.log(`${MODULE_NAME}: No output modifier card found`);
+            if (debug) log(`${MODULE_NAME}: No output modifier card found`);
             return;
         }
         
@@ -1050,7 +1071,6 @@ function GameState(hook, text) {
             // Skip if only comments
             const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
             if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: Output modifier is empty (only comments), using pass-through`);
                 outputModifier = (text) => text;
                 return;
             }
@@ -1060,10 +1080,10 @@ function GameState(hook, text) {
             const funcCode = `(function(text) { ${codeWithReturn} })`;
             outputModifier = eval(funcCode);
             
-            if (debug) console.log(`${MODULE_NAME}: Loaded output modifier`);
+            if (debug) log(`${MODULE_NAME}: Loaded output modifier`);
         } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load output modifier: ${e}`);
-            if (debug) console.log(`${MODULE_NAME}: Output modifier code was: ${modifierCard.entry}`);
+            if (debug) log(`${MODULE_NAME}: Failed to load output modifier: ${e}`);
+            if (debug) log(`${MODULE_NAME}: Output modifier code was: ${modifierCard.entry}`);
             outputModifier = null;
         }
     }
@@ -1273,7 +1293,7 @@ function GameState(hook, text) {
                 }
             }
             
-            if (debug) console.log(`${MODULE_NAME}: Saved ${data.entries.length} entries across ${cards.length} cards`);
+            if (debug) log(`${MODULE_NAME}: Saved ${data.entries.length} entries across ${cards.length} cards`);
         },
         
         // Quick hash function for text comparison
@@ -1310,7 +1330,7 @@ function GameState(hook, text) {
                 if (existingHash !== hash) {
                     // Different content at this position - truncate everything after it
                     data.entries = data.entries.slice(0, position);
-                    if (debug) console.log(`${MODULE_NAME}: New timeline branch at position ${position}, truncated future entries`);
+                    if (debug) log(`${MODULE_NAME}: New timeline branch at position ${position}, truncated future entries`);
                 }
             }
             
@@ -1331,19 +1351,19 @@ function GameState(hook, text) {
             }
             
             RewindSystem.saveStorage(data);
-            if (debug) console.log(`${MODULE_NAME}: Recorded action at position ${position} with ${tools.length} tools`);
+            if (debug) log(`${MODULE_NAME}: Recorded action at position ${position} with ${tools.length} tools`);
         },
         
         // Find current position by matching history
         findCurrentPosition: function() {
             const data = RewindSystem.getStorage();
             if (!history || history.length === 0) {
-                if (debug) console.log(`${MODULE_NAME}: No history available`);
+                if (debug) log(`${MODULE_NAME}: No history available`);
                 return { matched: false, position: -1 };
             }
             
             if (data.entries.length === 0) {
-                if (debug) console.log(`${MODULE_NAME}: No stored entries yet`);
+                if (debug) log(`${MODULE_NAME}: No stored entries yet`);
                 return { matched: false, position: -1 };
             }
             
@@ -1375,7 +1395,7 @@ function GameState(hook, text) {
                 }
                 
                 if (verified) {
-                    if (debug) console.log(`${MODULE_NAME}: Current position: ${expectedPosition} (history length: ${historyLength})`);
+                    if (debug) log(`${MODULE_NAME}: Current position: ${expectedPosition} (history length: ${historyLength})`);
                     return { matched: true, position: expectedPosition };
                 } else {
                     if (debug) console.log(`${MODULE_NAME}: Position mismatch - history doesn't match stored data`);
@@ -1420,7 +1440,7 @@ function GameState(hook, text) {
                 // Update position to match current history length
                 data.position = Math.min(position, history.length - 1);
                 
-                if (debug) console.log(`${MODULE_NAME}: Discarded entries after position ${position}, keeping ${data.entries.length} entries`);
+                if (debug) log(`${MODULE_NAME}: Discarded entries after position ${position}, keeping ${data.entries.length} entries`);
             }
             
             // Now rehash the current history entries from the edit point forward
@@ -1435,7 +1455,7 @@ function GameState(hook, text) {
             }
             
             RewindSystem.saveStorage(data);
-            if (debug) console.log(`${MODULE_NAME}: Rehashed from position ${position}`);
+            if (debug) log(`${MODULE_NAME}: Rehashed from position ${position}`);
         },
         
         // Get tool reversions for rewinding
@@ -1462,7 +1482,7 @@ function GameState(hook, text) {
             const currentPos = data.position;
             
             if (targetPosition >= currentPos) {
-                if (debug) console.log(`${MODULE_NAME}: Cannot rewind forward`);
+                if (debug) log(`${MODULE_NAME}: Cannot rewind forward`);
                 return false;
             }
             
@@ -1621,7 +1641,7 @@ function GameState(hook, text) {
         handleContext: function() {
             // Check if history is available
             if (typeof history === 'undefined' || !history) {
-                if (debug) console.log(`${MODULE_NAME}: History not available in context`);
+                if (debug) log(`${MODULE_NAME}: History not available in context`);
                 return;
             }
             
@@ -1639,7 +1659,7 @@ function GameState(hook, text) {
                     const historyHash = RewindSystem.quickHash(history[0].text);
                     if (data.entries[0].h !== historyHash) {
                         shifted = true;
-                        if (debug) console.log(`${MODULE_NAME}: History array shifted - realigning entries`);
+                        if (debug) log(`${MODULE_NAME}: History array shifted - realigning entries`);
                     }
                 }
             }
@@ -1665,7 +1685,7 @@ function GameState(hook, text) {
                 // All other entries are assumed to be restored/already executed
                 if (i === historyLength - 1 && i > oldPosition) {
                     // This is the newest entry and it's beyond our last position - execute tools
-                    if (debug) console.log(`${MODULE_NAME}: Processing genuinely new entry at position ${i}`);
+                    if (debug) log(`${MODULE_NAME}: Processing genuinely new entry at position ${i}`);
                     const tools = RewindSystem.extractAndExecuteTools(historyEntry.text);
                     data.entries[i] = {
                         h: hash,
@@ -1676,7 +1696,7 @@ function GameState(hook, text) {
                     // 1. A restored entry from history (middle entries)
                     // 2. Not beyond our last known position
                     // Just track hash, don't execute tools
-                    if (debug) console.log(`${MODULE_NAME}: Tracking entry at position ${i} without execution (restored or old)`);
+                    if (debug) log(`${MODULE_NAME}: Tracking entry at position ${i} without execution (restored or old)`);
                     
                     // Extract tools without executing them (for tracking purposes)
                     const toolMatches = [];
@@ -1719,7 +1739,7 @@ function GameState(hook, text) {
             data.position = historyLength - 1;
             RewindSystem.saveStorage(data);
             
-            if (debug) console.log(`${MODULE_NAME}: History check complete - ${data.entries.length} entries tracked`);
+            if (debug) log(`${MODULE_NAME}: History check complete - ${data.entries.length} entries tracked`);
         }
     };
     
@@ -1895,7 +1915,7 @@ function GameState(hook, text) {
             created = true;
         }
         
-        if (debug && created) console.log(`${MODULE_NAME}: Created runtime cards with defaults`);
+        if (debug && created) log(`${MODULE_NAME}: Created runtime cards with defaults`);
         return created;
     }
     
@@ -1908,22 +1928,13 @@ function GameState(hook, text) {
                 entry: (
                     `# entity_threshold\n` +
                     `3\n` +
-                    `\n` +
                     `# auto_generate\n` +
                     `true\n` +
-                    `\n` +
                     `# entity_blacklist\n` +
                     `player, self, me, you, unknown`
                 ),
                 description: `// Entity tracking data\n`
             });
-        }
-        
-        // Entity templates are now handled by GenerationWizard
-        // Remove old template card if it exists
-        if (Utilities.storyCard.get('[RPG_RUNTIME] Entity Templates')) {
-            Utilities.storyCard.remove('[RPG_RUNTIME] Entity Templates');
-            if (debug) console.log(`${MODULE_NAME}: Removed deprecated [RPG_RUNTIME] Entity Templates - now using GenerationWizard`);
         }
         
         // Skip creating entity templates (deprecated)
@@ -2002,7 +2013,7 @@ function GameState(hook, text) {
             });
         }
         
-        if (debug) console.log(`${MODULE_NAME}: Created entity tracker cards`);
+        if (debug) log(`${MODULE_NAME}: Created entity tracker cards`);
     }
     
     // ==========================
@@ -2061,7 +2072,7 @@ function GameState(hook, text) {
         }
         
         if (debug) {
-            console.log(`${MODULE_NAME}: Loaded RPG schema`);
+            log(`${MODULE_NAME}: Loaded RPG schema`);
         }
         return schemaCache;
     }
@@ -2086,7 +2097,7 @@ function GameState(hook, text) {
             description: 'Edit master attributes (required for all characters) and additional attributes (optional)'
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Attributes schema`);
+        if (debug) log(`${MODULE_NAME}: Created default Attributes schema`);
     }
     
     function createDefaultCoreStatsSchema() {
@@ -2111,7 +2122,7 @@ function GameState(hook, text) {
             description: 'Core stats with X/MAX format. per_level_formula is added to max when leveling up'
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Core Stats schema`);
+        if (debug) log(`${MODULE_NAME}: Created default Core Stats schema`);
     }
     
     function createDefaultSkillsSchema() {
@@ -2143,7 +2154,7 @@ function GameState(hook, text) {
             description: 'Define skill categories and individual skills. Skills can use category or custom formula'
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Skills schema`);
+        if (debug) log(`${MODULE_NAME}: Created default Skills schema`);
     }
     
     function createDefaultLevelProgressionSchema() {
@@ -2166,7 +2177,7 @@ function GameState(hook, text) {
             description: 'XP required for each level. Use formula for scaling, overrides for specific levels'
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Level Progression schema`);
+        if (debug) log(`${MODULE_NAME}: Created default Level Progression schema`);
     }
     
     function parseAttributesSchema(text, attributes) {
@@ -2263,6 +2274,13 @@ function GameState(hook, text) {
     }
     
     function calculateXPRequirement(level, formula, overrides) {
+        // If formula not provided, load from schema
+        if (!formula) {
+            const schema = loadRPGSchema();
+            formula = schema.levelProgression?.formula || 'level * 100';
+            overrides = overrides || schema.levelProgression?.overrides || {};
+        }
+        
         // Check for override first
         if (overrides && overrides[level]) {
             return overrides[level];
@@ -2392,7 +2410,7 @@ function GameState(hook, text) {
             description: 'Configure relationship value ranges and their descriptions. These appear in character sheets and logs.'
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Relationship Thresholds schema`);
+        if (debug) log(`${MODULE_NAME}: Created default Relationship Thresholds schema`);
     }
     
     // ==========================
@@ -2425,7 +2443,7 @@ function GameState(hook, text) {
         try {
             characterFormatCache = parseCharacterFormatSchema(formatCard.description || formatCard.entry);
         } catch (e) {
-            if (debug) console.log(`${MODULE_NAME}: Error parsing character format: ${e}. Using defaults.`);
+            if (debug) log(`${MODULE_NAME}: Error parsing character format: ${e}. Using defaults.`);
             logError(e, 'Failed to parse character format schema');
             characterFormatCache = getDefaultCharacterFormat();
         }
@@ -2471,13 +2489,42 @@ function GameState(hook, text) {
             
             // Parse based on current section
             switch (currentSection) {
+                case 'sections':
+                    // Parse unified format: id: **Pattern** | format_type
+                    // Also support old multi-line format for backward compatibility
+                    if (line.includes(':')) {
+                        const match = line.match(/^([a-z_]+):\s*(.+?)(?:\s*\|\s*([a-z_]+))?$/);
+                        if (match) {
+                            const [, id, pattern, formatType] = match;
+                            
+                            // Add to sections array
+                            const section = {
+                                id: id,
+                                format: formatType || 'plain_text'
+                            };
+                            format.sections.push(section);
+                            
+                            // Add to section order (implicit from list order)
+                            format.sectionOrder.push(id);
+                            
+                            // Add pattern
+                            format.sectionPatterns[id] = pattern.trim();
+                            
+                            // Add format
+                            if (formatType) {
+                                format.sectionFormats[id] = formatType;
+                            }
+                        }
+                    }
+                    break;
+                    
                 case 'section definitions':
-                    // Parse: just the section id, one per line
+                    // Legacy support - parse just the section id
                     const id = line.trim();
                     if (id && id.match(/^[a-z_]+$/)) {
                         format.sections.push({
                             id: id,
-                            format: 'plain_text' // default, will be overridden
+                            format: 'plain_text'
                         });
                     }
                     break;
@@ -2763,7 +2810,7 @@ function GameState(hook, text) {
             )
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Character Format schema`);
+        if (debug) log(`${MODULE_NAME}: Created default Character Format schema`);
     }
     
     // ==========================
@@ -2785,7 +2832,7 @@ function GameState(hook, text) {
         try {
             locationFormatCache = parseLocationFormatSchema(formatCard.description || formatCard.entry);
         } catch (e) {
-            if (debug) console.log(`${MODULE_NAME}: Error parsing location format: ${e}. Using defaults.`);
+            if (debug) log(`${MODULE_NAME}: Error parsing location format: ${e}. Using defaults.`);
             logError(e, 'Failed to parse location format schema');
             // Create a basic valid location format
             locationFormatCache = {
@@ -2890,7 +2937,7 @@ function GameState(hook, text) {
             )
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Location Format schema`);
+        if (debug) log(`${MODULE_NAME}: Created default Location Format schema`);
     }
     
     // ==========================
@@ -3025,7 +3072,7 @@ function GameState(hook, text) {
                 Utilities.storyCard.update(location.title, {
                     entry: surgicalResult.text
                 });
-                if (debug) console.log(`${MODULE_NAME}: Surgically updated location ${location.name}`);
+                if (debug) log(`${MODULE_NAME}: Surgically updated location ${location.name}`);
                 return true;
             }
             
@@ -3130,7 +3177,47 @@ function GameState(hook, text) {
     }
     
     function loadLocation(name) {
-        // Check cache first
+        if (!name) return null;
+        const normalizedName = String(name).toLowerCase();
+        
+        // Check quick cache first
+        const quickCache = loadLocationQuickCache();
+        if (quickCache && quickCache.locations[normalizedName]) {
+            // Location exists in cache, but we need to load the full data
+            // Check regular cache first
+            if (locationCache && locationCache[normalizedName]) {
+                return locationCache[normalizedName];
+            }
+            
+            // Load the specific location card
+            const card = Utilities.storyCard.find(
+                c => {
+                    if (!c.title) return false;
+                    const match = c.title.match(/\[LOCATION\]\s+(.+)/);
+                    return match && match[1].toLowerCase() === normalizedName;
+                },
+                false // Only need first match
+            );
+            
+            if (card) {
+                const parsed = parseLocationCard(card);
+                if (parsed && parsed.name) {
+                    // Add to regular cache
+                    if (!locationCache) locationCache = {};
+                    locationCache[normalizedName] = parsed;
+                    return parsed;
+                }
+            }
+        }
+        
+        // Check if cache is complete
+        if (isLocationCacheComplete()) {
+            // Cache is complete and location isn't in it = doesn't exist
+            if (debug) console.log(`${MODULE_NAME}: Location ${name} not found (cache complete)`);
+            return null;
+        }
+        
+        // Cache might be incomplete, do full search
         const locations = loadAllLocations();
         
         // Try various forms of the name
@@ -3140,12 +3227,12 @@ function GameState(hook, text) {
         }
         
         // Try normalized form
-        const normalizedName = name.split(/[\s_]+/)
+        const normalizedFormName = name.split(/[\s_]+/)
             .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
             .join('_');
         
-        if (locations[normalizedName.toLowerCase()]) {
-            return locations[normalizedName.toLowerCase()];
+        if (locations[normalizedFormName.toLowerCase()]) {
+            return locations[normalizedFormName.toLowerCase()];
         }
         
         if (debug) console.log(`${MODULE_NAME}: Location ${name} not found`);
@@ -3183,7 +3270,7 @@ function GameState(hook, text) {
             }
         }
         
-        if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(locationCache).length} locations`);
+        if (debug) log(`${MODULE_NAME}: Loaded ${Object.keys(locationCache).length} locations`);
         return locationCache;
     }
     
@@ -3248,10 +3335,1061 @@ function GameState(hook, text) {
     // ==========================
     // Character Management
     // ==========================
+    // Performance optimization: These caches are populated once per hook execution
+    // and reused across all operations to avoid redundant Story Card loads
+    // 
+    // Character Cache System:
+    // [GS] Character Cache - Fast lookup for common character data
+    // - Single card with all characters' basic info (name|location|level|hp|xp)
+    // - Pinned near top of Story Cards array for fast access
+    // - Updated whenever character data changes
+    // - Validated every X turns to catch desyncs
     let characterCache = null;
     let locationCache = null;
+    let characterQuickCache = null; // The [GS] Character Cache data
+    let locationQuickCache = null;  // The [GS] Location Cache data
+    let factionQuickCache = null;   // The [GS] Faction Cache data
+    
+    // ==========================
+    // Character Quick Cache System
+    // ==========================
+    
+    function loadCharacterQuickCache() {
+        if (characterQuickCache !== null) return characterQuickCache;
+        
+        if (debug) log(`${MODULE_NAME}: Loading character quick cache`);
+        
+        // Safety check for Utilities
+        if (typeof Utilities === 'undefined' || !Utilities || !Utilities.storyCard || !Utilities.storyCard.get) {
+            console.log(`${MODULE_NAME}: ERROR - Utilities.storyCard.get is not available!`);
+            // Return empty cache as fallback
+            return {
+                count: 0,
+                total_cards: 0,
+                validation_turn: 0,
+                cache_cards: 0,
+                format: 'name|location|level|hp.current|hp.max|xp.current|xp.max',
+                characters: {}
+            };
+        }
+        
+        const cacheCard = Utilities.storyCard.get('[GS] Character Cache');
+        if (!cacheCard) {
+            // Cache card doesn't exist at all - create a default one
+            if (debug) console.log(`${MODULE_NAME}: Cache card doesn't exist, creating default`);
+            const defaultCache = {
+                count: 0,
+                total_cards: 0,
+                validation_turn: 0,
+                cache_cards: 1,
+                format: 'name|location|level|hp.current|hp.max|xp.current|xp.max',
+                characters: {}
+            };
+            saveCharacterQuickCache(defaultCache);
+            return defaultCache;
+        }
+        
+        if (!cacheCard.entry) {
+            // Card exists but entry is empty - rebuild it
+            if (debug) console.log(`${MODULE_NAME}: Cache card has no entry, rebuilding`);
+            return buildCharacterQuickCache();
+        }
+        
+        try {
+            // Parse metadata from ENTRY field
+            const metadataLines = cacheCard.entry.split('\n');
+            const cache = {
+                count: 0,
+                total_cards: 0,  // Total number of CHARACTER/PLAYER cards in the system
+                validation_turn: 0,
+                cache_cards: 1,
+                format: '',
+                characters: {}
+            };
+            
+            // Parse metadata
+            for (const line of metadataLines) {
+                if (!line.trim()) continue;
+                
+                if (line.startsWith('count:')) {
+                    cache.count = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('total_cards:')) {
+                    cache.total_cards = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('validation_turn:')) {
+                    cache.validation_turn = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('cache_cards:')) {
+                    cache.cache_cards = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('format:')) {
+                    cache.format = line.substring(7).trim(); // Use substring to handle colons in format
+                }
+            }
+            
+            // Combine all cache card descriptions if multiple cards needed
+            let allData = '';
+            if (cache.cache_cards > 1) {
+                // Load primary card description
+                allData = cacheCard.description || '';
+                
+                // Load additional cards in order
+                for (let i = 2; i <= cache.cache_cards; i++) {
+                    const additionalCard = Utilities.storyCard.get(`[GS] Character Cache ${i}`);
+                    if (additionalCard && additionalCard.description) {
+                        allData += '\n' + additionalCard.description;
+                    }
+                }
+            } else {
+                allData = cacheCard.description || '';
+            }
+            
+            // Parse character data from combined descriptions
+            const dataLines = allData.split('\n');
+            for (const line of dataLines) {
+                if (!line.trim()) continue;
+                
+                const parts = line.split('|');
+                if (parts.length >= 7) {
+                    const name = parts[0].toLowerCase();
+                    cache.characters[name] = {
+                        name: parts[0],
+                        location: parts[1],
+                        level: parseInt(parts[2]),
+                        hp_current: parseInt(parts[3]),
+                        hp_max: parseInt(parts[4]),
+                        xp_current: parseInt(parts[5]),
+                        xp_max: parseInt(parts[6])
+                    };
+                }
+            }
+        
+            // Check if cache needs validation (every 10 turns)
+            // Also rebuild if action count went backward (undo/rewind/new adventure)
+            const turnDiff = info ? info.actionCount - cache.validation_turn : 0;
+            if (info && (turnDiff > 10 || turnDiff < 0)) {
+                if (debug) log(`${MODULE_NAME}: Character cache needs validation (turn diff: ${turnDiff})`);
+                return buildCharacterQuickCache();
+            }
+            
+            characterQuickCache = cache;
+            return cache;
+        } catch (e) {
+            // Cache corrupted, rebuild it
+            if (debug) log(`${MODULE_NAME}: Cache corrupted, rebuilding: ${e.message}`);
+            return buildCharacterQuickCache();
+        }
+    }
+    
+    function buildCharacterQuickCache() {
+        if (debug) log(`${MODULE_NAME}: Building character quick cache`);
+        
+        const cache = {
+            count: 0,
+            total_cards: 0,  // Track total CHARACTER/PLAYER cards
+            validation_turn: info ? info.actionCount : 0,
+            cache_cards: 1,
+            format: 'name|location|level|hp.current|hp.max|xp.current|xp.max',
+            characters: {}
+        };
+        
+        // Load all character cards
+        const cards = Utilities.storyCard.find(
+            card => card.title && (card.title.startsWith('[CHARACTER]') || card.title.startsWith('[PLAYER]')),
+            true
+        );
+        
+        if (!cards || cards.length === 0) {
+            cache.total_cards = 0;
+            saveCharacterQuickCache(cache);
+            return cache;
+        }
+        
+        // Set total cards count
+        cache.total_cards = cards.length;
+        
+        // Parse each character for basic info
+        for (const card of cards) {
+            const nameMatch = card.title.match(/\[(CHARACTER|PLAYER)\]\s+(.+)/);
+            if (!nameMatch) continue;
+            
+            const name = nameMatch[2].toLowerCase();
+            
+            // Quick parse for essential data from entry
+            const entry = card.entry || '';
+            
+            // Parse info line for level, hp, xp, location
+            const levelMatch = entry.match(/Level\s+(\d+)\s*\((\d+)\/(\d+)\s*XP\)/);
+            const hpMatch = entry.match(/HP:\s*(\d+)\/(\d+)/);
+            const locationMatch = entry.match(/Current Location:\s*([^\s|]+)/);
+            
+            // Parse the level first since we need it for XP calculation
+            const level = levelMatch ? parseInt(levelMatch[1]) : 1;
+            
+            // Parse XP values
+            let xp_current = levelMatch ? parseInt(levelMatch[2]) : 0;
+            let xp_max = levelMatch ? parseInt(levelMatch[3]) : null;
+            
+            // If we couldn't parse XP max, calculate it from the level
+            if (xp_max === null || isNaN(xp_max)) {
+                xp_max = calculateXPRequirement(level);
+            }
+            
+            cache.characters[name] = {
+                name: nameMatch[2] || '???',
+                location: locationMatch ? locationMatch[1].trim() : '???',
+                level: level,
+                hp_current: hpMatch ? parseInt(hpMatch[1]) : 100,
+                hp_max: hpMatch ? parseInt(hpMatch[2]) : 100,
+                xp_current: xp_current,
+                xp_max: xp_max
+            };
+            
+            cache.count++;
+        }
+        
+        saveCharacterQuickCache(cache);
+        characterQuickCache = cache;
+        return cache;
+    }
+    
+    function saveCharacterQuickCache(cache) {
+        // Build all character data lines
+        const characterLines = [];
+        for (const [name, data] of Object.entries(cache.characters)) {
+            // Use sensible defaults for numeric values instead of '???'
+            const location = data.location || 'Unknown';
+            const level = data.level || 1;
+            const hp_current = data.hp_current !== undefined ? data.hp_current : 100;
+            const hp_max = data.hp_max !== undefined ? data.hp_max : 100;
+            const xp_current = data.xp_current !== undefined ? data.xp_current : 0;
+            const xp_max = data.xp_max !== undefined ? data.xp_max : calculateXPRequirement(level);
+            
+            characterLines.push(`${data.name}|${location}|${level}|${hp_current}|${hp_max}|${xp_current}|${xp_max}`);
+        }
+        
+        // Split data into 9500 char chunks (leaving buffer for safety)
+        const maxChunkSize = 9500;
+        const chunks = [];
+        let currentChunk = [];
+        let currentSize = 0;
+        
+        for (const line of characterLines) {
+            if (currentSize + line.length + 1 > maxChunkSize && currentChunk.length > 0) {
+                // Start new chunk
+                chunks.push(currentChunk.join('\n'));
+                currentChunk = [line];
+                currentSize = line.length;
+            } else {
+                currentChunk.push(line);
+                currentSize += line.length + 1; // +1 for newline
+            }
+        }
+        if (currentChunk.length > 0) {
+            chunks.push(currentChunk.join('\n'));
+        }
+        
+        const cardsNeeded = Math.max(1, chunks.length);
+        
+        // Metadata goes in ENTRY field of first card
+        let metadata = '';
+        metadata += `count: ${cache.count}\n`;
+        metadata += `total_cards: ${cache.total_cards}\n`;
+        metadata += `validation_turn: ${cache.validation_turn}\n`;
+        metadata += `cache_cards: ${cardsNeeded}\n`;
+        metadata += `format: ${cache.format}`;
+        
+        // Save primary cache card (upsert)
+        Utilities.storyCard.upsert({
+            title: '[GS] Character Cache',
+            type: 'data',
+            entry: metadata,
+            description: chunks[0] || '',
+            keys: '' // Empty so it won't show up in searches
+        });
+        
+        // Save additional cards if needed
+        for (let i = 1; i < cardsNeeded; i++) {
+            const cardTitle = `[GS] Character Cache ${i + 1}`;
+            Utilities.storyCard.upsert({
+                title: cardTitle,
+                type: 'data',
+                entry: `// Overflow card ${i + 1} of ${cardsNeeded}`,
+                description: chunks[i],
+                keys: ''
+            });
+        }
+        
+        // Clean up any extra cards from previous saves
+        for (let i = cardsNeeded + 1; i <= 10; i++) {
+            const cardTitle = `[GS] Character Cache ${i}`;
+            const existing = Utilities.storyCard.get(cardTitle);
+            if (existing) {
+                Utilities.storyCard.remove(cardTitle);
+                if (debug) log(`${MODULE_NAME}: Removed obsolete cache card ${cardTitle}`);
+            } else {
+                break; // No more cards to clean up
+            }
+        }
+        
+        if (debug) log(`${MODULE_NAME}: Saved character cache with ${cache.count} characters across ${cardsNeeded} card(s)`);
+    }
+    
+    function updateCharacterInCache(characterName, updates) {
+        const cache = loadCharacterQuickCache();
+        const name = characterName.toLowerCase();
+        
+        if (!cache.characters[name]) {
+            // Character not in cache, rebuild cache
+            return buildCharacterQuickCache();
+        }
+        
+        // Apply updates
+        for (const [key, value] of Object.entries(updates)) {
+            if (cache.characters[name].hasOwnProperty(key)) {
+                cache.characters[name][key] = value;
+            }
+        }
+        
+        // Save updated cache
+        saveCharacterQuickCache(cache);
+        return cache;
+    }
+    
+    function isCacheComplete() {
+        // Check if the cache contains all characters
+        const cache = loadCharacterQuickCache();
+        if (!cache) return false;
+        
+        // Quick count check - count actual CHARACTER/PLAYER cards
+        const allCards = Utilities.storyCard.find(
+            card => card.title && (card.title.startsWith('[CHARACTER]') || card.title.startsWith('[PLAYER]')),
+            true // Get all matches
+        );
+        const actualCount = allCards ? allCards.length : 0;
+        
+        // If counts match, cache is complete
+        return cache.count === cache.total_cards && cache.total_cards === actualCount;
+    }
+    
+    function refreshCacheIfNeeded() {
+        const cache = loadCharacterQuickCache();
+        if (!cache) {
+            buildCharacterQuickCache();
+            return true;
+        }
+        
+        // Check if cache is stale (more than 10 turns old or went backward)
+        const currentTurn = info ? info.actionCount : 0;
+        const turnDiff = currentTurn - cache.validation_turn;
+        if (turnDiff > 10 || turnDiff < 0) {
+            buildCharacterQuickCache();
+            return true;
+        }
+        
+        // Check if character count has changed
+        const allCards = Utilities.storyCard.find(
+            card => card.title && (card.title.startsWith('[CHARACTER]') || card.title.startsWith('[PLAYER]')),
+            true  // getAll = true
+        );
+        const actualCount = allCards ? allCards.length : 0;
+        
+        if (actualCount !== cache.total_cards) {
+            buildCharacterQuickCache();
+            return true;
+        }
+        
+        return false;
+    }
+    
+    // ==========================
+    // Location Quick Cache System
+    // ==========================
+    
+    function loadLocationQuickCache() {
+        if (locationQuickCache !== null) return locationQuickCache;
+        
+        const cacheCard = Utilities.storyCard.get('[GS] Location Cache');
+        if (!cacheCard || !cacheCard.entry) {
+            // Cache doesn't exist, need to build it
+            return buildLocationQuickCache();
+        }
+        
+        try {
+            // Parse metadata from ENTRY field
+            const metadataLines = cacheCard.entry.split('\n');
+            const cache = {
+                count: 0,
+                total_cards: 0,
+                validation_turn: 0,
+                cache_cards: 1,
+                format: '',
+                locations: {}
+            };
+            
+            // Parse metadata
+            for (const line of metadataLines) {
+                if (!line.trim()) continue;
+                
+                if (line.startsWith('count:')) {
+                    cache.count = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('total_cards:')) {
+                    cache.total_cards = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('validation_turn:')) {
+                    cache.validation_turn = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('cache_cards:')) {
+                    cache.cache_cards = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('format:')) {
+                    cache.format = line.substring(7).trim(); // Use substring to handle colons in format
+                }
+            }
+            
+            // Combine all cache card descriptions if multiple cards needed
+            let allData = '';
+            if (cache.cache_cards > 1) {
+                // Load primary card description
+                allData = cacheCard.description || '';
+                
+                // Load additional cards in order
+                for (let i = 2; i <= cache.cache_cards; i++) {
+                    const additionalCard = Utilities.storyCard.get(`[GS] Location Cache ${i}`);
+                    if (additionalCard && additionalCard.description) {
+                        allData += '\n' + additionalCard.description;
+                    }
+                }
+            } else {
+                allData = cacheCard.description || '';
+            }
+            
+            // Parse location data from combined descriptions
+            const dataLines = allData.split('\n');
+            for (const line of dataLines) {
+                if (!line.trim()) continue;
+                
+                const parts = line.split('|');
+                if (parts.length >= 9) {  // name|type|floor|north|south|east|west|inside|outside
+                    const name = parts[0].toLowerCase();
+                    cache.locations[name] = {
+                        name: parts[0],
+                        type: parts[1] === '???' ? null : parts[1],
+                        floor: parts[2] === '???' ? null : parts[2],
+                        north: parts[3] === '???' ? null : parts[3],  // Can be comma-separated
+                        south: parts[4] === '???' ? null : parts[4],  // Can be comma-separated
+                        east: parts[5] === '???' ? null : parts[5],   // Can be comma-separated
+                        west: parts[6] === '???' ? null : parts[6],   // Can be comma-separated
+                        inside: parts[7] === '???' ? null : parts[7], // Can be comma-separated
+                        outside: parts[8] === '???' ? null : parts[8] // Can be comma-separated
+                    };
+                }
+            }
+            
+            // Check if cache needs validation (every 10 turns)
+            // Also rebuild if action count went backward (undo/rewind/new adventure)
+            const turnDiff = info ? info.actionCount - cache.validation_turn : 0;
+            if (info && (turnDiff > 10 || turnDiff < 0)) {
+                if (debug) log(`${MODULE_NAME}: Location cache needs validation (turn diff: ${turnDiff})`);
+                return buildLocationQuickCache();
+            }
+            
+            locationQuickCache = cache;
+            return cache;
+        } catch (e) {
+            // Cache corrupted, rebuild it
+            if (debug) log(`${MODULE_NAME}: Location cache corrupted, rebuilding: ${e.message}`);
+            return buildLocationQuickCache();
+        }
+    }
+    
+    function buildLocationQuickCache() {
+        if (debug) log(`${MODULE_NAME}: Building location quick cache`);
+        
+        const cache = {
+            count: 0,
+            total_cards: 0,
+            validation_turn: info ? info.actionCount : 0,
+            format: 'name|type|floor|north|south|east|west|inside|outside',
+            locations: {}
+        };
+        
+        // Load all location cards
+        const cards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[LOCATION]'),
+            true
+        );
+        
+        if (!cards || cards.length === 0) {
+            cache.total_cards = 0;
+            saveLocationQuickCache(cache);
+            return cache;
+        }
+        
+        // Set total cards count
+        cache.total_cards = cards.length;
+        
+        // Parse each location for basic info
+        for (const card of cards) {
+            const nameMatch = card.title.match(/\[LOCATION\]\s+(.+)/);
+            if (!nameMatch) continue;
+            
+            const name = nameMatch[1].toLowerCase();
+            const entry = card.entry || '';
+            
+            // Parse type and floor from info line
+            const typeMatch = entry.match(/Type:\s*([^\s|]+)/i);
+            const floorMatch = entry.match(/Floor:\s*([^\s|]+)/i);
+            
+            // Parse pathways section
+            const pathways = {
+                north: null,
+                south: null,
+                east: null,
+                west: null,
+                inside: null,
+                outside: null
+            };
+            
+            // Look for pathways section
+            const pathwayMatch = entry.match(/\*\*Pathways?\*\*([^*]*?)(?:\*\*|$)/si);
+            if (pathwayMatch) {
+                const pathwayText = pathwayMatch[1];
+                const pathwayLines = pathwayText.split('\n');
+                
+                for (const line of pathwayLines) {
+                    const dirMatch = line.match(/^(North|South|East|West|Inside|Outside):\s*(.+)?$/i);
+                    if (dirMatch) {
+                        const direction = dirMatch[1].toLowerCase();
+                        const destinationText = dirMatch[2] ? dirMatch[2].trim() : null;
+                        
+                        if (destinationText && destinationText !== '-' && destinationText !== '---') {
+                            // Support multiple destinations separated by commas
+                            // e.g., "Inside: Shop1, Shop2, Inn (various buildings)"
+                            const destinations = destinationText
+                                .split(/[,]/)
+                                .map(d => d.trim().split(/[\s(]/)[0]) // Take first word before space or parenthesis
+                                .filter(d => d && d !== '-' && d !== '---')
+                                .join(',');
+                            
+                            if (destinations) {
+                                pathways[direction] = destinations;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            cache.locations[name] = {
+                name: nameMatch[1],
+                type: typeMatch ? typeMatch[1] : '???',
+                floor: floorMatch ? floorMatch[1] : '???',
+                north: pathways.north || '???',
+                south: pathways.south || '???',
+                east: pathways.east || '???',
+                west: pathways.west || '???',
+                inside: pathways.inside || '???',
+                outside: pathways.outside || '???'
+            };
+            
+            cache.count++;
+        }
+        
+        saveLocationQuickCache(cache);
+        locationQuickCache = cache;
+        return cache;
+    }
+    
+    function saveLocationQuickCache(cache) {
+        // Build all location data lines
+        const locationLines = [];
+        for (const [name, data] of Object.entries(cache.locations)) {
+            locationLines.push(`${data.name}|${data.type || '???'}|${data.floor || '???'}|${data.north || '???'}|${data.south || '???'}|${data.east || '???'}|${data.west || '???'}|${data.inside || '???'}|${data.outside || '???'}`);
+        }
+        
+        // Split data into 9500 char chunks (leaving buffer for safety)
+        const maxChunkSize = 9500;
+        const chunks = [];
+        let currentChunk = [];
+        let currentSize = 0;
+        
+        for (const line of locationLines) {
+            if (currentSize + line.length + 1 > maxChunkSize && currentChunk.length > 0) {
+                // Start new chunk
+                chunks.push(currentChunk.join('\n'));
+                currentChunk = [line];
+                currentSize = line.length;
+            } else {
+                currentChunk.push(line);
+                currentSize += line.length + 1; // +1 for newline
+            }
+        }
+        if (currentChunk.length > 0) {
+            chunks.push(currentChunk.join('\n'));
+        }
+        
+        const cardsNeeded = Math.max(1, chunks.length);
+        
+        // Metadata goes in ENTRY field of first card
+        let metadata = '';
+        metadata += `count: ${cache.count}\n`;
+        metadata += `total_cards: ${cache.total_cards}\n`;
+        metadata += `validation_turn: ${cache.validation_turn}\n`;
+        metadata += `cache_cards: ${cardsNeeded}\n`;
+        metadata += `format: ${cache.format}`;
+        
+        // Save primary cache card (upsert)
+        Utilities.storyCard.upsert({
+            title: '[GS] Location Cache',
+            type: 'data',
+            entry: metadata,
+            description: chunks[0] || '',
+            keys: '' // Empty so it won't show up in searches
+        });
+        
+        // Save additional cards if needed
+        for (let i = 1; i < cardsNeeded; i++) {
+            const cardTitle = `[GS] Location Cache ${i + 1}`;
+            Utilities.storyCard.upsert({
+                title: cardTitle,
+                type: 'data',
+                entry: `// Overflow card ${i + 1} of ${cardsNeeded}`,
+                description: chunks[i],
+                keys: ''
+            });
+        }
+        
+        // Clean up any extra cards from previous saves
+        for (let i = cardsNeeded + 1; i <= 10; i++) {
+            const cardTitle = `[GS] Location Cache ${i}`;
+            const existing = Utilities.storyCard.get(cardTitle);
+            if (existing) {
+                Utilities.storyCard.remove(cardTitle);
+                if (debug) log(`${MODULE_NAME}: Removed obsolete cache card ${cardTitle}`);
+            } else {
+                break; // No more cards to clean up
+            }
+        }
+        
+        if (debug) log(`${MODULE_NAME}: Saved location cache with ${cache.count} locations across ${cardsNeeded} card(s)`);
+    }
+    
+    function updateLocationInCache(locationName, updates) {
+        const cache = loadLocationQuickCache();
+        const name = locationName.toLowerCase();
+        
+        if (!cache.locations[name]) {
+            // Location not in cache, rebuild cache
+            return buildLocationQuickCache();
+        }
+        
+        // Apply updates
+        for (const [key, value] of Object.entries(updates)) {
+            if (cache.locations[name].hasOwnProperty(key)) {
+                cache.locations[name][key] = value;
+            }
+        }
+        
+        // Save updated cache
+        saveLocationQuickCache(cache);
+        return cache;
+    }
+    
+    function isLocationCacheComplete() {
+        const cache = loadLocationQuickCache();
+        if (!cache) return false;
+        
+        // Quick count check
+        const allLocations = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[LOCATION]'),
+            true  // getAll = true
+        );
+        const actualCount = allLocations ? allLocations.length : 0;
+        
+        return cache.count === cache.total_cards && cache.total_cards === actualCount;
+    }
+    
+    function getLocationConnections(locationName) {
+        // Get all connections for a location as arrays
+        const cache = loadLocationQuickCache();
+        if (!cache || !cache.locations[locationName.toLowerCase()]) return null;
+        
+        const loc = cache.locations[locationName.toLowerCase()];
+        return {
+            north: loc.north ? loc.north.split(',').map(s => s.trim()) : [],
+            south: loc.south ? loc.south.split(',').map(s => s.trim()) : [],
+            east: loc.east ? loc.east.split(',').map(s => s.trim()) : [],
+            west: loc.west ? loc.west.split(',').map(s => s.trim()) : [],
+            inside: loc.inside ? loc.inside.split(',').map(s => s.trim()) : [],
+            outside: loc.outside ? loc.outside.split(',').map(s => s.trim()) : []
+        };
+    }
+    
+    function buildWorldFlowMap() {
+        // Build a complete map of all location connections
+        const cache = loadLocationQuickCache();
+        if (!cache) return {};
+        
+        const flowMap = {};
+        
+        for (const [name, loc] of Object.entries(cache.locations)) {
+            flowMap[name] = {
+                type: loc.type,
+                floor: loc.floor,
+                connections: getLocationConnections(name)
+            };
+        }
+        
+        return flowMap;
+    }
+    
+    // ==========================
+    // Faction Quick Cache System (TODO)
+    // ==========================
+    
+    function loadFactionQuickCache() {
+        if (factionQuickCache !== null) return factionQuickCache;
+        
+        if (debug) log(`${MODULE_NAME}: Loading faction quick cache`);
+        
+        const cacheCard = Utilities.storyCard.get('[GS] Faction Cache');
+        if (!cacheCard || !cacheCard.entry) {
+            // Cache doesn't exist, need to build it
+            return buildFactionQuickCache();
+        }
+        
+        try {
+            // Parse metadata from ENTRY field
+            const metadataLines = cacheCard.entry.split('\n');
+            const cache = {
+                count: 0,
+                total_cards: 0,
+                validation_turn: 0,
+                cache_cards: 1,
+                format: '',
+                factions: {}
+            };
+            
+            // Parse metadata
+            for (const line of metadataLines) {
+                if (!line.trim()) continue;
+                
+                if (line.startsWith('count:')) {
+                    cache.count = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('total_cards:')) {
+                    cache.total_cards = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('validation_turn:')) {
+                    cache.validation_turn = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('cache_cards:')) {
+                    cache.cache_cards = parseInt(line.split(':')[1].trim());
+                } else if (line.startsWith('format:')) {
+                    cache.format = line.substring(7).trim();
+                }
+            }
+            
+            // Combine all cache card descriptions if multiple cards needed
+            let allData = '';
+            if (cache.cache_cards > 1) {
+                allData = cacheCard.description || '';
+                
+                // Load additional cards in order
+                for (let i = 2; i <= cache.cache_cards; i++) {
+                    const additionalCard = Utilities.storyCard.get(`[GS] Faction Cache ${i}`);
+                    if (additionalCard && additionalCard.description) {
+                        allData += '\n' + additionalCard.description;
+                    }
+                }
+            } else {
+                allData = cacheCard.description || '';
+            }
+            
+            // Parse faction data from combined descriptions
+            // Format: name|type|alignment|leader|headquarters|members|territories|allies|enemies
+            const dataLines = allData.split('\n');
+            for (const line of dataLines) {
+                if (!line.trim()) continue;
+                
+                const parts = line.split('|');
+                if (parts.length >= 9) {
+                    const name = parts[0].toLowerCase();
+                    cache.factions[name] = {
+                        name: parts[0],
+                        type: parts[1] || 'Unknown',
+                        alignment: parts[2] || 'Neutral',
+                        leader: parts[3] || 'Unknown',
+                        headquarters: parts[4] || 'Unknown',
+                        members: parts[5] ? parts[5].split(',').map(m => m.trim()) : [],
+                        territories: parts[6] ? parts[6].split(',').map(t => t.trim()) : [],
+                        allies: parts[7] ? parts[7].split(',').map(a => a.trim()) : [],
+                        enemies: parts[8] ? parts[8].split(',').map(e => e.trim()) : []
+                    };
+                }
+            }
+            
+            // Check cache validity
+            const currentTurn = info ? info.actionCount : 0;
+            const turnDiff = currentTurn - cache.validation_turn;
+            if (turnDiff > 10 || turnDiff < 0 || cache.count !== Object.keys(cache.factions).length) {
+                return buildFactionQuickCache();
+            }
+            
+            factionQuickCache = cache;
+            return cache;
+        } catch (e) {
+            // Cache corrupted, rebuild it
+            if (debug) log(`${MODULE_NAME}: Faction cache corrupted, rebuilding: ${e.message}`);
+            return buildFactionQuickCache();
+        }
+    }
+    
+    function buildFactionQuickCache() {
+        if (debug) log(`${MODULE_NAME}: Building faction quick cache`);
+        
+        const cache = {
+            count: 0,
+            total_cards: 0,
+            validation_turn: info ? info.actionCount : 0,
+            cache_cards: 1,
+            format: 'name|type|alignment|leader|headquarters|members|territories|allies|enemies',
+            factions: {}
+        };
+        
+        // Load all faction cards
+        const cards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[FACTION]'),
+            true
+        );
+        
+        if (!cards || cards.length === 0) {
+            cache.total_cards = 0;
+            saveFactionQuickCache(cache);
+            return cache;
+        }
+        
+        // Set total cards count
+        cache.total_cards = cards.length;
+        
+        // Parse each faction for basic info
+        for (const card of cards) {
+            const nameMatch = card.title.match(/\[FACTION\]\s+(.+)/);
+            if (!nameMatch) continue;
+            
+            const name = nameMatch[1].toLowerCase();
+            const entry = card.entry || '';
+            const description = card.description || '';
+            const fullText = entry + '\n' + description;
+            
+            // Parse basic faction data
+            const typeMatch = fullText.match(/Type:\s*([^\n|]+)/);
+            const alignmentMatch = fullText.match(/Alignment:\s*([^\n|]+)/);
+            const leaderMatch = fullText.match(/Leader:\s*([^\n|]+)/);
+            const hqMatch = fullText.match(/Headquarters:\s*([^\n|]+)/);
+            
+            // Extract members list
+            const membersMatch = fullText.match(/Members:\s*([^\n]+(?:\n[^#\n][^\n]*)*)/i);
+            let members = [];
+            if (membersMatch) {
+                const membersList = membersMatch[1].trim();
+                if (membersList && membersList !== 'None') {
+                    members = membersList.split(',').map(m => m.trim());
+                }
+            }
+            
+            // Extract territories list
+            const territoriesMatch = fullText.match(/Controlled Territories:\s*([^\n]+(?:\n[^#\n][^\n]*)*)/i);
+            let territories = [];
+            if (territoriesMatch) {
+                const territoriesList = territoriesMatch[1].trim();
+                if (territoriesList && territoriesList !== 'None') {
+                    territories = territoriesList.split(',').map(t => t.trim());
+                }
+            }
+            
+            // Extract allies list
+            const alliesMatch = fullText.match(/Allied Factions:\s*([^\n]+(?:\n[^#\n][^\n]*)*)/i);
+            let allies = [];
+            if (alliesMatch) {
+                const alliesList = alliesMatch[1].trim();
+                if (alliesList && alliesList !== 'None') {
+                    allies = alliesList.split(',').map(a => a.trim());
+                }
+            }
+            
+            // Extract enemies list
+            const enemiesMatch = fullText.match(/Enemy Factions:\s*([^\n]+(?:\n[^#\n][^\n]*)*)/i);
+            let enemies = [];
+            if (enemiesMatch) {
+                const enemiesList = enemiesMatch[1].trim();
+                if (enemiesList && enemiesList !== 'None') {
+                    enemies = enemiesList.split(',').map(e => e.trim());
+                }
+            }
+            
+            cache.factions[name] = {
+                name: nameMatch[1],
+                type: typeMatch ? typeMatch[1].trim() : 'Unknown',
+                alignment: alignmentMatch ? alignmentMatch[1].trim() : 'Neutral',
+                leader: leaderMatch ? leaderMatch[1].trim() : 'Unknown',
+                headquarters: hqMatch ? hqMatch[1].trim() : 'Unknown',
+                members: members,
+                territories: territories,
+                allies: allies,
+                enemies: enemies
+            };
+            
+            cache.count++;
+        }
+        
+        saveFactionQuickCache(cache);
+        factionQuickCache = cache;
+        return cache;
+    }
+    
+    function saveFactionQuickCache(cache) {
+        // Build all faction data lines
+        const factionLines = [];
+        for (const [name, data] of Object.entries(cache.factions)) {
+            // Use sensible defaults
+            const type = data.type || 'Unknown';
+            const alignment = data.alignment || 'Neutral';
+            const leader = data.leader || 'Unknown';
+            const headquarters = data.headquarters || 'Unknown';
+            // Join arrays with commas for storage
+            const members = Array.isArray(data.members) ? data.members.join(',') : '';
+            const territories = Array.isArray(data.territories) ? data.territories.join(',') : '';
+            const allies = Array.isArray(data.allies) ? data.allies.join(',') : '';
+            const enemies = Array.isArray(data.enemies) ? data.enemies.join(',') : '';
+            
+            factionLines.push(`${data.name}|${type}|${alignment}|${leader}|${headquarters}|${members}|${territories}|${allies}|${enemies}`);
+        }
+        
+        // Split data into 9500 char chunks (leaving buffer for safety)
+        const maxChunkSize = 9500;
+        const chunks = [];
+        let currentChunk = [];
+        let currentSize = 0;
+        
+        for (const line of factionLines) {
+            if (currentSize + line.length + 1 > maxChunkSize && currentChunk.length > 0) {
+                // Start new chunk
+                chunks.push(currentChunk.join('\n'));
+                currentChunk = [line];
+                currentSize = line.length;
+            } else {
+                currentChunk.push(line);
+                currentSize += line.length + 1; // +1 for newline
+            }
+        }
+        if (currentChunk.length > 0) {
+            chunks.push(currentChunk.join('\n'));
+        }
+        
+        const cardsNeeded = Math.max(1, chunks.length);
+        
+        // Metadata goes in ENTRY field of first card
+        let metadata = '';
+        metadata += `count: ${cache.count}\n`;
+        metadata += `total_cards: ${cache.total_cards}\n`;
+        metadata += `validation_turn: ${cache.validation_turn}\n`;
+        metadata += `cache_cards: ${cardsNeeded}\n`;
+        metadata += `format: ${cache.format}`;
+        
+        // Save primary cache card (upsert)
+        Utilities.storyCard.upsert({
+            title: '[GS] Faction Cache',
+            type: 'data',
+            entry: metadata,
+            description: chunks[0] || '',
+            keys: '' // Empty so it won't show up in searches
+        });
+        
+        // Save additional cards if needed
+        for (let i = 1; i < cardsNeeded; i++) {
+            const cardTitle = `[GS] Faction Cache ${i + 1}`;
+            Utilities.storyCard.upsert({
+                title: cardTitle,
+                type: 'data',
+                entry: `Part ${i + 1} of ${cardsNeeded}`,
+                description: chunks[i],
+                keys: ''
+            });
+        }
+        
+        // Remove obsolete overflow cards if cache shrank
+        for (let i = cardsNeeded + 1; i <= 10; i++) {
+            const cardTitle = `[GS] Faction Cache ${i}`;
+            const existing = Utilities.storyCard.get(cardTitle);
+            if (existing) {
+                Utilities.storyCard.remove(cardTitle);
+                if (debug) log(`${MODULE_NAME}: Removed obsolete faction cache card ${cardTitle}`);
+            } else {
+                break; // No more overflow cards
+            }
+        }
+        
+        if (debug) log(`${MODULE_NAME}: Saved faction cache with ${cache.count} factions across ${cardsNeeded} card(s)`);
+    }
+    
+    function updateFactionInCache(factionName, updates) {
+        // TODO: Update specific faction in cache
+        const cache = loadFactionQuickCache();
+        const name = factionName.toLowerCase();
+        
+        if (!cache.factions[name]) {
+            // Faction not in cache, rebuild
+            return buildFactionQuickCache();
+        }
+        
+        // TODO: Apply updates to cached faction data
+        
+        return cache;
+    }
+    
+    function isFactionCacheComplete() {
+        // TODO: Check if faction cache contains all factions
+        const cache = loadFactionQuickCache();
+        if (!cache) return false;
+        
+        // TODO: Implement actual count check
+        // const allFactions = Utilities.storyCard.find(
+        //     card => card.title && card.title.startsWith('[FACTION]'),
+        //     true  // getAll = true
+        // );
+        // const actualCount = allFactions ? allFactions.length : 0;
+        
+        return false; // For now, always incomplete
+    }
+    
+    function getFactionMembers(factionName) {
+        // TODO: Get parsed array of faction members
+        const cache = loadFactionQuickCache();
+        if (!cache || !cache.factions[factionName.toLowerCase()]) return [];
+        
+        const faction = cache.factions[factionName.toLowerCase()];
+        // TODO: Parse members list (comma-separated, with [notable] tags)
+        
+        return [];
+    }
+    
+    function getCharacterFaction(characterName) {
+        // TODO: Find which faction a character belongs to
+        const cache = loadFactionQuickCache();
+        if (!cache) return null;
+        
+        // TODO: Search through all factions' member lists
+        
+        return null;
+    }
+    
+    function getFactionRelations(factionName) {
+        // TODO: Get faction's allies and enemies as arrays
+        const cache = loadFactionQuickCache();
+        if (!cache || !cache.factions[factionName.toLowerCase()]) return null;
+        
+        // TODO: Parse allied_factions and enemy_factions
+        
+        return {
+            allies: [],
+            enemies: []
+        };
+    }
     
     function loadAllCharacters() {
+        // Use existing cache if available (set by processTools for performance)
         if (characterCache !== null) return characterCache;
         
         characterCache = {};
@@ -3264,6 +4402,7 @@ function GameState(hook, text) {
         
         if (!cards || cards.length === 0) return characterCache;
         
+        // Process all character cards
         for (const card of cards) {
             const parsed = parseCharacterCard(card);
             if (parsed && parsed.name) {
@@ -3273,7 +4412,7 @@ function GameState(hook, text) {
         }
         
         if (debug) {
-            console.log(`${MODULE_NAME}: Loaded ${Object.keys(characterCache).length} characters`);
+            log(`${MODULE_NAME}: Loaded ${Object.keys(characterCache).length} characters`);
         }
         return characterCache;
     }
@@ -3282,6 +4421,11 @@ function GameState(hook, text) {
         const schema = loadRPGSchema();
         const format = loadCharacterFormat();
         
+        // Get default HP from schema
+        const defaultHP = schema.coreStats.HP?.default || 100;
+        const defaultLevel = 1;
+        const defaultXPMax = calculateXPRequirement(defaultLevel);
+        
         const character = {
             title: card.title,
             name: null,
@@ -3289,9 +4433,9 @@ function GameState(hook, text) {
             dob: null,
             race: null,
             gender: null,
-            hp: { current: 10, max: 10 },
-            level: 1,
-            xp: { current: 0, max: 100 },
+            hp: { current: defaultHP, max: defaultHP },
+            level: defaultLevel,
+            xp: { current: 0, max: defaultXPMax },
             location: '???',
             coreStats: {},
             attributes: {},
@@ -3364,7 +4508,8 @@ function GameState(hook, text) {
                     // Parse the info line (next line after header)
                     if (i + 1 < lines.length) {
                         const infoLine = lines[i + 1];
-                        parseCharacterInfoLine(infoLine, character);
+                        const format = loadCharacterFormat();
+                        parseInfoLineFromTemplate(infoLine, character, format.infoTemplate);
                         i++; // Skip the info line
                     }
                     continue;
@@ -3462,7 +4607,7 @@ function GameState(hook, text) {
                     // Store the footer separately
                     if (footerText) {
                         character.footerText = footerText;
-                        if (debug) console.log(`${MODULE_NAME}: Detected footer text: "${footerText.substring(0, 50)}..."`);
+                        // Removed noisy debug log - footer detection happens for all characters on every load
                     }
                 }
             }
@@ -3578,10 +4723,147 @@ function GameState(hook, text) {
         }
     }
     
-    function parseCharacterInfoLine(line, character) {
-        // Parse multiple formats:
-        // New: DOB: YYYY-MM-DD | Race: Human | Gender: Female
-        // Old: Gender: Female | HP: 10/10 | Level 1 (0/100 XP) | Current Location: Town_of_Beginnings
+    function parseInfoLineFromTemplate(line, character, template) {
+        // Parse an info line based on the template structure
+        // This is the inverse of formatTemplate - it extracts values from formatted text
+        
+        if (!line || !template) {
+            // No template, fall back to hardcoded parser
+            parseCharacterInfoLineHardcoded(line, character);
+            return;
+        }
+        
+        // Strategy: Build a regex from the template by replacing field placeholders with capture groups
+        // Handle both simple fields {field} and conditional fields {field?text with {field}}
+        
+        // First pass: extract field information and their positions
+        const fieldRegex = /\{([^}?]+)(\?[^}]*)?\}/g;
+        const fields = [];
+        let match;
+        let workingTemplate = template;
+        
+        while ((match = fieldRegex.exec(template)) !== null) {
+            fields.push({
+                fullMatch: match[0],
+                fieldPath: match[1],
+                isConditional: !!match[2],
+                startPos: match.index,
+                endPos: match.index + match[0].length
+            });
+        }
+        
+        // Build regex pattern by replacing placeholders
+        let pattern = template;
+        
+        // Escape regex special characters except for our placeholders
+        pattern = pattern.replace(/[.*+?^$()[\]\\]/g, '\\$&');
+        pattern = pattern.replace(/\\\{/g, '{').replace(/\\\}/g, '}'); // Unescape braces
+        
+        // Replace field placeholders with capture groups
+        for (let i = fields.length - 1; i >= 0; i--) {
+            const field = fields[i];
+            
+            if (field.isConditional) {
+                // For conditional fields like {dob?DOB: {dob} | }
+                // Make the entire section optional
+                const conditionalMatch = field.fullMatch.match(/\{[^?]+\?([^}]*)\}/);
+                if (conditionalMatch) {
+                    let conditionalContent = conditionalMatch[1];
+                    // Replace nested field references with capture groups
+                    conditionalContent = conditionalContent.replace(/\{[^}]+\}/g, '(.+?)');
+                    // Make it optional
+                    pattern = pattern.replace(field.fullMatch, `(?:${conditionalContent})?`);
+                }
+            } else {
+                // Simple field - determine what to capture based on context
+                const beforeChar = field.startPos > 0 ? template[field.startPos - 1] : '';
+                const afterChar = field.endPos < template.length ? template[field.endPos] : '';
+                
+                let captureGroup = '(.+?)'; // Default: lazy capture
+                
+                // Specific patterns based on context
+                if (afterChar === '/') {
+                    // Like HP: {hp.current}/{hp.max}
+                    captureGroup = '(\\d+)'; // Capture digits
+                } else if (afterChar === ')' && beforeChar === '(') {
+                    // Like Level {level} ({xp.current}/{xp.max} XP)
+                    captureGroup = '(\\d+)'; // Capture digits
+                } else if (afterChar === ' ' && template[field.endPos + 1] === 'X' && template[field.endPos + 2] === 'P') {
+                    // Like {xp.max} XP
+                    captureGroup = '(\\d+)'; // Capture digits  
+                } else if (beforeChar === ' ' && afterChar === '|') {
+                    // Field followed by pipe delimiter
+                    captureGroup = '([^|]+?)'; // Capture until pipe
+                } else if (beforeChar === ':' && afterChar === '|') {
+                    // After colon, before pipe
+                    captureGroup = '\\s*([^|]+?)'; // Skip space, capture until pipe
+                } else if (beforeChar === ':' && !afterChar) {
+                    // After colon at end of line
+                    captureGroup = '\\s*(.+)'; // Skip space, capture rest
+                } else if (!afterChar) {
+                    // At end of template
+                    captureGroup = '(.+)'; // Capture rest of line
+                }
+                
+                pattern = pattern.replace(field.fullMatch, captureGroup);
+            }
+        }
+        
+        // Clean up the pattern - handle pipes
+        pattern = pattern.replace(/\|/g, '\\|');
+        
+        try {
+            const regex = new RegExp(pattern);
+            const result = line.match(regex);
+            
+            if (result) {
+                // Extract values and assign to character
+                let captureIndex = 1;
+                for (const field of fields) {
+                    if (!field.isConditional && result[captureIndex] !== undefined) {
+                        const value = result[captureIndex].trim();
+                        
+                        // Parse the value based on field type
+                        if (field.fieldPath.includes('.')) {
+                            // Nested field like hp.current
+                            const parts = field.fieldPath.split('.');
+                            if (parts[0] === 'hp' || parts[0] === 'xp' || character.coreStats[parts[0]]) {
+                                // Numeric stat
+                                const numValue = parseInt(value);
+                                if (!isNaN(numValue)) {
+                                    setCharacterField(character, field.fieldPath, numValue);
+                                }
+                            } else {
+                                setCharacterField(character, field.fieldPath, value);
+                            }
+                        } else if (field.fieldPath === 'level') {
+                            const numValue = parseInt(value);
+                            if (!isNaN(numValue)) {
+                                character.level = numValue;
+                            }
+                        } else {
+                            // Simple field
+                            setCharacterField(character, field.fieldPath, value);
+                        }
+                        
+                        captureIndex++;
+                    }
+                }
+                
+                // Successfully parsed with template
+                return;
+            }
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Template parsing failed: ${e.message}`);
+        }
+        
+        // Fall back to hardcoded parser if template parsing failed
+        parseCharacterInfoLineHardcoded(line, character);
+    }
+    
+    function parseCharacterInfoLineHardcoded(line, character) {
+        // Legacy hardcoded parser - kept for backwards compatibility
+        // Only used as fallback when template-based parsing doesn't extract critical fields
         
         const parts = line.split('|').map(p => p.trim());
         
@@ -3767,8 +5049,19 @@ function GameState(hook, text) {
                     entry: surgicalResult.text
                 });
                 if (debug) {
-                    console.log(`${MODULE_NAME}: Surgically updated character ${character.name}`);
+                    log(`${MODULE_NAME}: Surgically updated character ${character.name}`);
                 }
+                
+                // Update the quick cache with new character data
+                updateCharacterInCache(character.name, {
+                    location: character.location || '???',
+                    level: character.level || 1,
+                    hp_current: character.hp?.current !== undefined ? character.hp.current : 100,
+                    hp_max: character.hp?.max !== undefined ? character.hp.max : 100,
+                    xp_current: character.xp?.current !== undefined ? character.xp.current : 0,
+                    xp_max: character.xp?.max !== undefined ? character.xp.max : calculateXPRequirement(character.level || 1)
+                });
+                
                 return true;
             }
             
@@ -3798,6 +5091,13 @@ function GameState(hook, text) {
             if (!sectionDef) continue;
             
             const data = character[sectionId];
+            
+            // Skip empty relationships section entirely
+            if (sectionId === 'relationships' && (!data || (typeof data === 'object' && Object.keys(data).length === 0))) {
+                continue;
+            }
+            
+            // Skip other empty sections
             if (!data || (typeof data === 'object' && Object.keys(data).length === 0 && sectionDef.format !== 'plain_text')) continue;
             if (sectionDef.format === 'plain_text' && !data) continue;
             
@@ -3842,6 +5142,16 @@ function GameState(hook, text) {
             entry: entry
         });
         
+        // Update the quick cache after full rebuild too
+        updateCharacterInCache(character.name, {
+            location: character.location || '???',
+            level: character.level || 1,
+            hp_current: character.hp?.current !== undefined ? character.hp.current : 100,
+            hp_max: character.hp?.max !== undefined ? character.hp.max : 100,
+            xp_current: character.xp?.current !== undefined ? character.xp.current : 0,
+            xp_max: character.xp?.max !== undefined ? character.xp.max : calculateXPRequirement(character.level || 1)
+        });
+        
         if (debug) console.log(`${MODULE_NAME}: Rebuilt character ${character.name}`);
         return true;
     }
@@ -3857,6 +5167,28 @@ function GameState(hook, text) {
             if (debug) console.log(`${MODULE_NAME}: Fixed string relationships during surgical update for ${character.name}`);
         }
         
+        // Find and replace the info line which follows the header
+        const headerPattern = /^##\s+\*\*[^*]+\*\*.*$/m;
+        const headerMatch = text.match(headerPattern);
+        if (headerMatch) {
+            // Find the line after the header (the info line)
+            const headerIndex = text.indexOf(headerMatch[0]);
+            const afterHeader = text.substring(headerIndex + headerMatch[0].length);
+            const nextLineMatch = afterHeader.match(/^\n([^\n]+)/);
+            
+            if (nextLineMatch) {
+                const oldInfoLine = nextLineMatch[1];
+                const newInfoLine = formatTemplate(format.infoLineFormat || format.infoTemplate, character);
+                
+                if (oldInfoLine !== newInfoLine) {
+                    // Replace the old info line with the new one
+                    text = text.replace(headerMatch[0] + '\n' + oldInfoLine, 
+                                       headerMatch[0] + '\n' + newInfoLine);
+                    if (debug) log(`${MODULE_NAME}: Updated info line for ${character.name}`);
+                }
+            }
+        }
+        
         // Update each section that has changed
         for (const sectionId of format.sectionOrder) {
             const sectionDef = format.sections.find(s => s.id === sectionId);
@@ -3867,23 +5199,81 @@ function GameState(hook, text) {
             
             if (!pattern) continue;
             
-            // Try to find and update this section
-            const sectionResult = updateSection(text, pattern, sectionId, data, sectionDef.format, character);
-            
-            if (sectionResult.updated) {
-                text = sectionResult.text;
-            } else if (data && Object.keys(data).length > 0) {
-                // Section not found but we have data for it - try to add it
-                const newSection = pattern + '\n' + formatSectionData(data, sectionDef.format, character) + '\n';
+            // Special handling for relationships section - only add if there's actual data
+            if (sectionId === 'relationships') {
+                // Check if we have any actual relationships
+                const hasRelationships = data && typeof data === 'object' && Object.keys(data).length > 0;
                 
-                // Find appropriate place to insert (after previous section or before next)
-                const insertPosition = findSectionInsertPosition(text, sectionId, format);
-                if (insertPosition >= 0) {
-                    text = text.slice(0, insertPosition) + newSection + text.slice(insertPosition);
+                if (hasRelationships) {
+                    // We have relationships, update or add the section
+                    const sectionResult = updateSection(text, pattern, sectionId, data, sectionDef.format, character);
+                    if (sectionResult.updated) {
+                        text = sectionResult.text;
+                    } else {
+                        // Section doesn't exist, add it with data
+                        const newSection = pattern + '\n' + formatSectionData(data, sectionDef.format, character) + '\n';
+                        const insertPosition = findSectionInsertPosition(text, sectionId, format);
+                        if (insertPosition >= 0) {
+                            // Ensure there's a newline before the new section
+                            const needsNewline = insertPosition > 0 && text[insertPosition - 1] !== '\n';
+                            const insertion = needsNewline ? '\n' + newSection : newSection;
+                            text = text.slice(0, insertPosition) + insertion + text.slice(insertPosition);
+                        } else {
+                            text += '\n' + newSection;
+                        }
+                    }
                 } else {
-                    // Just append at end if we can't find a good position
-                    text += '\n' + newSection;
+                    // No relationships - remove the section if it exists
+                    const escapedPattern = pattern.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+                    const sectionRegex = new RegExp(
+                        `(${escapedPattern}\\n)([^\\n]*(?:\\n(?!\\*\\*|###|===|^\\s*$)[^\\n]*)*)\\n?`,
+                        'gm'
+                    );
+                    
+                    if (sectionRegex.test(text)) {
+                        text = text.replace(sectionRegex, '');
+                        if (debug) log(`${MODULE_NAME}: Removed empty relationships section for ${character.name}`);
+                    }
                 }
+            } else {
+                // Normal section handling
+                const sectionResult = updateSection(text, pattern, sectionId, data, sectionDef.format, character);
+                
+                if (sectionResult.updated) {
+                    text = sectionResult.text;
+                } else if (data && (typeof data !== 'object' || Object.keys(data).length > 0)) {
+                    // Section not found but we have data for it - try to add it
+                    const newSection = pattern + '\n' + formatSectionData(data, sectionDef.format, character) + '\n';
+                    
+                    // Find appropriate place to insert (after previous section or before next)
+                    const insertPosition = findSectionInsertPosition(text, sectionId, format);
+                    if (insertPosition >= 0) {
+                        text = text.slice(0, insertPosition) + newSection + text.slice(insertPosition);
+                    } else {
+                        // Just append at end if we can't find a good position
+                        text += '\n' + newSection;
+                    }
+                }
+            }
+        }
+        
+        // Update footer if template exists
+        if (format.footerTemplate) {
+            const newFooter = formatTemplate(format.footerTemplate, character);
+            if (newFooter && newFooter.trim()) {
+                // Find existing footer (usually starts with === or is at the very end)
+                const footerPattern = /^===.*$/m;
+                const footerMatch = text.match(footerPattern);
+                
+                if (footerMatch) {
+                    // Replace existing footer
+                    text = text.replace(footerMatch[0], newFooter);
+                } else {
+                    // Add footer at end
+                    text = text.trimEnd() + '\n' + newFooter;
+                }
+                
+                if (debug) log(`${MODULE_NAME}: Updated footer for ${character.name}`);
             }
         }
         
@@ -3924,7 +5314,7 @@ function GameState(hook, text) {
             return { updated: true, text: newText };
         }
         
-        // Replace the section content
+        // Replace the section content - ensure we use formatted content, not raw object
         const newSection = match[1] + (newContent || '');
         const newText = text.replace(match[0], newSection);
         
@@ -4295,11 +5685,6 @@ function GameState(hook, text) {
         return result;
     }
     
-    // Keep formatInfoLine as an alias for backwards compatibility
-    function formatInfoLine(template, character) {
-        return formatTemplate(template, character);
-    }
-    
     function formatSectionData(data, format, character) {
         // Protect against null/undefined data
         if (!data) return '';
@@ -4611,6 +5996,25 @@ function GameState(hook, text) {
         if (saveCharacter(character)) {
             // Clear cache to include new character
             characterCache = null;
+            
+            // Add the new character to the quick cache
+            const cache = loadCharacterQuickCache();
+            if (cache) {
+                // Add new character to cache
+                cache.characters[character.name.toLowerCase()] = {
+                    name: character.name || '???',
+                    location: character.location || '???',
+                    level: character.level || 1,
+                    hp_current: character.hp?.current !== undefined ? character.hp.current : 100,
+                    hp_max: character.hp?.max !== undefined ? character.hp.max : 100,
+                    xp_current: character.xp?.current !== undefined ? character.xp.current : 0,
+                    xp_max: character.xp?.max !== undefined ? character.xp.max : calculateXPRequirement(character.level || 1)
+                };
+                cache.count = Object.keys(cache.characters).length;
+                cache.total_cards++; // Increment total cards since we just created one
+                saveCharacterQuickCache(cache);
+            }
+            
             if (debug) console.log(`${MODULE_NAME}: Created character ${character.name}`);
             return character;
         }
@@ -4730,6 +6134,10 @@ function GameState(hook, text) {
     function processGetters(text) {
         if (!text) return text;
         
+        // Use cached characters if available (set by context hook)
+        // Otherwise lazy load when first character getter is encountered
+        let characters = characterCache;
+        
         // Lazy load runtime variables only when needed
         let runtimeVars = null;
         
@@ -4744,7 +6152,7 @@ function GameState(hook, text) {
             
             // Process different getter types
             switch(getterType) {
-                // Character getters
+                // Character getters - now use efficient caching
                 case 'location':
                     return getCharacterLocation(params[0]) || '???';
                     
@@ -4825,46 +6233,47 @@ function GameState(hook, text) {
     }
     
     // Character getter functions
-    function getCharacterLocation(name) {
+    // Helper function to get a character from cache efficiently
+    function getCharacterFromCache(name) {
         if (!name) return null;
-        const characters = loadAllCharacters();
-        const character = characters[String(name).toLowerCase()];
+        
+        // Lazy load characters only when needed (not at module init)
+        if (characterCache === null) {
+            loadAllCharacters();
+        }
+        
+        return characterCache[String(name).toLowerCase()] || null;
+    }
+    
+    function getCharacterLocation(name) {
+        const character = getCharacterFromCache(name);
         return character ? character.location : null;
     }
     
     function getCharacterHP(name) {
-        if (!name) return null;
-        const characters = loadAllCharacters();
-        const character = characters[String(name).toLowerCase()];
+        const character = getCharacterFromCache(name);
         return character ? `${character.hp.current}/${character.hp.max}` : null;
     }
     
     function getCharacterLevel(name) {
-        if (!name) return null;
-        const characters = loadAllCharacters();
-        const character = characters[String(name).toLowerCase()];
+        const character = getCharacterFromCache(name);
         return character ? character.level.toString() : null;
     }
     
     function getCharacterXP(name) {
-        if (!name) return null;
-        const characters = loadAllCharacters();
-        const character = characters[String(name).toLowerCase()];
+        const character = getCharacterFromCache(name);
         return character ? `${character.xp.current}/${character.xp.max}` : null;
     }
     
     function getCharacterName(name) {
-        if (!name) return null;
-        const characters = loadAllCharacters();
-        const character = characters[String(name).toLowerCase()];
+        const character = getCharacterFromCache(name);
         return character ? character.name : null;
     }
     
     function getCharacterAttribute(characterName, attrName) {
-        if (!characterName || !attrName) return null;
+        if (!attrName) return null;
         
-        const characters = loadAllCharacters();
-        const character = characters[String(characterName).toLowerCase()];
+        const character = getCharacterFromCache(characterName);
         if (!character) return null;
         
         const attrKey = String(attrName).toLowerCase();
@@ -4872,10 +6281,9 @@ function GameState(hook, text) {
     }
     
     function getCharacterSkill(characterName, skillName) {
-        if (!characterName || !skillName) return null;
+        if (!skillName) return null;
         
-        const characters = loadAllCharacters();
-        const character = characters[String(characterName).toLowerCase()];
+        const character = getCharacterFromCache(characterName);
         if (!character) return null;
         
         const skillKey = String(skillName).toLowerCase();
@@ -4884,9 +6292,7 @@ function GameState(hook, text) {
     }
     
     function getCharacterInventory(name) {
-        if (!name) return null;
-        const characters = loadAllCharacters();
-        const character = characters[String(name).toLowerCase()];
+        const character = getCharacterFromCache(name);
         if (!character) return null;
         
         const items = Object.entries(character.inventory || {})
@@ -4897,10 +6303,9 @@ function GameState(hook, text) {
     }
     
     function getCharacterStat(characterName, statName) {
-        if (!characterName || !statName) return null;
+        if (!statName) return null;
         
-        const characters = loadAllCharacters();
-        const character = characters[String(characterName).toLowerCase()];
+        const character = getCharacterFromCache(characterName);
         if (!character) return null;
         
         const statKey = String(statName).toLowerCase();
@@ -5002,7 +6407,7 @@ function GameState(hook, text) {
             keys: '.,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"'
         });
         
-        if (debug) console.log(`${MODULE_NAME}: Created default Current Scene template with player: ${playerName}`);
+        if (debug) log(`${MODULE_NAME}: Created default Current Scene template with player: ${playerName}`);
         return defaultText;
     }
     
@@ -5128,26 +6533,6 @@ function GameState(hook, text) {
         // Generic references
         'player', 'self', 'me', 'you', 'user', 'myself', 'yourself', 
         'him', 'her', 'them', 'they', 'it', 'this', 'that',
-        'someone', 'somebody', 'anyone', 'anybody', 'everyone', 'everybody',
-        'no_one', 'nobody', 'none', 'nothing', 'unknown', 'undefined', 'null',
-        
-        // Group references
-        'group', 'party', 'team', 'squad', 'guild', 'clan', 'faction',
-        'allies', 'enemies', 'friends', 'companions', 'members',
-        
-        // Common placeholder names
-        'name', 'character', 'person', 'npc', 'target', 'source', 
-        'giver', 'receiver', 'sender', 'recipient', 'victim', 'attacker',
-        'customer', 'merchant', 'vendor', 'shop', 'shopkeeper',
-        
-        // Common action descriptors that might be mistaken for names
-        'here', 'there', 'now', 'then', 'today', 'tomorrow', 'yesterday',
-        'all', 'some', 'any', 'other', 'another', 'each', 'every',
-        'both', 'either', 'neither', 'several', 'many', 'few',
-        
-        // System/meta references
-        'system', 'admin', 'gm', 'dm', 'gamemaster', 'dungeonmaster',
-        'narrator', 'storyteller', 'ai', 'bot', 'assistant', 'helper'
     ];
     
     function isValidCharacterName(name) {
@@ -5159,25 +6544,60 @@ function GameState(hook, text) {
         // Check if empty or just whitespace
         if (!normalized) return false;
         
-        // First, check if this character actually exists - if so, it's valid regardless of blacklist
-        const characters = loadAllCharacters();
-        if (characters[normalized]) {
-            return true; // Character exists, so name is valid
-        }
-        
-        // Check against blacklist
+        // Check against blacklist of generic terms (but allow compound names like "player_unknown")
         if (INVALID_CHARACTER_NAMES.includes(normalized)) {
-            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (blacklisted)`);
+            if (debug) log(`${MODULE_NAME}: Invalid character name detected: "${name}" (blacklisted)`);
             return false;
         }
         
-        // Check if it's just numbers
-        if (/^\d+$/.test(normalized)) {
-            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (only numbers)`);
-            return false;
-        }
-        
+        // Valid syntax - doesn't need to exist yet (allows hallucinated names)
         return true;
+    }
+    
+    // ==========================
+    // Helper function for tools
+    // ==========================
+    
+    // Local function to load a single character (used by tools)
+    function loadCharacter(name) {
+        if (!name) return null;
+        const normalizedName = String(name).toLowerCase();
+        
+        // Check quick cache first
+        const quickCache = loadCharacterQuickCache();
+        if (quickCache && quickCache.characters[normalizedName]) {
+            // Character exists in quick cache, now load full data
+            
+            // Check regular cache first
+            if (characterCache && characterCache[normalizedName]) {
+                return characterCache[normalizedName];
+            }
+            
+            // Initialize cache if needed
+            if (!characterCache) characterCache = {};
+            
+            // Load just this one character
+            const card = Utilities.storyCard.find(
+                c => {
+                    if (!c.title) return false;
+                    const match = c.title.match(/\[(CHARACTER|PLAYER)\]\s+(.+)/);
+                    return match && match[2].toLowerCase() === normalizedName;
+                },
+                false // Only need first match
+            );
+            
+            if (card) {
+                const parsed = parseCharacterCard(card);
+                if (parsed && parsed.name) {
+                    characterCache[normalizedName] = parsed;
+                    return parsed;
+                }
+            }
+        }
+        
+        // Not in quick cache - might still exist, do full search
+        const allChars = loadAllCharacters();
+        return allChars[normalizedName] || null;
     }
     
     // ==========================
@@ -5218,8 +6638,34 @@ function GameState(hook, text) {
             characterName = String(characterName).toLowerCase();
             location = String(location).toLowerCase().replace(/\s+/g, '_');
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Check quick cache first
+            const cache = loadCharacterQuickCache();
+            if (cache && cache.characters[characterName]) {
+                // Character exists in cache, load and update
+                const character = loadCharacter(characterName);
+                if (character) {
+                    character.location = location;
+                    saveCharacter(character);
+                    if (debug) console.log(`${MODULE_NAME}: ${character.name} moved to ${location}`);
+                    return 'executed';
+                }
+            }
+            
+            // Character not in cache - check if cache is complete
+            if (isCacheComplete()) {
+                // Cache is complete and character isn't in it = doesn't exist
+                trackUnknownEntity(characterName, 'update_location', info?.actionCount);
+                if (shouldTriggerGeneration(characterName)) {
+                    addToEntityQueue(characterName);
+                }
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location (cache complete)`);
+                }
+                return 'executed';
+            }
+            
+            // Cache might be incomplete, do a full check
+            const character = loadCharacter(characterName);
             
             if (!character) {
                 trackUnknownEntity(characterName, 'update_location', info?.actionCount);
@@ -5230,6 +6676,8 @@ function GameState(hook, text) {
                     console.log(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
                 }
             } else {
+                // Found a character not in cache - refresh cache
+                refreshCacheIfNeeded();
                 character.location = location;
                 saveCharacter(character);
                 if (debug) console.log(`${MODULE_NAME}: ${character.name} moved to ${location}`);
@@ -5263,8 +6711,8 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             
             if (!character) {
                 if (debug) {
@@ -5310,8 +6758,8 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             
             if (!character) return 'executed';
             
@@ -5421,7 +6869,7 @@ function GameState(hook, text) {
         deal_damage: function(sourceName, targetName, damageAmount) {
             if (!targetName) return 'malformed';
             
-            // Validate target name (source can be 'unknown' for environmental damage)
+            // Validate target name syntax (but allow non-existent/hallucinated names)
             if (!isValidCharacterName(targetName)) {
                 return 'malformed';
             }
@@ -5443,17 +6891,31 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
-            const characters = loadAllCharacters();
-            const target = characters[targetName];
-            const source = characters[sourceName];
+            // Check quick cache first for target existence
+            const cache = loadCharacterQuickCache();
+            if (cache && !cache.characters[targetName]) {
+                // Target not in cache - check if cache is complete
+                if (isCacheComplete()) {
+                    // Cache is complete, character definitely doesn't exist
+                    if (debug) {
+                        console.log(`${MODULE_NAME}: Target ${targetName} not found (cache complete)`);
+                    }
+                    return 'executed';
+                }
+            }
             
-            // Don't track for deal_damage - could be environmental/trap damage
+            // Load the target character
+            const target = loadCharacter(targetName);
             if (!target) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Target ${targetName} not found`);
                 }
                 return 'executed';
             }
+            
+            // Only load source if needed and exists
+            const source = (sourceName !== 'unknown' && cache && cache.characters[sourceName]) 
+                ? loadCharacter(sourceName) : null;
             
             const sourceDisplay = source ? source.name : sourceName;
             
@@ -5493,8 +6955,8 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             
             if (!character) {
                 trackUnknownEntity(characterName, 'add_levelxp', info?.actionCount);
@@ -5539,8 +7001,8 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             
             if (!character) {
                 trackUnknownEntity(characterName, 'add_skillxp', info?.actionCount);
@@ -5577,8 +7039,8 @@ function GameState(hook, text) {
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             
             if (!character) {
                 trackUnknownEntity(characterName, 'unlock_newskill', info?.actionCount);
@@ -5646,8 +7108,8 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             
             if (!character) return 'executed';
             
@@ -5765,8 +7227,8 @@ function GameState(hook, text) {
             }
             
             // Get character's current location
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             
             if (!character) {
                 if (debug) {
@@ -5837,10 +7299,26 @@ function GameState(hook, text) {
                 );
             }
             
+            // Use location format if available
+            const locationFormat = loadLocationFormat();
+            const locationData = {
+                name: locationName,
+                type: 'Unknown',
+                terrain: 'Unexplored'
+            };
+            
+            let headerLine = locationFormat?.mainTemplate ? 
+                formatTemplate(locationFormat.mainTemplate, locationData) :
+                `## **${locationName}**`;
+            
+            let infoLine = locationFormat?.infoTemplate ?
+                formatTemplate(locationFormat.infoTemplate, locationData) :
+                'Type: Unknown | Terrain: Unexplored';
+            
             const locationEntry = (
                 locationHeaders + '\n' +
-                '## **' + locationName + '**\n' +
-                'Type: Unknown | Terrain: Unexplored\n' +
+                headerLine + '\n' +
+                infoLine + '\n' +
                 '### Description\n' +
                 'An unexplored location. Details will be revealed upon first visit.\n' +
                 '### Pathways\n' +
@@ -6235,7 +7713,7 @@ function GameState(hook, text) {
         // This is the most reliable way to check for existing characters
         const allCharacters = loadAllCharacters();
         if (allCharacters[entityName]) {
-            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${entityName}`);
+            if (debug) log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${entityName}`);
             return;
         }
         
@@ -6262,7 +7740,7 @@ function GameState(hook, text) {
         
         // If character already exists, don't track
         if (characterCards && characterCards.length > 0) {
-            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character card: ${entityName}`);
+            if (debug) log(`${MODULE_NAME}: Skipping tracking for existing character card: ${entityName}`);
             return;
         }
         
@@ -6315,12 +7793,12 @@ function GameState(hook, text) {
             // If no recent turns remain, remove the entity from tracking
             if (recentTurns.length === 0) {
                 delete tracker[name];
-                if (debug) console.log(`${MODULE_NAME}: Removed stale entity from tracker: ${name} (all turns older than ${cutoffTurn})`);
+                if (debug) log(`${MODULE_NAME}: Removed stale entity from tracker: ${name} (all turns older than ${cutoffTurn})`);
             } else if (recentTurns.length < data.uniqueTurns.length) {
                 // Update with only recent turns
                 tracker[name].uniqueTurns = recentTurns;
                 tracker[name].count = recentTurns.length;
-                if (debug) console.log(`${MODULE_NAME}: Cleaned up old turns for ${name}: kept ${recentTurns.length} recent turns`);
+                if (debug) log(`${MODULE_NAME}: Cleaned up old turns for ${name}: kept ${recentTurns.length} recent turns`);
             }
         }
         
@@ -6573,6 +8051,9 @@ function GameState(hook, text) {
         let toolsToModify = [];
         let executedTools = [];  // Track for RewindSystem
         
+        // Only load characters if there are actually tools to process
+        let charactersLoaded = false;
+        
         // First pass: find and execute all tools, track malformed ones and ones to modify
         let match;
         TOOL_PATTERN.lastIndex = 0;
@@ -6593,10 +8074,17 @@ function GameState(hook, text) {
             // Parse parameters
             const params = parseParameters(paramString);
             
-            // Capture revert data BEFORE executing the tool
-            const revertData = captureRevertData(toolName.toLowerCase(), params);
+            // Load characters on first tool that needs them
+            if (!charactersLoaded) {
+                // Set cache for all tools to use
+                characterCache = loadAllCharacters();
+                charactersLoaded = true;
+            }
             
-            let result = processToolCall(toolName, params);
+            // Capture revert data BEFORE executing the tool
+            const revertData = captureRevertData(toolName.toLowerCase(), params, characterCache);
+            
+            let result = processToolCall(toolName, params, characterCache);
             
             // Log tool result
             if (debug) {
@@ -6719,8 +8207,8 @@ function GameState(hook, text) {
     }
     
     // Capture revert data for specific tools
-    function captureRevertData(toolName, params) {
-        const characters = loadAllCharacters();
+    function captureRevertData(toolName, params, characters) {
+        if (!characters) characters = loadAllCharacters();
         const revertData = {};
         
         switch(toolName) {
@@ -6766,14 +8254,16 @@ function GameState(hook, text) {
         return revertData;
     }
     
-    function processToolCall(toolName, params) {
+    function processToolCall(toolName, params, characters) {
         // Normalize tool name to lowercase for lookup
         const normalizedToolName = toolName.toLowerCase();
+        
+        // Characters are already in characterCache, set by processTools
         
         // Check if it's a known tool
         if (toolProcessors[normalizedToolName]) {
             try {
-                // Execute the tool
+                // Execute the tool (it will use the cached characters)
                 const result = toolProcessors[normalizedToolName](...params);
                 return result;
             } catch (e) {
@@ -6859,8 +8349,8 @@ function GameState(hook, text) {
                 return false;
             }
             
-            const characters = loadAllCharacters();
-            const character = characters[characterName];
+            // Selectively load only the character needed
+            const character = loadCharacter(characterName);
             if (!character) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Character ${characterName} not found`);
@@ -6924,36 +8414,36 @@ function GameState(hook, text) {
             return false;
         }
         
-        // Parse current/max - can be two params or one "current/max" string
-        let current, max;
-        if (params[1] && String(params[1]).includes('/')) {
-            const parts = String(params[1]).split('/');
-            current = parseInt(parts[0]);
-            max = parseInt(parts[1]);
-        } else {
-            current = parseInt(params[1]);
-            max = parseInt(params[2]);
-        }
+        // Parse current value only - use update_max_[stat] to change max
+        const current = parseInt(params[1]);
         
-        if (isNaN(current) || isNaN(max)) {
-            if (debug) console.log(`${MODULE_NAME}: Invalid format for ${statName}`);
+        if (isNaN(current)) {
+            if (debug) console.log(`${MODULE_NAME}: Invalid value for ${statName}: ${params[1]}`);
             return false;
         }
         
+        // Update only the current value, preserve max
         if (matchingStatKey.toUpperCase() === 'HP') {
             character.hp.current = current;
-            character.hp.max = max;
         } else {
             const statKey = matchingStatKey.toLowerCase();
             if (!character.coreStats[statKey]) {
-                character.coreStats[statKey] = {};
+                character.coreStats[statKey] = { current: 0, max: 100 };
             }
             character.coreStats[statKey].current = current;
-            character.coreStats[statKey].max = max;
+        }
+        
+        // Get the max value for logging
+        let max;
+        if (matchingStatKey.toUpperCase() === 'HP') {
+            max = character.hp.max;
+        } else {
+            const statKey = matchingStatKey.toLowerCase();
+            max = character.coreStats[statKey]?.max || 100;
         }
         
         saveCharacter(character);
-        if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s ${statName} to ${current}/${max}`);
+        if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s current ${statName} to ${current} (max: ${max})`);
         return true;
     }
     
@@ -7310,10 +8800,6 @@ function GameState(hook, text) {
     // Expose debug function to global API if debug mode is on
     if (debug) {
         GameState.debugTest = debugTest;
-        console.log(`${MODULE_NAME}: Debug commands available - use /command_name in input`);
-        console.log(`${MODULE_NAME}: Generation: gw_activate, gw_npc, gw_quest, gw_location`);
-        console.log(`${MODULE_NAME}: Status: entity_status, char_list, schema_all`);
-        console.log(`${MODULE_NAME}: Utilities: runtime_test, cleanup, debug_log, debug_help`);
     }
     
     // ==========================
@@ -7353,7 +8839,7 @@ function GameState(hook, text) {
             // Initialize debug logging for this turn
             initDebugLogging();
             
-            if (debug) console.log(`${MODULE_NAME}: Input received: "${text}"`);
+            if (debug) log(`${MODULE_NAME}: Input received: "${text}"`);
             
             // Store original input for logging
             const originalInput = text;
@@ -7362,17 +8848,17 @@ function GameState(hook, text) {
             loadInputCommands();
             loadInputModifier();
             
-            // Apply INPUT_MODIFIER first (pure JavaScript sandbox)
+            // Apply INPUT_MODIFIER first
             if (inputModifier) {
                 try {
                     text = inputModifier(text);
-                    if (debug) console.log(`${MODULE_NAME}: Applied input modifier`);
+                    if (debug) log(`${MODULE_NAME}: Applied input modifier`);
                 } catch(e) {
-                    if (debug) console.log(`${MODULE_NAME}: Input modifier error: ${e}`);
+                    if (debug) log(`${MODULE_NAME}: Input modifier error: ${e}`);
                 }
             }
             
-            // Check for INPUT_COMMANDS anywhere in the text
+            // Check for INPUT_COMMANDS in the text
             // Pattern: /commandname or /commandname args
             const commandPattern = /\/([a-z_]+)(?:\s+([^\n/]*))?/gi;
             let commandResults = [];
@@ -7383,14 +8869,14 @@ function GameState(hook, text) {
                 const argsString = match[2] || '';
                 const args = argsString.trim().split(/\s+/).filter(arg => arg);
                 
-                if (debug) console.log(`${MODULE_NAME}: Found command: /${commandName} with args: [${args.join(', ')}]`);
+                if (debug) log(`${MODULE_NAME}: Found command: /${commandName} with args: [${args.join(', ')}]`);
                 
                 // Check debug commands first (only when debug mode is on)
                 if (debug) {
                     const debugResult = handleDebugCommand(commandName, args);
                     if (debugResult) {
-                        console.log(`${MODULE_NAME}: Debug command handled: ${commandName}`);
-                        console.log(`${MODULE_NAME}: Debug command result: ${debugResult}`);
+                        log(`${MODULE_NAME}: Debug command handled: ${commandName}`);
+                        log(`${MODULE_NAME}: Debug command result: ${debugResult}`);
                         commandResults.push(debugResult);
                         continue;
                     }
@@ -7400,7 +8886,7 @@ function GameState(hook, text) {
                 if (inputCommands[commandName]) {
                     const result = inputCommands[commandName](args);
                     if (result !== null && result !== undefined) {
-                        if (debug) console.log(`${MODULE_NAME}: Command /${commandName} returned: ${result}`);
+                        if (debug) log(`${MODULE_NAME}: Command /${commandName} returned: ${result}`);
                         commandResults.push(result);
                         continue;
                     }
@@ -7465,8 +8951,10 @@ function GameState(hook, text) {
             
             // Clear caches for fresh load (before initialization)
             runtimeVariablesCache = null;
-            characterCache = null;
+            characterCache = null;  // Clear full character data cache
+            locationCache = null;   // Clear full location data cache
             schemaCache = null;
+            // NOTE: Quick caches are NOT cleared - they persist across turns!
             
             // Initialize runtime system
             initializeRuntimeVariables();
@@ -7480,14 +8968,35 @@ function GameState(hook, text) {
             // Remove any hidden message markers from previous turns (including surrounding newlines)
             let modifiedText = text.replace(/\n*<<<[^>]*>>>\n*/g, '');
             
-            // Move current scene card if it exists (before processing getters)
+            // Move current scene card if it exists (before getters)
             modifiedText = moveCurrentSceneCard(modifiedText);
             
-            // Process all getters in the entire context (only if getters exist)
-            let gettersReplaced = 0;
+            // Process all getters in the entire context (if getters exist)
+            let gettersReplaced = {};
             if (GETTER_PATTERN.test(modifiedText)) {
+                // Track which getters are being replaced (count only, not every instance)
                 const getterMatches = modifiedText.match(GETTER_PATTERN);
-                gettersReplaced = getterMatches ? getterMatches.length : 0;
+                if (getterMatches) {
+                    // Check if any getters need character data
+                    let needsCharacters = false;
+                    getterMatches.forEach(match => {
+                        const innerMatch = match.match(/get_([a-z_]+)/i);
+                        if (innerMatch) {
+                            const getterName = innerMatch[1];
+                            gettersReplaced[getterName] = (gettersReplaced[getterName] || 0) + 1;
+                            
+                            // These getters need character data
+                            if (['location', 'hp', 'level', 'xp', 'name', 'attribute', 'skill', 'inventory', 'stat'].includes(getterName)) {
+                                needsCharacters = true;
+                            }
+                        }
+                    });
+                    
+                    // Pre-load characters if needed
+                    if (needsCharacters) {
+                        characterCache = loadAllCharacters();
+                    }
+                }
                 modifiedText = processGetters(modifiedText);
             }
             
@@ -7558,7 +9067,7 @@ function GameState(hook, text) {
             // Check if GenerationWizard needs to append prompts
             if (typeof GenerationWizard !== 'undefined') {
                 const isActive = GenerationWizard.isActive();
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard active check: ${isActive}`);
+                if (debug) log(`${MODULE_NAME}: GenerationWizard active check: ${isActive}`);
                 
                 if (isActive) {
                     const result = GenerationWizard.process('context', modifiedText);
@@ -7592,9 +9101,9 @@ function GameState(hook, text) {
                         modifiedText = contextModifier.call(context, modifiedText);
                     }
                     
-                    if (debug) console.log(`${MODULE_NAME}: Applied context modifier`);
+                    if (debug) log(`${MODULE_NAME}: Applied context modifier`);
                 } catch(e) {
-                    if (debug) console.log(`${MODULE_NAME}: Context modifier error: ${e}`);
+                    if (debug) log(`${MODULE_NAME}: Context modifier error: ${e}`);
                 }
             }
             
@@ -7615,11 +9124,6 @@ function GameState(hook, text) {
             // Store original output for logging
             const originalOutput = text;
             
-            // Log raw output in debug mode
-            if (debug) {
-                console.log(`${MODULE_NAME}: Raw output from AI:`);
-                console.log(text);
-            }
             
             // Load output modifier
             loadOutputModifier();
@@ -7666,20 +9170,20 @@ function GameState(hook, text) {
                 if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
                     // Add warning that GM will take control next turn
                     modifiedText += '\n\n<<<The GM will use the next turn to think. Use `/GW abort` if undesired.>>>';
-                    if (debug) console.log(`${MODULE_NAME}: GenerationWizard activated, adding warning to output`);
+                    if (debug) log(`${MODULE_NAME}: GenerationWizard activated, adding warning to output`);
                 } else if (entityQueued) {
                     // Entity generation was triggered
                     modifiedText += '\n\n<<<The GM will generate a new entity next turn. Use `/GW abort` if undesired.>>>';
-                    if (debug) console.log(`${MODULE_NAME}: Entity generation triggered, adding warning to output`);
+                    if (debug) log(`${MODULE_NAME}: Entity generation triggered, adding warning to output`);
                 }
                 
-                // Apply OUTPUT_MODIFIER if available (pure JavaScript sandbox)
+                // Apply OUTPUT_MODIFIER if available
                 if (outputModifier) {
                     try {
                         modifiedText = outputModifier(modifiedText);
-                        if (debug) console.log(`${MODULE_NAME}: Applied output modifier`);
+                        if (debug) log(`${MODULE_NAME}: Applied output modifier`);
                     } catch(e) {
-                        if (debug) console.log(`${MODULE_NAME}: Output modifier error: ${e}`);
+                        if (debug) log(`${MODULE_NAME}: Output modifier error: ${e}`);
                     }
                 }
                 
@@ -7696,6 +9200,42 @@ function GameState(hook, text) {
                 // Clear runtime cache to force refresh on next access
                 runtimeVariablesCache = null;
                 
+                // Pin important cards to top for fast access
+                // Optimal order: [PLAYER] cards -> Cache cards -> Everything else
+                if (typeof storyCards !== 'undefined' && storyCards.length > 0) {
+                    const playerCards = [];
+                    const cacheCards = [];
+                    
+                    // Extract all special cards in one pass (backwards to avoid index issues)
+                    for (let i = storyCards.length - 1; i >= 0; i--) {
+                        const card = storyCards[i];
+                        if (!card || !card.title) continue;
+                        
+                        if (card.title.startsWith('[PLAYER]')) {
+                            playerCards.unshift(storyCards.splice(i, 1)[0]);
+                        } else if (card.title === '[GS] Character Cache' || 
+                                   card.title === '[GS] Location Cache' ||
+                                   card.title === '[GS] Faction Cache') {
+                            cacheCards.unshift(storyCards.splice(i, 1)[0]);
+                        }
+                    }
+                    
+                    // Re-insert in optimal order at the top
+                    let insertPos = 0;
+                    
+                    // Insert player cards at the very top
+                    if (playerCards.length > 0) {
+                        storyCards.splice(insertPos, 0, ...playerCards);
+                        if (debug) log(`${MODULE_NAME}: Pinned ${playerCards.length} player card(s) to top`);
+                    }
+                    
+                    // Insert cache cards right after players
+                    if (cacheCards.length > 0) {
+                        storyCards.splice(playerCards.length, 0, ...cacheCards);
+                        if (debug) log(`${MODULE_NAME}: Pinned ${cacheCards.length} cache card(s) after player cards`);
+                    }
+                }
+                
                 logTime();
                 return modifiedText;
             }
@@ -7709,9 +9249,40 @@ function GameState(hook, text) {
     GameState.getRuntimeValue = getRuntimeValue;
     GameState.setRuntimeValue = setRuntimeValue;
     GameState.loadAllCharacters = loadAllCharacters;
+    // Selective character loading - only loads the specific character needed
     GameState.loadCharacter = function(name) {
-        const chars = loadAllCharacters();
-        return chars[name.toLowerCase()];
+        if (!name) return null;
+        const normalizedName = String(name).toLowerCase();
+        
+        // Check cache first
+        if (characterCache && characterCache[normalizedName]) {
+            return characterCache[normalizedName];
+        }
+        
+        // Initialize cache if needed
+        if (!characterCache) characterCache = {};
+        
+        // Find and load just this one character
+        const card = Utilities.storyCard.find(
+            c => {
+                if (!c.title) return false;
+                const match = c.title.match(/\[(CHARACTER|PLAYER)\]\s+(.+)/);
+                return match && match[2].toLowerCase() === normalizedName;
+            },
+            false // Only need first match
+        );
+        
+        if (!card) return null;
+        
+        const parsed = parseCharacterCard(card);
+        if (parsed && parsed.name) {
+            // Add to cache
+            characterCache[normalizedName] = parsed;
+            if (debug) log(`${MODULE_NAME}: Selectively loaded character: ${parsed.name}`);
+            return parsed;
+        }
+        
+        return null;
     };
     GameState.saveCharacter = saveCharacter;
     GameState.createCharacter = createCharacter;
