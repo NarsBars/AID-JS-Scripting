@@ -207,30 +207,35 @@ function GenerationWizard(hook, text) {
         const name = collectedData.NAME || 'Unknown_Location';
         const formattedName = name.replace(/\s+/g, '_');
         
-        // Build type string from fields
-        let typeString = '';
-        if (collectedData.LOCATION_TYPE) typeString += `Type: ${collectedData.LOCATION_TYPE}`;
-        if (collectedData.TERRAIN) typeString += ` | Terrain: ${collectedData.TERRAIN}`;
-        
-        // TODO: Could add implicit danger tags based on LOCATION_TYPE
-        // Settlement/Safezone = Safe
-        // Wilderness/Landmark = Medium
-        // Dungeon/Ruins = Dangerous
-        
-        // Build pathways section (no header here, added in locationEntry)
-        let pathwaysSection = '';
+        // Create location data with component structure
+        const locationData = {
+            name: formattedName,
+            
+            // Info component
+            info: {
+                type: collectedData.LOCATION_TYPE || 'Unknown',
+                terrain: collectedData.TERRAIN || null,
+                description: collectedData.DESCRIPTION || 'An unexplored location.',
+                features: collectedData.FEATURES || null,
+                floor: collectedData.FLOOR || 1,
+                district: collectedData.DISTRICT || null
+            },
+            
+            // Pathways for connections
+            pathways: {}
+        };
         
         // Add return path if we know where we came from
         if (metadata && metadata.from && metadata.direction) {
-            const oppositeDir = getOppositeDirection(metadata.direction);
-            pathwaysSection += `- ${oppositeDir}: ${metadata.from}\n`;
+            const oppositeDir = getOppositeDirection(metadata.direction).toLowerCase();
+            locationData.pathways[oppositeDir] = metadata.from;
         }
         
         // Add unexplored paths for other directions
-        const allDirections = ['North', 'South', 'East', 'West'];
+        const allDirections = ['north', 'south', 'east', 'west'];
         for (const dir of allDirections) {
-            if (!metadata || !metadata.direction || dir !== getOppositeDirection(metadata.direction)) {
-                pathwaysSection += `- ${dir}: (unexplored)\n`;
+            if (!locationData.pathways[dir]) {
+                locationData.pathways[dir] = '(unexplored)';
             }
         }
         
@@ -264,37 +269,62 @@ function GenerationWizard(hook, text) {
             }
         }
         
-        // Build the location entry
-        const locationEntry = (
-            locationHeaders + '\n' +
-            '## **' + formattedName + '**\n' +
-            typeString + '\n' +
-            '### Description\n' +
-            (collectedData.DESCRIPTION || 'An unexplored location.') + '\n' +
-            '### Pathways\n' +
-            pathwaysSection
-        );
+        // Use GameState to save the location if available
+        if (typeof GameState !== 'undefined' && GameState.save) {
+            if (GameState.save('Location', locationData)) {
+                if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName} using GameState`);
+                
+                // Update the connecting location's pathways if needed
+                if (metadata && metadata.from && metadata.direction) {
+                    updateLocationPathway(metadata.from, metadata.direction, formattedName);
+                }
+                
+                // Signal completion if GameState has a handler
+                if (GameState.completeLocationGeneration) {
+                    GameState.completeLocationGeneration(formattedName);
+                }
+                return;
+            }
+        }
         
-        // Create the card
-        const snakeCased = formattedName.toLowerCase();  // Already has underscores
-        const spacedName = formattedName.replace(/_/g, ' ');
+        // Fallback to manual creation if GameState not available
+        // Build display value
+        let displayValue = `<$# Locations>\n## **${name}**\n`;
+        displayValue += `Floor: ${locationData.info.floor || 'Floor One'} | Type: ${locationData.info.type || 'Unknown'}\n`;
+        if (locationData.info.safe_zone) {
+            displayValue += `**Safe Zone** - No damage can occur\n`;
+        }
+        displayValue += `**Description**\n${locationData.info.description}`;
+        
+        // Add connections if any
+        if (locationData.pathways && Object.keys(locationData.pathways).length > 0) {
+            displayValue += '\n**Connections**';
+            for (const [dir, dest] of Object.entries(locationData.pathways)) {
+                if (dest && dest !== '(unexplored)') {
+                    displayValue += `\n• ${dir.charAt(0).toUpperCase() + dir.slice(1)}: ${dest.replace(/_/g, ' ')}`;
+                }
+            }
+        }
+        
+        // Build proper JSON data structure
+        const jsonData = {
+            name: formattedName,
+            type: 'Location',
+            info: locationData.info,
+            pathways: locationData.pathways || {},
+            features: []
+        };
         
         const card = {
             title: `[LOCATION] ${formattedName}`,
-            type: 'Location',
-            keys: `${snakeCased}, ${spacedName}`,  // Keys as comma-separated string
-            entry: locationEntry,
-            description: `Generated on turn ${info?.actionCount || 0}`
+            type: 'location',
+            value: displayValue,
+            description: `<== REAL DATA ==>\n${JSON.stringify(jsonData, null, 2)}\n<== END DATA ==>`
         };
         
         Utilities.storyCard.add(card);
         
-        // Update the connecting location's pathways if needed
-        if (metadata && metadata.from && metadata.direction) {
-            updateLocationPathway(metadata.from, metadata.direction, formattedName);
-        }
-        
-        if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName}`);
+        if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName} (fallback method)`);
         
         // Signal completion if GameState has a handler
         if (typeof GameState !== 'undefined' && GameState.completeLocationGeneration) {
@@ -313,78 +343,202 @@ function GenerationWizard(hook, text) {
     }
     
     function updateLocationPathway(locationName, direction, destinationName) {
+        // Try to update using GameState first
+        if (typeof GameState !== 'undefined' && GameState.load && GameState.save) {
+            const location = GameState.load('Location', locationName);
+            if (location) {
+                // Update pathways (not connections - matching the JSON structure)
+                if (!location.pathways) location.pathways = {};
+                location.pathways[direction.toLowerCase()] = destinationName;
+                
+                // Save the updated location
+                if (GameState.save('Location', location)) {
+                    if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
+                    return;
+                }
+            }
+        }
+        
+        // Fallback to manual update
         const card = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
         if (!card) return;
         
-        // Parse current entry
-        let entry = card.entry || '';
-        
-        // Find and update the pathway line
-        const dirCapitalized = direction.charAt(0).toUpperCase() + direction.slice(1).toLowerCase();
-        const pathwayRegex = new RegExp(`^- ${dirCapitalized}: .*$`, 'm');
-        
-        if (entry.match(pathwayRegex)) {
-            entry = entry.replace(pathwayRegex, `- ${dirCapitalized}: ${destinationName}`);
+        // Update the REAL DATA in description field
+        if (card.description && card.description.includes('<== REAL DATA ==>')) {
+            try {
+                const data = parseEntityData(card.description);
+                if (data) {
+                    if (!data.pathways) data.pathways = {};
+                    data.pathways[direction.toLowerCase()] = destinationName;
+                    
+                    // Rebuild the description with updated data
+                    const newDescription = buildEntityData('Location', data);
+                    Utilities.storyCard.update(card.title, { description: newDescription });
+                    
+                    if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName} (fallback)`);
+                }
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Failed to update pathway: ${e}`);
+            }
         }
+    }
+    
+    // Helper function to parse entity data from description
+    function parseEntityData(description) {
+        if (!description) return null;
         
-        Utilities.storyCard.update(card.title, { entry: entry });
+        const startMarker = '<== REAL DATA ==>';
+        const endMarker = '<== END DATA ==>';
         
-        if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
+        const startIdx = description.indexOf(startMarker);
+        const endIdx = description.indexOf(endMarker);
+        
+        if (startIdx === -1 || endIdx === -1) return null;
+        
+        const dataSection = description.substring(startIdx + startMarker.length, endIdx).trim();
+        
+        // Try to parse as JSON first (new format)
+        try {
+            return JSON.parse(dataSection);
+        } catch (e) {
+            // Fallback to old format parsing if JSON fails
+            const data = {};
+            let currentSection = null;
+            
+            const lines = dataSection.split('\n');
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                
+                if (trimmed.startsWith('## ')) {
+                    currentSection = trimmed.substring(3).toLowerCase();
+                    if (currentSection === 'identifier') {
+                        currentSection = null; // Parse identifier fields at root level
+                    }
+                } else if (trimmed.includes(':')) {
+                    const colonIdx = trimmed.indexOf(':');
+                    const key = trimmed.substring(0, colonIdx).trim();
+                    const value = trimmed.substring(colonIdx + 1).trim();
+                    
+                    if (currentSection) {
+                        if (!data[currentSection]) data[currentSection] = {};
+                        // Try to parse JSON for objects
+                        if (value.startsWith('{') || value.startsWith('[')) {
+                            try {
+                                data[currentSection] = JSON.parse(value);
+                            } catch {
+                                data[currentSection][key] = value.replace(/^"|"$/g, '');
+                            }
+                        } else {
+                            data[currentSection][key] = value.replace(/^"|"$/g, '');
+                        }
+                    } else {
+                        data[key] = value.replace(/^"|"$/g, '');
+                    }
+                }
+            }
+            
+            return data;
+        }
+    }
+    
+    // Helper function to build entity data for description
+    function buildEntityData(type, data) {
+        // Use JSON format for all new data
+        const jsonData = {
+            name: data.name,
+            type: type,
+            ...data
+        };
+        return `<== REAL DATA ==>\n${JSON.stringify(jsonData, null, 2)}\n<== END DATA ==>`;
     }
     
     // ==========================
     // Character Data Transformation
     // ==========================
     function transformToCharacterData(collectedData, triggerName) {
+        // Create character data with proper component structure
         const characterData = {
             name: collectedData.NAME,
-            fullName: collectedData.FULL_NAME || null,
-            gender: collectedData.GENDER || '???',
-            dob: collectedData.DOB || null,
-            level: parseInt(collectedData.LEVEL) || 1,
-            location: collectedData.DEFAULT_LOCATION || collectedData.LOCATION || 'unknown',
-            isPlayer: false,  // NPCs are not players
-            triggerName: triggerName || null,  // Store original trigger name
+            
+            // Stats component with nested level/xp structure
+            stats: {
+                level: {
+                    value: parseInt(collectedData.LEVEL) || 1,
+                    xp: {
+                        current: 0,
+                        max: parseInt(collectedData.XP_MAX) || 1000
+                    }
+                },
+                hp: {
+                    current: parseInt(collectedData.HP) || parseInt(collectedData.MAX_HP) || 100,
+                    max: parseInt(collectedData.MAX_HP) || parseInt(collectedData.HP) || 100
+                }
+            },
+            
+            // Info component
+            info: {
+                full_name: collectedData.FULL_NAME || null,
+                gender: collectedData.GENDER || '???',
+                race: collectedData.RACE || null,
+                class: collectedData.CLASS || null,
+                location: collectedData.DEFAULT_LOCATION || collectedData.LOCATION || getPlayerLocation() || 'unknown',
+                faction: collectedData.FACTION || null
+            },
+            
+            // Other components (empty by default)
             attributes: {},
             skills: {},
             inventory: {},
             relationships: {}
         };
         
-        // Combine appearance fields into single field for GameState
+        // Store trigger name and generation turn in info component if provided
+        if (triggerName) {
+            characterData.info.trigger_name = triggerName;
+            characterData.info.generation_turn = info?.actionCount || 0;
+        }
+        
+        // Combine appearance fields into single field in info component
         if (collectedData.HAIR || collectedData.EYES || collectedData.BUILD) {
             const appearanceParts = [];
             if (collectedData.HAIR) appearanceParts.push(`Hair: ${collectedData.HAIR}`);
             if (collectedData.EYES) appearanceParts.push(`Eyes: ${collectedData.EYES}`);
             if (collectedData.BUILD) appearanceParts.push(`Build: ${collectedData.BUILD}`);
-            characterData.appearance = appearanceParts.join(' | ');
+            characterData.info.appearance = appearanceParts.join(' | ');
         } else if (collectedData.APPEARANCE) {
             // Fallback to old APPEARANCE field if present
-            characterData.appearance = collectedData.APPEARANCE;
+            characterData.info.appearance = collectedData.APPEARANCE;
         }
         
-        // Map personality and background
+        // Map personality and background to info component
         if (collectedData.PERSONALITY) {
-            characterData.personality = collectedData.PERSONALITY;
+            characterData.info.personality = collectedData.PERSONALITY;
         }
-        if (collectedData.BACKGROUND) {
-            characterData.background = collectedData.BACKGROUND;
+        if (collectedData.BACKGROUND || collectedData.BACKSTORY) {
+            characterData.info.background = collectedData.BACKGROUND || collectedData.BACKSTORY;
         }
         
-        // Map HP if provided
-        if (collectedData.HP || collectedData.MAX_HP) {
-            characterData.hp = {
-                current: parseInt(collectedData.HP) || parseInt(collectedData.MAX_HP) || 100,
-                max: parseInt(collectedData.MAX_HP) || parseInt(collectedData.HP) || 100
-            };
-        }
+        // HP is now handled via stats.hp.current and stats.hp.max above
+        // No separate hp object needed
         
         // Map attributes
         const attributeNames = ['VITALITY', 'STRENGTH', 'DEXTERITY', 'AGILITY', 'INTELLIGENCE', 'WISDOM', 'CHARISMA', 'LUCK'];
         for (const attr of attributeNames) {
             if (collectedData[attr]) {
-                characterData.attributes[attr.toLowerCase()] = parseInt(collectedData[attr]) || 10;
+                // Use uppercase keys for attributes with proper value structure
+                characterData.attributes[attr] = { value: parseInt(collectedData[attr]) || 10 };
             }
+        }
+        
+        // If no attributes were provided, set defaults
+        if (Object.keys(characterData.attributes).length === 0) {
+            characterData.attributes = {
+                VITALITY: { value: 10 },
+                STRENGTH: { value: 10 },
+                DEXTERITY: { value: 10 },
+                AGILITY: { value: 10 }
+            };
         }
         
         // Parse skills if provided (format: "skill_name: Level X")
@@ -394,7 +548,11 @@ function GenerationWizard(hook, text) {
                 const match = line.match(/(.+?):\s*Level\s+(\d+)/i);
                 if (match) {
                     const skillName = match[1].trim().toLowerCase().replace(/\s+/g, '_');
-                    characterData.skills[skillName] = parseInt(match[2]) || 1;
+                    // Skills need level and xp structure
+                    characterData.skills[skillName] = {
+                        level: parseInt(match[2]) || 1,
+                        xp: { current: 0, max: 100 }
+                    };
                 }
             }
         }
@@ -410,7 +568,8 @@ function GenerationWizard(hook, text) {
                     if (parts.length === 2) {
                         const itemName = parts[0].trim().toLowerCase().replace(/\s+/g, '_');
                         const qty = parseInt(parts[1]) || 1;
-                        characterData.inventory[itemName] = qty;
+                        // Use proper {quantity: n} format
+                        characterData.inventory[itemName] = { quantity: qty };
                     }
                 }
             }
@@ -712,17 +871,17 @@ function GenerationWizard(hook, text) {
         const lines = response.split('\n');
         
         if (debug) {
-            console.log(`${MODULE_NAME}: parseBatchedResponse called with ${lines.length} lines`);
-            console.log(`${MODULE_NAME}: Raw response: "${response}"`);
-            console.log(`${MODULE_NAME}: Fields to parse: ${fields.map(f => f.name).join(', ')}`);
+            log(`${MODULE_NAME}: parseBatchedResponse called with ${lines.length} lines`);
+            log(`${MODULE_NAME}: Raw response: "${response}"`);
+            log(`${MODULE_NAME}: Fields to parse: ${fields.map(f => f.name).join(', ')}`);
         }
         
         for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
             const line = lines[lineIndex];
             
             if (debug && line.trim()) {
-                console.log(`${MODULE_NAME}: Line ${lineIndex}: "${line}"`);
-                console.log(`${MODULE_NAME}: Line length: ${line.length}, trimmed length: ${line.trim().length}`);
+                log(`${MODULE_NAME}: Line ${lineIndex}: "${line}"`);
+                log(`${MODULE_NAME}: Line length: ${line.length}, trimmed length: ${line.trim().length}`);
             }
             
             // Trim the line before matching to handle leading/trailing spaces
@@ -733,7 +892,7 @@ function GenerationWizard(hook, text) {
                 const regex = new RegExp(`^${field.name}:\\s*(.+)`, 'i');
                 
                 if (debug) {
-                    console.log(`${MODULE_NAME}: Testing regex /${regex.source}/${regex.flags} against trimmed line`);
+                    log(`${MODULE_NAME}: Testing regex /${regex.source}/${regex.flags} against trimmed line`);
                 }
                 
                 const match = trimmedLine.match(regex);
@@ -779,19 +938,25 @@ function GenerationWizard(hook, text) {
                 if (debug) console.log(`${MODULE_NAME}: Converting NAME to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
             }
             
-            // Check for duplicate usernames in existing characters
-            const existingCharacters = Utilities.storyCard.find((card) => {
-                return card.type === 'character' || 
-                       (card.title && card.title.startsWith('[CHARACTER]'));
-            }, true); // true = return all matches
-            
-            for (const character of existingCharacters) {
-                // Extract username from character header (## **Username**)
-                const headerMatch = character.entry.match(/^##\s+\*\*([^*]+)\*\*/);
-                if (headerMatch && headerMatch[1].toLowerCase() === snakeCased) {
+            // Check for duplicate usernames using GameState
+            if (typeof GameState !== 'undefined' && GameState.load) {
+                const existingCharacter = GameState.load('Character', snakeCased);
+                if (existingCharacter) {
+                    if (debug) console.log(`${MODULE_NAME}: Name "${snakeCased}" already exists, silently rejecting`);
+                    // Return invalid without error message - AI will just retry
                     return { 
-                        valid: false, 
-                        error: `Username "${snakeCased}" already exists. Please provide a different username.` 
+                        valid: false
+                    };
+                }
+            } else {
+                // Fallback: check story cards directly
+                const existingCard = Utilities.storyCard.get(`[CHARACTER] ${snakeCased}`) || 
+                                     Utilities.storyCard.get(`[PLAYER] ${snakeCased}`);
+                if (existingCard) {
+                    if (debug) console.log(`${MODULE_NAME}: Name "${snakeCased}" already exists, silently rejecting`);
+                    // Return invalid without error message - AI will just retry
+                    return { 
+                        valid: false
                     };
                 }
             }
@@ -1898,7 +2063,7 @@ function GenerationWizard(hook, text) {
             ),
             description: (
                 `// NPC Generation\n` +
-                `NAME: required, text, Username/Gamertag (e.g., xXShadowKillerXx, DragonSlayer42, CrimsonBlade)\n` +
+                `NAME: required, text, Username/Gamertag (e.g. Nixara, LewdLeah, xXNyaXx, Pixel_Prowl; snake_case)\n` +
                 `FULL_NAME: optional, text, Real name (if known)\n` +
                 `GENDER: required, text, Gender (Male/Female/Other)\n` +
                 `DOB: required, text, Birth date\n` +
@@ -2072,7 +2237,7 @@ function GenerationWizard(hook, text) {
                 
                 // Create the character using GameState
                 if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                    const characterData = transformEntityToCharacter(progress.collectedData, progress.entityName);
+                    const characterData = transformEntityToCharacter(progress.collectedData, progress.triggerName || progress.entityName);
                     GameState.createCharacter(characterData);
                     
                     // Signal completion to GameState
@@ -2097,7 +2262,7 @@ function GenerationWizard(hook, text) {
             
             // Create the character using GameState
             if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                const characterData = transformEntityToCharacter(progress.collectedData);
+                const characterData = transformEntityToCharacter(progress.collectedData, progress.triggerName || progress.entityName);
                 GameState.createCharacter(characterData);
                 
                 // Signal completion to GameState
@@ -2207,24 +2372,63 @@ function GenerationWizard(hook, text) {
         return result;
     }
     
+    function getPlayerLocation() {
+        // Use GameState's existing functions to get player location
+        if (typeof GameState !== 'undefined' && GameState.getPlayerName && GameState.get) {
+            const playerName = GameState.getPlayerName();
+            if (playerName) {
+                const location = GameState.get(`Character.${playerName}.info.location`);
+                return location || null;
+            }
+        }
+        return null;
+    }
+    
     function transformEntityToCharacter(entityData, entityName) {
-        // Transform collected entity data into character format for GameState
+        // Transform collected entity data into ECS component format for GameState
         const characterData = {
             name: entityData.FULL_NAME || entityName,
+            
+            // Display fields
             gender: entityData.GENDER || 'Unknown',
-            level: entityData.LEVEL || 1,
-            location: entityData.LOCATION || 'unknown',
             appearance: entityData.APPEARANCE || '',
             personality: entityData.PERSONALITY || '',
-            background: entityData.BACKGROUND || ''
+            backstory: entityData.BACKGROUND || entityData.BACKSTORY || '',
+            
+            // Stats component with dot notation
+            'stats.level': parseInt(entityData.LEVEL) || 1,
+            'stats.hp.current': 100,
+            'stats.hp.max': 100,
+            'stats.xp.current': 0,
+            'stats.xp.max': 1000,
+            
+            // Info component
+            'info.location': entityData.LOCATION || getPlayerLocation() || 'unknown',
+            'info.faction': entityData.FACTION || null,
+            'info.trigger_name': entityName,  // Store the trigger name that caused generation
+            'info.generation_turn': info?.actionCount || 0,
+            
+            // Attributes component - set defaults with proper structure
+            attributes: {
+                VITALITY: { value: 10 },
+                STRENGTH: { value: 10 },
+                DEXTERITY: { value: 10 },
+                AGILITY: { value: 10 }
+            },
+            
+            // Initialize empty components
+            skills: {},
+            inventory: {},
+            relationships: {}
         };
         
-        // Add DOB for player characters
-        if (entityData.TYPE === 'NPC_PLAYER' && entityData.DOB) {
-            characterData.dob = entityData.DOB;
+        // Add DOB and class for player characters
+        if (entityData.TYPE === 'NPC_PLAYER') {
+            if (entityData.DOB) characterData.dob = entityData.DOB;
+            if (entityData.STARTING_CLASS) characterData.class = entityData.STARTING_CLASS;
             characterData.isPlayer = true;
         } else {
-            characterData.isNPC = true;
+            characterData.isPlayer = false;
         }
         
         // Parse skills
@@ -2233,7 +2437,10 @@ function GenerationWizard(hook, text) {
             const skills = entityData.PRIMARY_SKILLS.split(',').map(s => s.trim());
             for (const skill of skills) {
                 const skillKey = skill.toLowerCase().replace(/\s+/g, '_');
-                characterData.skills[skillKey] = { level: 1 };
+                characterData.skills[skillKey] = {
+                    level: 1,
+                    xp: { current: 0, max: 100 }
+                };
             }
         }
         
@@ -2243,7 +2450,7 @@ function GenerationWizard(hook, text) {
             const items = entityData.STARTING_ITEMS.split(',').map(s => s.trim());
             for (const item of items) {
                 const itemKey = item.toLowerCase().replace(/\s+/g, '_');
-                characterData.inventory[itemKey] = 1;
+                characterData.inventory[itemKey] = { quantity: 1 };
             }
         }
         
@@ -2255,7 +2462,7 @@ function GenerationWizard(hook, text) {
             for (const rel of rels) {
                 if (rel && rel !== 'None') {
                     const relKey = rel.toLowerCase().replace(/\s+/g, '_');
-                    characterData.relationships[relKey] = 50; // Default neutral
+                    characterData.relationships[relKey] = 'neutral';
                 }
             }
         }
@@ -2305,11 +2512,17 @@ function GenerationWizard(hook, text) {
             
             let templateFields = parseTemplateFields(template.description);
             
-            // For quests, handle predefined fields from initialData
-            if (entityType === 'Quest' && initialData) {
-                // Remove predefined fields from the fields to ask
+            // Handle predefined fields from initialData for any entity type
+            if (initialData && Object.keys(initialData).length > 0) {
+                // Remove fields we already have values for
                 templateFields = templateFields.filter(field => {
+                    // Skip if this field was predefined
                     if (field.requirement === 'predefined') {
+                        return false;
+                    }
+                    // Skip if we already have a value for this field
+                    if (initialData.hasOwnProperty(field.name)) {
+                        if (debug) console.log(`${MODULE_NAME}: Skipping ${field.name} - already provided`);
                         return false;
                     }
                     return true;
@@ -2427,6 +2640,7 @@ function GenerationWizard(hook, text) {
             const progress = {
                 entityType: 'EntityClassification',
                 entityName: entityData.name,
+                triggerName: entityData.name,  // Store the trigger name from entity tracker
                 stage: entityData.stage || 'classification',
                 collectedData: entityData.collectedData || {},
                 templateFields: null,
