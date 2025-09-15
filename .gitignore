@@ -1,2 +1,5 @@
 *.md
 *.json
+/ScriptAssistedNarrativeEngine/dev/CompanionHelper
+/ScriptAssistedNarrativeEngine/dev/Scenarios
+/ScriptAssistedNarrativeEngine/dev/Tests
