@@ -1,6 +1,9 @@
 function GameState(hook, text) {
     'use strict';
-    
+
+    // GenerationWizard active state - checked once per hook
+    let gwActive = false;
+
     const debug = true;
     const MODULE_NAME = 'GameState';
     const begin = Date.now(); // Start timing execution
@@ -8,21 +11,214 @@ function GameState(hook, text) {
     // Variable to track current hash
     let currentHash = null;
     
-    // Entity cache - stores all loaded entities for the current turn
-    // Uses entity type + name as cache key
-    let entityCache = {};
-    
-    // Helper to get all cached entities of a type
-    function getCachedEntitiesOfType(type) {
-        const result = {};
-        const prefix = type + '.';
-        for (const [key, entity] of Object.entries(entityCache)) {
-            if (key.startsWith(prefix)) {
-                const name = key.substring(prefix.length);
-                result[name] = entity;
+    // Unified data cache for everything - entities, variables, functions, schemas, etc.
+    // Keys are just the ID (no type prefix)
+    // Stores data from:
+    // - [SANE:E] cards: entities with display
+    // - [SANE:D] cards: entities without display, variables
+    // - [SANE:S] cards: schemas stored as dataCache['schema.componentName']
+    // - [SANE_RUNTIME] LIBRARY: functions stored as dataCache['Library.functionName']
+    let dataCache = {};
+
+    // Entity alias mapping for fast lookups
+    let entityAliasMap = {}; // alias -> entityId
+
+    // Library functions storage
+    let Library = {}; // Populated from [SANE_RUNTIME] LIBRARY card
+
+    // Normalize entity ID to consistent case for case-insensitive operations
+    function normalizeEntityId(entityId) {
+        if (!entityId || typeof entityId !== 'string') return entityId;
+        return entityId.toLowerCase();
+    }
+
+    // Load Library functions from [SANE_RUNTIME] LIBRARY card and add built-in helpers
+    function loadLibraryFunctions() {
+
+        // Simply reference Utilities instead of copying all functions
+        Library.Utilities = Utilities;
+
+
+        // Store all functions in dataCache
+        for (const [funcName, func] of Object.entries(Library)) {
+            if (typeof func === 'function') {
+                dataCache[`Library.${funcName}`] = func;
             }
         }
-        return result;
+
+        // Then load any custom functions from [SANE_RUNTIME] LIBRARY card
+        const card = Utilities.storyCard.get('[SANE_RUNTIME] LIBRARY');
+        if (!card) {
+            if (debug) console.log(`${MODULE_NAME}: No [SANE_RUNTIME] LIBRARY card found, using built-in functions only`);
+            return;
+        }
+
+        try {
+            // Card should contain function definitions
+            // Combine both entry and description as they may both contain code
+            const libCode = (card.entry || '') + (card.description || '');
+
+            // Check if there's any actual code (not just whitespace or comments)
+            const codeWithoutComments = libCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+            if (!codeWithoutComments) {
+                if (debug) console.log(`${MODULE_NAME}: Library card contains no executable code`);
+                return;
+            }
+
+            // Execute to populate Library object with custom functions
+            // The library code should assign functions to the Library object
+            // Example: Library.customFunction = function() { ... }
+            // The Library object and all standard globals are available in eval context
+            eval(libCode);
+
+            // Store any new library functions in dataCache
+            for (const [funcName, func] of Object.entries(Library)) {
+                if (typeof func === 'function') {
+                    dataCache[`Library.${funcName}`] = func;
+                }
+            }
+
+            // Universal data access - IMPORTANT: These will be set after functions are defined
+            // We'll assign them at the end of GameState initialization
+            // Library.get = get;
+            // Library.set = set;
+            // Library.del = del;
+
+            if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(Library).length} library functions (built-in + custom)`);
+        } catch (e) {
+            console.log(`${MODULE_NAME}: Failed to load custom library functions: ${e.message}`);
+        }
+    }
+
+    // Initialize dataCache on startup
+    function initializeDataCache() {
+        if (debug) console.log(`${MODULE_NAME}: Initializing data cache...`);
+
+        // 1. Load schemas from [SANE:S] cards
+        if (schemaCount === 0) {
+            const schemaCards = Utilities.storyCard.find(
+                card => card.title && card.title.startsWith('[SANE:S]'),
+                true  // Get all matching cards
+            ) || [];
+
+            if (schemaCards && Array.isArray(schemaCards)) {
+                for (const card of schemaCards) {
+                    try {
+                        const schema = JSON.parse(card.description || '{}');
+                        // Schema MUST have an id field
+                        if (!schema.id) {
+                            console.log(`${MODULE_NAME}: Schema in card ${card.title} missing required 'id' field`);
+                            continue;
+                        }
+                        // Store ONLY in schema.* namespace
+                        dataCache[`schema.${schema.id}`] = schema;
+                        schemaCount++;
+                    } catch (e) {
+                        console.log(`${MODULE_NAME}: Failed to load schema from ${card.title}: ${e.message}`);
+                    }
+                }
+            }
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Loaded ${schemaCount} schemas`);
+
+        // 2. Load Library functions
+        loadLibraryFunctions();
+
+        // 3. Load from [SANE:D] Data cards if present
+        const allData = loadFromDataCards();
+        if (allData && allData.Global) {
+            dataCache['Global'] = allData.Global;
+            if (debug) console.log(`${MODULE_NAME}: Loaded Global entity from data cards`);
+        }
+
+        // 4. Build entity alias map AFTER loading all data
+        rebuildEntityAliasMap();
+
+        if (debug) console.log(`${MODULE_NAME}: Data cache initialized`);
+    }
+
+    // Rebuild entity alias map from all entity cards
+    function rebuildEntityAliasMap() {
+        entityAliasMap = {};
+        let aliasCount = 0;
+        let duplicates = 0;
+
+        // Scan [SANE:E] cards - get ALL cards, not just first
+        const entityCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:E]'),
+            true  // Get all matching cards
+        ) || [];
+
+        if (entityCards.length > 0) {
+            for (const card of entityCards) {
+                try {
+                    // Parse the structured data from description using parseEntityData
+                    const entities = parseEntityData(card.description || '');
+
+                    // Process each entity in the card (there should typically be just one)
+                    for (const entityId in entities) {
+                        const entity = entities[entityId];
+
+                        if (entity && entity.aliases) {
+                            for (const alias of entity.aliases) {
+                                const normalizedAlias = normalizeEntityId(alias);
+                                const normalizedEntityId = normalizeEntityId(entityId);
+                                if (entityAliasMap[normalizedAlias] && entityAliasMap[normalizedAlias] !== normalizedEntityId) {
+                                    console.log(`${MODULE_NAME}: WARNING - Duplicate alias '${alias}' - was ${entityAliasMap[normalizedAlias]}, now ${normalizedEntityId}`);
+                                    duplicates++;
+                                }
+                                entityAliasMap[normalizedAlias] = normalizedEntityId;
+                                aliasCount++;
+                            }
+                        }
+
+                        // Always map the entity ID to itself for lookups (normalized)
+                        if (entityId) {
+                            const normalizedId = normalizeEntityId(entityId);
+                            entityAliasMap[normalizedId] = normalizedId;
+                        }
+                    }
+
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Failed to parse ${card.title}: ${e.message}`);
+                }
+            }
+        }
+
+        // Scan [SANE:D] cards - get ALL cards, not just first
+        const dataCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:D]'),
+            true  // Get all matching cards
+        ) || [];
+
+        if (dataCards && Array.isArray(dataCards)) {
+            for (const card of dataCards) {
+                try {
+                    const data = JSON.parse(card.description || '{}');
+                    for (const [entityId, entity] of Object.entries(data)) {
+                        if (entity && entity.aliases) {
+                            for (const alias of entity.aliases) {
+                                if (entityAliasMap[alias] && entityAliasMap[alias] !== entityId) {
+                                    console.warn(`${MODULE_NAME}: Duplicate alias '${alias}' - was ${entityAliasMap[alias]}, now ${entityId}`);
+                                    duplicates++;
+                                }
+                                entityAliasMap[alias] = entityId;
+                                aliasCount++;
+                            }
+                        }
+
+                        // Don't map the entity ID to itself - that's redundant
+                    }
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Failed to parse ${card.title}: ${e.message}`);
+                }
+            }
+        }
+
+        if (debug) {
+            console.log(`${MODULE_NAME}: Built alias map with ${aliasCount} aliases (${duplicates} duplicates)`);
+        }
     }
     
     // Debug-only: Initialize execution times array if needed  
@@ -120,13 +316,10 @@ function GameState(hook, text) {
     // Tool pattern: standard function calls like tool_name(param1, param2, param3)
     const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/gi;
     
-    // Universal getter pattern for object data: get[objectType.entityName.field]
-    // Examples: get[character.Bob.level], get[location.Somewhere_Over_There.type]
+    // Universal getter pattern for object data: get(objectType.entityName.field)
+    // Examples: get(Bob.level)
     const UNIVERSAL_GETTER_PATTERN = /get\[([^\]]+)\]/gi;
     
-    // Function getter pattern for dynamic/computed values: get_function(parameters)
-    // Examples: get_currentdate(), get_formattedtime(), get_daynumber()
-    const FUNCTION_GETTER_PATTERN = /get_[a-z]+\s*\([^)]*\)/gi;
     
     // ==========================
     // Debug Logging System
@@ -514,7 +707,7 @@ function GameState(hook, text) {
                         break; // Stop when we hit non-player cards
                     }
                 }
-                
+
                 // Move debug card after player cards
                 const debugIndex = storyCards.findIndex(card => card.title === '[DEBUG] Debug Log');
                 if (debugIndex >= 0 && debugIndex !== playerCount) {
@@ -533,525 +726,424 @@ function GameState(hook, text) {
     // Universal Data System
     // ==========================
     
-    // Cache for discovered schemas
-    let schemaRegistry = null;
-    
-    // Cache for field configurations  
-    // REMOVED: fieldConfigCache - part of removed SANE_FIELDS system
-    
-    // Pre-built alias mapping for efficient lookups
-    // Maps lowercase aliases -> canonical schema name
-    let schemaAliasMap = null;
-    
-    // Removed - now combined with entityCardMap for single-lookup efficiency
-    
-    // Discover all available schemas and build registry
-    function initializeSchemaRegistry() {
-        if (schemaRegistry !== null) return schemaRegistry;
-        
-        schemaRegistry = {};
-        const componentRegistry = {}; // Store component schemas separately
-        
-        // First, load component definitions from [SANE_COMP] cards
-        const compCards = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[SANE_COMP]'),
-            true // Get all matches
-        );
-        
-        for (const card of compCards || []) {
-            const match = card.title.match(/\[SANE_COMP\]\s+(.+)/);
-            if (!match) continue;
-            
-            const compName = match[1].trim();
-            try {
-                // Parse component definition from description field
-                const compDef = JSON.parse(card.description || '{}');
-                componentRegistry[compName] = {
-                    name: compName,
-                    fields: compDef.fields || {},
-                    defaults: compDef.defaults || {}
-                };
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse component ${compName}: ${e.message}`);
-            }
-        }
-        
-        // Then load entity types from [SANE_ENTITY] cards
-        const entityCards = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[SANE_ENTITY]'),
-            true // Get all matches
-        );
-        
-        for (const card of entityCards || []) {
-            const match = card.title.match(/\[SANE_ENTITY\]\s+(.+)/);
-            if (!match) continue;
-            
-            const entityType = match[1].trim();
-            try {
-                // Parse entity definition from description field
-                const entityDef = JSON.parse(card.description || '{}');
-                schemaRegistry[entityType] = {
-                    name: entityType,
-                    type: entityType,
-                    components: entityDef.components || [],
-                    prefixes: entityDef.prefixes || [entityType.toUpperCase()],
-                    dataOnly: entityDef.dataOnly || false,
-                    singleton: entityDef.singleton || false
-                };
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse entity type ${entityType}: ${e.message}`);
-            }
-        }
-        
-        // Store component registry globally for access
-        schemaRegistry._components = componentRegistry;
-        
-        // Build aliases map for quick lookup
-        const aliasMap = {};
-        for (const [name, schema] of Object.entries(schemaRegistry)) {
-            if (schema.aliases) {
-                for (const alias of schema.aliases) {
-                    aliasMap[alias] = name;
-                }
-            }
-        }
-        schemaRegistry._aliases = aliasMap;
-        
-        if (debug) {
-            log(`${MODULE_NAME}: Registered ${Object.keys(schemaRegistry).length} entity schemas`);
-            log(`${MODULE_NAME}: Registered ${Object.keys(componentRegistry).length} component schemas`);
-        }
-        
-        // Ensure Runtime is always available even without explicit schema
-        if (!schemaRegistry['Global']) {
-            schemaRegistry['Global'] = {
-                name: 'Global',
-                prefixes: [],
-                storageType: 'global'
-            };
-        }
-        
-        // Build the complete alias map for O(1) lookups
-        schemaAliasMap = {};
-        for (const [schemaName, schema] of Object.entries(schemaRegistry)) {
-            // Add the schema name itself (normalized)
-            schemaAliasMap[schemaName.toLowerCase()] = schemaName;
-            
-            // Add all defined aliases
-            if (schema.aliases) {
-                for (const alias of schema.aliases) {
-                    schemaAliasMap[alias.toLowerCase()] = schemaName;
-                }
-            }
-            
-            // Add all prefixes as aliases
-            if (schema.prefixes) {
-                for (const prefix of schema.prefixes) {
-                    schemaAliasMap[prefix.toLowerCase()] = schemaName;
-                }
-            }
-        }
-        
-        if (debug) log(`${MODULE_NAME}: Built alias map with ${Object.keys(schemaAliasMap).length} entries`);
-        
-        // Create default components and entities if they don't exist
-        initializeDefaultComponents();
-        
-        // Create default FORMAT cards if they don't exist
-        initializeDefaultFormatCards();
-        
-        return schemaRegistry;
-    }
-    
-    // Create default component and entity cards if they don't exist
-    function initializeDefaultComponents() {
-        // Stats component with level containing xp
-        if (!Utilities.storyCard.get('[SANE_COMP] stats')) {
-            const statsComponent = {
-                title: '[SANE_COMP] stats',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {
-                        level: {
-                            value: 1,
-                            xp: { current: 0, max: 500 }
-                        },
-                        hp: { current: 100, max: 100 }
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(statsComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created stats component`);
-        }
-        
-        // Info component
-        if (!Utilities.storyCard.get('[SANE_COMP] info')) {
-            const infoComponent = {
-                title: '[SANE_COMP] info',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {
-                        gender: 'Unknown',
-                        race: 'Human',
-                        class: 'Adventurer',
-                        location: 'Unknown'
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(infoComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created info component`);
-        }
-        
-        // Skills component with registry and formulas
-        if (!Utilities.storyCard.get('[SANE_COMP] skills')) {
-            const skillsComponent = {
-                title: '[SANE_COMP] skills',
-                type: 'component', 
-                description: JSON.stringify({
-                    defaults: {},
-                    categories: {
-                        "combat": { "xp_formula": "level * 80" },
-                        "crafting": { "xp_formula": "level * 150" },
-                        "social": { "xp_formula": "level * 120" },
-                        "gathering": { "xp_formula": "level * 130" },
-                        "support": { "xp_formula": "level * 90" }
-                    },
-                    registry: {
-                        "one_handed_sword": { "category": "combat" },
-                        "katana": { "category": "combat", "xp_formula": "level * 200" },
-                        "two_handed_sword": { "category": "combat" },
-                        "rapier": { "category": "combat" },
-                        "dagger": { "category": "combat" },
-                        "spear": { "category": "combat" },
-                        "shield": { "category": "combat" },
-                        "parry": { "category": "combat" },
-                        "meditation": { "category": "support" },
-                        "detection": { "category": "support" },
-                        "hiding": { "category": "support" },
-                        "alchemy": { "category": "crafting" },
-                        "blacksmithing": { "category": "crafting" },
-                        "tailoring": { "category": "crafting" },
-                        "cooking": { "category": "crafting" },
-                        "fishing": { "category": "gathering" },
-                        "herbalism": { "category": "gathering" },
-                        "mining": { "category": "gathering" },
-                        "woodcutting": { "category": "gathering" },
-                        "negotiation": { "category": "social" },
-                        "intimidation": { "category": "social" },
-                        "persuasion": { "category": "social" },
-                        "deception": { "category": "social" },
-                        "insight": { "category": "social" },
-                        "leadership": { "category": "social" },
-                        "first_aid": { "category": "support" },
-                        "tracking": { "category": "support" },
-                        "stealth": { "category": "support" },
-                        "lockpicking": { "category": "support" },
-                        "acrobatics": { "category": "support" },
-                        "night_vision": { "category": "support" },
-                        "battle_healing": { "category": "support" },
-                        "emergency_recovery": { "category": "support" },
-                        "sprint": { "category": "support" },
-                        "extended_weight_limit": { "category": "support" },
-                        "martial_arts": { "category": "combat" },
-                        "throwing": { "category": "combat" },
-                        "archery": { "category": "combat" }
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(skillsComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created skills component with registry`);
-        }
-        
-        // Attributes component
-        if (!Utilities.storyCard.get('[SANE_COMP] attributes')) {
-            const attributesComponent = {
-                title: '[SANE_COMP] attributes',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {},
-                    registry: {
-                        "VITALITY": { 
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases max HP"
-                        },
-                        "STRENGTH": {
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases physical damage"
-                        },
-                        "DEXTERITY": {
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases accuracy and crit chance"
-                        },
-                        "AGILITY": {
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases evasion and speed"
-                        }
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(attributesComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created attributes component`);
-        }
-        
-        // Inventory component
-        if (!Utilities.storyCard.get('[SANE_COMP] inventory')) {
-            const inventoryComponent = {
-                title: '[SANE_COMP] inventory',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {}
-                }, null, 2)
-            };
-            Utilities.storyCard.add(inventoryComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created inventory component`);
-        }
-        
-        // Relationships component with thresholds
-        if (!Utilities.storyCard.get('[SANE_COMP] relationships')) {
-            const relationshipsComponent = {
-                title: '[SANE_COMP] relationships',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {},
-                    thresholds: {
-                        "Stranger": 0,
-                        "Acquaintance": 10,
-                        "Friend": 30,
-                        "Close Friend": 60,
-                        "Best Friend": 100,
-                        "Trusted Ally": 150,
-                        "Rival": -10,
-                        "Enemy": -30,
-                        "Nemesis": -60,
-                        "Arch-Enemy": -100
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(relationshipsComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created relationships component`);
-        }
-        
-        // Character entity type
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Character')) {
-            const characterEntity = {
-                title: '[SANE_ENTITY] Character',
-                type: 'entity',
-                description: JSON.stringify({
-                    components: ['info', 'stats', 'skills', 'attributes', 'inventory', 'relationships'],
-                    prefixes: ['CHARACTER', 'PLAYER'],
-                    aliases: ['char', 'c'],
-                    dataOnly: false
-                }, null, 2)
-            };
-            Utilities.storyCard.add(characterEntity);
-            if (debug) console.log(`${MODULE_NAME}: Created Character entity type`);
-        }
-        
-        // Location entity type
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Location')) {
-            const locationEntity = {
-                title: '[SANE_ENTITY] Location',
-                type: 'entity',
-                description: JSON.stringify({
-                    components: [],
-                    prefixes: ['LOCATION'],
-                    aliases: ['loc', 'l'],
-                    dataOnly: false
-                }, null, 2)
-            };
-            Utilities.storyCard.add(locationEntity);
-            if (debug) console.log(`${MODULE_NAME}: Created Location entity type`);
-        }
-        
-        // Global entity type (singleton)
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Global')) {
-            const globalEntity = {
-                title: '[SANE_ENTITY] Global',
-                type: 'entity',
-                description: JSON.stringify({
-                    components: [],
-                    prefixes: [],
-                    aliases: ['runtime', 'global'],
-                    singleton: true,
-                    dataOnly: true
-                }, null, 2)
-            };
-            Utilities.storyCard.add(globalEntity);
-            if (debug) console.log(`${MODULE_NAME}: Created Global entity type`);
-        }
-    }
-    
-    // Create default FORMAT cards for entities that need them
-    function initializeDefaultFormatCards() {
-        // Default CHARACTER FORMAT (for NPCs)
-        if (!Utilities.storyCard.get('[SANE_FORMAT] CHARACTER')) {
-            const characterFormat = {
-                title: '[SANE_FORMAT] CHARACTER',
-                type: 'schema',
-                entry: '// Computed fields\n' +
-                    'info_line: {info.dob?DOB\\: $(info.dob) | }Gender: $(info.gender) | Level: $(stats.level.value) ($(stats.level.xp.current)/$(stats.level.xp.max)) | HP: $(stats.hp.current)/$(stats.hp.max) | Location: $(info.location)\n',
-                description: '<$# Character>\n' +
-                    '## **{name}**{info.full_name? [{info.full_name}]}\n' +
-                    '{info_line}\n' +
-                    '{info.appearance?**Appearance**\n{info.appearance}\n}' +
-                    '{info.personality?**Personality**\n{info.personality}\n}' +
-                    '{info.background?**Background**\n{info.background}\n}' +
-                    '{attributes?**Attributes**\n{attributes.*|{*}: {*.value}}\n}' +
-                    '{skills?**Skills**\n{skills.*:• {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}\n}' +
-                    '{inventory?**Inventory**\n{inventory.*:• {*} x{*.quantity}}\n}' +
-                    '{relationships?**Relationships**\n{relationships.*:• {*}: {*.}}}' +
-                    '{misc?{misc}}'
-            };
-            Utilities.storyCard.add(characterFormat);
-            if (debug) console.log(`${MODULE_NAME}: Created default FORMAT card for CHARACTER`);
-        }
-        
-        // Default PLAYER FORMAT
-        if (!Utilities.storyCard.get('[SANE_FORMAT] PLAYER')) {
-            const playerFormat = {
-                title: '[SANE_FORMAT] PLAYER',
-                type: 'schema',
-                entry: '// Computed fields\n' +
-                    'info_line: {info.dob?DOB\\: $(info.dob) | }Gender: $(info.gender) | Level: $(stats.level.value) ($(stats.level.xp.current)/$(stats.level.xp.max)) | HP: $(stats.hp.current)/$(stats.hp.max) | Location: $(info.location)\n',
-                description: '<$# User>\n' +
-                    '## **{name}**{info.full_name? [{info.full_name}]}\n' +
-                    '{info_line}\n' +
-                    '{info.appearance?**Appearance**\n{info.appearance}\n}' +
-                    '{info.personality?**Personality**\n{info.personality}\n}' +
-                    '{info.background?**Background**\n{info.background}\n}' +
-                    '**Attributes**\n{attributes.*|{*}: {*.value}}\n' +
-                    '**Skills**\n{skills.*:• {*}\\: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}\n' +
-                    '**Inventory**\n{inventory.*:• {*} x{*.quantity}}\n' +
-                    '==={name} is a USER. Do not act or speak for them.==='
-            };
-            
-            Utilities.storyCard.add(playerFormat);
-            if (debug) console.log(`${MODULE_NAME}: Created default FORMAT card for PLAYER`);
-        }
-        
-        // Default Location FORMAT  
-        if (!Utilities.storyCard.get('[SANE_FORMAT] Location')) {
-            const locationFormat = {
-                title: '[SANE_FORMAT] Location',
-                type: 'schema',
-                entry: '// Computed fields\n' +
-                    'info_line: {info.type?Type: {info.type}}{info.floor? | Floor: {info.floor}}{info.district? | District: {info.district}}\n' +
-                    '\n' +
-                    '// Format hints\n' +
-                    'format:connections: directional\n' +
-                    'format:inhabitants: bullets',
-                description: '<$# Location>\n' +
-                    '## **{name}**\n' +
-                    '{info_line}\n' +
-                    '{info.description?**Description**\n' +
-                    '{info.description}}\n' +
-                    '{connections?**Connections**\n' +
-                    '{connections_formatted}}\n' +
-                    '{info.features?**Notable Features**\n' +
-                    '{info.features}}'
-            };
-            Utilities.storyCard.add(locationFormat);
-            if (debug) console.log(`${MODULE_NAME}: Created default FORMAT card for Location`);
-        }
-    }
-    
     // Universal getter function - access any data via path
     // Resolve dynamic expressions in paths
     // Examples:
-    // "Character.$(player).level" -> "Character.Bob.level" (if player = "Bob")
-    // "Location.$(Character.Bob.location).type" -> "Location.Somewhere_Over_There.type"
+    // - "$(party[0]).stats" -> "Kirito.stats"
     function resolve(path) {
         if (!path || typeof path !== 'string') return path;
-        
+
         // Replace all $(expression) with their evaluated results
         return path.replace(/\$\((.*?)\)/g, function(match, expression) {
-            // Recursively resolve the expression
-            const resolved = resolve(expression);
-            // Get the value at that path
+            // Parse nested array access iteratively
+            // Supports patterns like: array[0][1][2] or matrix[i][j]
+            let currentPath = expression;
+            let arrayAccesses = [];
+
+            // Extract all array accesses from the end
+            while (true) {
+                const arrayMatch = currentPath.match(/^(.*)\[([^\]]+)\]$/);
+                if (!arrayMatch) break;
+
+                currentPath = arrayMatch[1];
+                arrayAccesses.unshift(arrayMatch[2]); // Add to front to maintain order
+            }
+
+            // If we found array accesses
+            if (arrayAccesses.length > 0) {
+                // Split any remainder (e.g., ".stats.hp" after array accesses)
+                const dotIndex = expression.indexOf('.', currentPath.length);
+                const remainder = dotIndex >= 0 ? expression.substring(dotIndex) : '';
+
+                // Start with the base path
+                let value = get(currentPath);
+
+                // Process each array access
+                for (let indexExpr of arrayAccesses) {
+                    // If index contains $(), resolve it recursively
+                    if (indexExpr.includes('$(')) {
+                        indexExpr = resolve(indexExpr);
+                    }
+
+                    // Check if current value is an array
+                    if (!value || !Array.isArray(value)) {
+                        if (debug) console.log(`${MODULE_NAME}: Not an array at ${currentPath}, value:`, value);
+                        return match;
+                    }
+
+                    // Parse index
+                    const index = parseInt(indexExpr);
+                    // Double-check value is still valid before accessing length
+                    if (isNaN(index) || index < 0 || !value || index >= value.length) {
+                        if (debug) console.log(`${MODULE_NAME}: Invalid array index ${indexExpr}`);
+                        return match;
+                    }
+
+                    // Get the value at index
+                    value = value[index];
+                    currentPath += `[${index}]`;
+                }
+
+                // If there's a remainder, append it
+                if (remainder && value !== null && value !== undefined) {
+                    // If value is a string (like entity ID), append the remainder
+                    if (typeof value === 'string' || typeof value === 'number') {
+                        return String(value) + remainder;
+                    }
+                    // If value is an object, try to get the nested field
+                    else if (typeof value === 'object') {
+                        const nestedValue = getNestedField(value, remainder.substring(1));
+                        return nestedValue !== undefined ? String(nestedValue) : match;
+                    }
+                }
+
+                return value !== undefined && value !== null ? String(value) : match;
+            }
+
+            // Standard resolution for non-array expressions
+            const resolved = resolve(expression); // Recursive resolution
             const value = get(resolved);
-            // Return the value as a string for path construction
             return value !== undefined && value !== null ? String(value) : match;
         });
     }
     
     function get(path) {
         if (!path) return undefined;
-        
+
         // First resolve any dynamic expressions in the path
         const resolvedPath = resolve(path);
         if (resolvedPath !== path) {
             path = resolvedPath;
         }
-        
-        // Parse path: "Character.Bob.level" or "Global.currentPlayer"
-        const parts = path.split('.');
-        if (parts.length < 2) return undefined;
-        
-        const objectType = parts[0];
-        const entityName = parts[1];
-        const fieldPath = parts.slice(2).join('.');
-        
-        // Special case for Global variables
-        if (objectType === 'Global') {
-            const value = getGlobalValue(entityName);
-            if (value === null) return undefined;
-            return fieldPath ? getNestedField(value, fieldPath) : value;
+
+        // Special namespaces first
+        if (path.startsWith('Library.')) {
+            const funcName = path.substring(8);
+            if (Library[funcName]) {
+                return Library[funcName];
+            }
+            return undefined;
         }
-        
-        // Load the entity using our simplified load function
-        const entity = load(objectType, entityName);
+
+        if (path.startsWith('time.')) {
+            // Return Calendar functions
+            const funcName = path.substring(5);
+            if (typeof Calendar !== 'undefined' && Calendar[funcName]) {
+                return Calendar[funcName];
+            }
+            return undefined;
+        }
+
+        // Check if it's a schema access
+        if (path.startsWith('schema.')) {
+            // Direct access to schema data
+            const schemaPath = path.substring(7);
+            const parts = schemaPath.split('.');
+            const schemaName = parts[0];
+            const fieldPath = parts.slice(1).join('.');
+
+            // Check dataCache first
+            const schemaData = dataCache[`schema.${schemaName}`];
+            if (schemaData) {
+                return fieldPath ? getNestedField(schemaData, fieldPath) : schemaData;
+            }
+
+            // Load from [SANE:S] cards if not cached
+            return undefined;
+        }
+
+        // Parse path for regular data access
+        const parts = path.split('.');
+
+        // Single part = direct dataCache lookup (entity ID or variable)
+        if (parts.length === 1) {
+            // Check dataCache directly
+            if (dataCache[path] !== undefined) {
+                return dataCache[path];
+            }
+
+            // Check aliases
+            for (const [key, data] of Object.entries(dataCache)) {
+                if (data && data.aliases && data.aliases.includes(path)) {
+                    return data;
+                }
+            }
+
+            // Try to load entity if not cached
+            // First check if it's a known entity type by checking entity card map
+            if (!entityCardMap) buildEntityCardMap();
+
+            // Check if path is an alias that maps to a different entity ID (case-insensitive)
+            const normalizedPath = normalizeEntityId(path);
+            const mappedId = entityAliasMap[normalizedPath];
+            const entityId = mappedId || normalizedPath; // Use mapped ID if it exists, otherwise use normalized path
+
+            // Try to load from [SANE:E] card first
+            const entityCard = Utilities.storyCard.get(`[SANE:E] ${entityId}`);
+            if (entityCard) {
+                // Use parseEntityData to handle delimiters properly
+                const parsedData = parseEntityData(entityCard.description || '');
+                // parseEntityData returns an object with entityId as key
+                const entity = parsedData ? parsedData[entityId] : null;
+                if (entity) {
+                    entity.id = entityId;  // Add the ID field
+                    dataCache[entityId] = entity;
+                    checkMemoryUsage();
+                    // Register all aliases
+                    if (entity.aliases) {
+                        for (const alias of entity.aliases) {
+                            entityAliasMap[alias] = entityId;
+                        }
+                    }
+                    // Also cache under the original path if it was an alias
+                    if (mappedId) {
+                        dataCache[path] = entity;
+                    }
+                    return entity;
+                }
+            }
+
+            // If not found in [SANE:E], check data-only entities in [SANE:D] cards
+            const dataCardResult = Utilities.storyCard.find(
+                card => card.title.startsWith('[SANE:D]'),
+                false // Get all matching cards (false for returnFirst)
+            );
+
+            // Handle both single card and array of cards
+            let allDataCards = [];
+            if (dataCardResult) {
+                allDataCards = Array.isArray(dataCardResult) ? dataCardResult : [dataCardResult];
+            }
+
+            for (const card of allDataCards) {
+                try {
+                    const data = JSON.parse(card.description || '{}');
+
+                    // Check if entityId exists in this card (either as direct ID or mapped from alias)
+                    if (data[entityId]) {
+                        const entity = data[entityId];
+                        entity.id = entityId;  // Add the ID field
+
+                        // Cache the entity
+                        dataCache[entityId] = entity;
+                        checkMemoryUsage();
+
+                        // Register aliases if present
+                        if (entity.aliases) {
+                            for (const alias of entity.aliases) {
+                                entityAliasMap[alias] = entityId;
+                            }
+                        }
+
+                        // Also cache under the original path if it was an alias
+                        if (mappedId) {
+                            dataCache[path] = entity;
+                        }
+
+                        return entity;
+                    }
+
+                    // If entityId wasn't found and we haven't checked aliases yet,
+                    // scan for entities that have our path as an alias
+                    if (!mappedId) {
+                        for (const [key, entity] of Object.entries(data)) {
+                            if (entity && entity.aliases && entity.aliases.includes(path)) {
+                                entity.id = key;  // Add the ID field
+
+                                // Cache the entity by its primary ID
+                                dataCache[key] = entity;
+                                checkMemoryUsage();
+
+                                // Register all aliases
+                                if (entity.aliases) {
+                                    for (const alias of entity.aliases) {
+                                        entityAliasMap[alias] = key;
+                                }
+                            }
+
+                            return entity;
+                        }
+                    }
+                    }
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Failed to parse ${card.title}: ${e.message}`);
+                }
+            }
+
+            return undefined;
+        }
+
+        // Multi-part path
+        const entityId = parts[0];
+        const fieldPath = parts.slice(1).join('.');
+
+        // Special case for Global variables
+        if (entityId === 'Global') {
+            const varName = parts[1];
+            if (!varName) {
+                // Return all globals
+                return dataCache.Global || {};
+            }
+            const varFieldPath = parts.slice(2).join('.');
+            const value = dataCache.Global?.[varName];
+            if (value === undefined) return undefined;
+            return varFieldPath ? getNestedField(value, varFieldPath) : value;
+        }
+
+        // Load entity from cache
+        const entity = dataCache[entityId] || get(entityId);
         if (!entity) return undefined;
+
+        // Return field or entire entity
         return fieldPath ? getNestedField(entity, fieldPath) : entity;
+
+        return undefined;
     }
     
     // Universal setter function - set any data via path
     function set(path, value) {
         if (!path) return false;
-        
+
         // First resolve any dynamic expressions in the path
         const resolvedPath = resolve(path);
         if (resolvedPath !== path) {
             path = resolvedPath;
         }
-        
-        // Parse path: "Character.Bob.level" or "Global.currentPlayer"
+
+        // Parse path: "EntityID.field.subfield" or "Global.variableName"
         const parts = path.split('.');
-        if (parts.length < 2) return false;
-        
-        const objectType = parts[0];
-        const entityName = parts[1];
-        const fieldPath = parts.slice(2).join('.');
-        
-        // Special case for Global variables
-        if (objectType === 'Global') {
-            if (fieldPath) {
-                // Get current value, modify nested field, save back
-                let currentValue = getGlobalValue(entityName) || {};
-                setNestedField(currentValue, fieldPath, value);
-                return setGlobalValue(entityName, currentValue);
-            } else {
-                return setGlobalValue(entityName, value);
+        if (parts.length < 1) return false;
+
+        const entityName = parts[0];
+        const fieldPath = parts.slice(1).join('.');
+
+        // Special case for Global variables (the only "typed" access we keep)
+        if (entityName === 'Global') {
+            if (!fieldPath) {
+                if (debug) console.log(`${MODULE_NAME}: Global requires a variable name`);
+                return false;
             }
+
+            // Global.variableName.field format
+            const varParts = fieldPath.split('.');
+            const varName = varParts[0];
+            const varFieldPath = varParts.slice(1).join('.');
+
+            if (varFieldPath) {
+                // Setting nested field in global variable
+                let currentValue = get(`Global.${varName}`) || {};
+                setNestedField(currentValue, varFieldPath, value);
+                value = currentValue;
+            }
+
+            // Store the global variable
+            if (!dataCache.Global) dataCache.Global = {};
+            dataCache.Global[varName] = value;
+
+            // Save Global entity to [SANE:D] cards
+            saveToDataCards({ Global: dataCache.Global });
+
+            return true;
         }
-        
+
         // Load the entity
-        const entity = load(objectType, entityName);
+        const entity = get(entityName);
         if (!entity) {
-            if (debug) console.log(`${MODULE_NAME}: Entity not found: ${objectType}.${entityName}`);
+            if (debug) console.log(`${MODULE_NAME}: Entity not found: ${entityName}`);
             return false;
         }
-        
+
         // Modify the field
         if (fieldPath) {
             setNestedField(entity, fieldPath, value);
         } else {
+            // If no field path, we're replacing the entire entity
             Object.assign(entity, value);
         }
-        
-        // Save the entity back
-        return save(objectType, entity);
+
+        // Save the entity back (unless it's a temporary entity with gw_progress)
+        if (entity.components && entity.components.includes('gw_progress')) {
+            // Don't save temporary entities - just update cache
+            dataCache[entityName] = entity;
+            return true;
+        }
+        return save(entityName, entity);
     }
-    
+
+    // Universal delete function - remove any data via path
+    function del(path) {
+        if (!path) return false;
+
+        // First resolve any dynamic expressions in the path
+        const resolvedPath = resolve(path);
+
+        // Split the path to determine what we're deleting
+        const parts = resolvedPath.split('.');
+
+        // Handle Global variables
+        if (parts[0] === 'Global' || parts[0] === 'global') {
+            const varName = parts.slice(1).join('.');
+            const globalVars = loadGlobalVariables();
+            if (varName in globalVars) {
+                delete globalVars[varName];
+                saveGlobalVariables(globalVars);
+                // Also remove from cache
+                delete dataCache[resolvedPath];
+                return true;
+            }
+            return false;
+        }
+
+        // Handle entity field deletion
+        if (parts.length >= 2) {
+            const entityName = parts[0];
+            const fieldPath = parts.slice(1).join('.');
+
+            const entity = get(entityName);
+            if (entity) {
+                // Delete the nested field
+                if (deleteNestedField(entity, fieldPath)) {
+                    // Save the updated entity
+                    save(entityName, entity);
+                    // Update cache
+                    dataCache[entityName] = entity;
+                    return true;
+                }
+            }
+        }
+
+        // Try to delete from dataCache directly
+        if (resolvedPath in dataCache) {
+            delete dataCache[resolvedPath];
+            return true;
+        }
+
+        return false;
+    }
+
+    // Helper to delete nested field from any object
+    function deleteNestedField(obj, path) {
+        if (!obj || !path) return false;
+
+        const parts = path.split('.');
+        const lastPart = parts.pop();
+
+        // Navigate to the parent object
+        let current = obj;
+        for (const part of parts) {
+            if (!(part in current)) return false;
+            current = current[part];
+        }
+
+        // Delete the final property
+        if (lastPart in current) {
+            delete current[lastPart];
+            return true;
+        }
+
+        return false;
+    }
+
     // Helper to get nested field from any object
     function getNestedField(obj, path) {
         if (!obj || !path) return obj;
@@ -1090,19 +1182,19 @@ function GameState(hook, text) {
     // Helper to set nested field in any object
     function setNestedField(obj, path, value) {
         if (!obj || !path) return false;
-        
+
         const parts = path.split('.');
         let current = obj;
-        
+
         for (let i = 0; i < parts.length - 1; i++) {
             const part = parts[i];
-            
+
             // Handle array index notation
             const arrayMatch = part.match(/^(.+)\[(\d+)\]$/);
             if (arrayMatch) {
                 const fieldName = arrayMatch[1];
                 const index = parseInt(arrayMatch[2]);
-                
+
                 if (!current[fieldName]) current[fieldName] = [];
                 if (!current[fieldName][index]) current[fieldName][index] = {};
                 current = current[fieldName][index];
@@ -1124,100 +1216,35 @@ function GameState(hook, text) {
         
         return true;
     }
-    
-    // Aliases for compatibility with old code that used getNestedValue/setNestedValue
-    const getNestedValue = getNestedField;
-    const setNestedValue = setNestedField;
-    
+
+
     // ==========================
     // Location Helper Functions
     // ==========================
     function getOppositeDirection(direction) {
-        // Simple hardcoded opposites - could be moved to a component if needed
-        const opposites = {
-            'north': 'south',
-            'south': 'north',
-            'east': 'west',
-            'west': 'east',
-            'northeast': 'southwest',
-            'northwest': 'southeast',
-            'southeast': 'northwest',
-            'southwest': 'northeast',
-            'up': 'down',
-            'down': 'up',
-            'in': 'out',
-            'out': 'in',
-            'inside': 'outside',
-            'outside': 'inside',
-            'forward': 'back',
-            'back': 'forward',
-            'left': 'right',
-            'right': 'left'
-        };
-        
-        const lower = direction.toLowerCase();
-        const opposite = opposites[lower];
-        
-        // Return with same capitalization as input
-        if (opposite) {
-            if (direction[0] === direction[0].toUpperCase()) {
-                return opposite.charAt(0).toUpperCase() + opposite.slice(1);
-            }
-            return opposite;
-        }
-        
-        // No opposite found - return original
-        return direction;
-    }
-    
-    function getLocationPathways(locationName) {
-        // Get all pathways for a location
-        const location = load('Location', locationName);
-        if (!location) return {};
-        
-        return location.pathways || {};
-    }
-    
-    function removeLocationPathway(locationName, direction, removeBidirectional = true) {
-        // Remove a pathway from a location
-        const location = load('Location', locationName);
-        if (!location || !location.pathways) {
-            return false;
-        }
-        
-        const dirLower = direction.toLowerCase();
-        const destinationName = location.pathways[dirLower];
-        
-        if (!destinationName) {
-            return false; // Pathway doesn't exist
-        }
-        
-        // Remove the pathway
-        delete location.pathways[dirLower];
-        
-        // Save the updated location
-        const saved = save('Location', location);
-        
-        if (saved && removeBidirectional && destinationName) {
-            // Also remove reverse pathway
-            const destination = load('Location', destinationName);
-            if (destination && destination.pathways) {
-                const oppositeDir = getOppositeDirection(direction).toLowerCase();
-                delete destination.pathways[oppositeDir];
-                save('Location', destination);
-                
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Removed bidirectional pathway: ${locationName} -X- ${destinationName}`);
+        // Try to get opposites from pathways schema
+        const pathwaysSchema = dataCache['schema.pathways'] || loadSchemaIntoCache('pathways');
+
+        if (pathwaysSchema && pathwaysSchema.opposites) {
+            const lower = direction.toLowerCase();
+            const opposite = pathwaysSchema.opposites[lower];
+
+            if (opposite) {
+                // Return with same capitalization as input
+                if (direction[0] === direction[0].toUpperCase()) {
+                    return opposite.charAt(0).toUpperCase() + opposite.slice(1);
                 }
+                return opposite;
             }
         }
-        
-        return saved;
+
+        // No opposite found - return null to indicate no bidirectional connection
+        return null;
     }
     
     function updateLocationPathway(locationName, direction, destinationName, bidirectional = true) {
         // Use universal load function
-        const location = load('Location', locationName);
+        const location = get(locationName);
         if (!location) {
             if (debug) console.log(`${MODULE_NAME}: Location not found: ${locationName}`);
             return false;
@@ -1233,22 +1260,25 @@ function GameState(hook, text) {
         location.pathways[dirLower] = destinationName;
         
         // Save the updated location using universal save
-        const saved = save('Location', location);
-        
+        const saved = save(locationName, location);
+
         if (saved && bidirectional) {
             // Also update the destination location with reverse pathway
-            const destination = load('Location', destinationName);
+            const destination = get(destinationName);
             if (destination) {
-                const oppositeDir = getOppositeDirection(direction).toLowerCase();
-                
-                if (!destination.pathways || typeof destination.pathways !== 'object') {
-                    destination.pathways = {};
-                }
-                destination.pathways[oppositeDir] = locationName;
-                save('Location', destination);
-                
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Created bidirectional pathway: ${locationName} <-${direction}/${oppositeDir}-> ${destinationName}`);
+                const oppositeDir = getOppositeDirection(direction);
+
+                // Only create bidirectional if opposite direction exists
+                if (oppositeDir) {
+                    if (!destination.pathways || typeof destination.pathways !== 'object') {
+                        destination.pathways = {};
+                    }
+                    destination.pathways[oppositeDir.toLowerCase()] = locationName;
+                    save(destinationName, destination);
+
+                    if (debug) {
+                        console.log(`${MODULE_NAME}: Created bidirectional pathway: ${locationName} <-${direction}/${oppositeDir}-> ${destinationName}`);
+                    }
                 }
             }
         } else if (saved) {
@@ -1260,69 +1290,1725 @@ function GameState(hook, text) {
         return saved;
     }
     
-    // ==========================
-    // Global Variables System (Universal Data Integration)
-    // ==========================
-    // Global variables now use the universal load/save system
-    // They are stored as a special 'Global' entity type
-    
-    function loadGlobalVariables() {
-        // Global variables use [GLOBAL] Global card for singleton storage
-        const card = Utilities.storyCard.get('[GLOBAL] Global');
-        if (!card || !card.description) return {};
-        
-        try {
-            // Try to parse as JSON first for complex data
-            return JSON.parse(card.description);
-        } catch (e) {
-            // Fall back to key:value format
-            const globalVars = {};
-            const lines = card.description.split('\n');
-            for (const line of lines) {
-                const colonIndex = line.indexOf(':');
-                if (colonIndex > 0) {
-                    const key = line.substring(0, colonIndex).trim();
-                    const value = line.substring(colonIndex + 1).trim();
-                    try {
-                        globalVars[key] = JSON.parse(value);
-                    } catch {
-                        globalVars[key] = value;
+    // ===============
+    // Display System
+    // ===============
+    // Component-based display system for generating Entry fields
+    // Generate keys for entity card based on type
+    function generateEntityKeys(entityId, entity) {
+        if (!entityId || !entity) return '';
+
+        // Check entity type from GameplayTags
+        const isLocation = entity.GameplayTags && entity.GameplayTags.some(tag => tag.startsWith('Location'));
+
+        if (isLocation) {
+            // Location format: " Location_ID, Title Case Name"
+            const titleCase = entityId.split('_').map(word =>
+                word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+            ).join(' ');
+
+            let keys = ` ${entityId}, ${titleCase}`;
+
+            // Add aliases if present
+            if (entity.aliases && Array.isArray(entity.aliases)) {
+                for (const alias of entity.aliases) {
+                    if (alias !== entityId) {
+                        // For locations, also add title case version of aliases
+                        const aliasTitleCase = alias.split('_').map(word =>
+                            word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+                        ).join(' ');
+                        keys += `, ${alias}, ${aliasTitleCase}`;
                     }
                 }
             }
-            return globalVars;
+
+            return keys;
+        } else {
+            // Character/other entity format: " EntityID,(EntityId, trigger_name,(trigger_name"
+            let keys = ` ${entityId},(${entityId}`;
+
+            // Add aliases
+            if (entity.aliases && Array.isArray(entity.aliases)) {
+                for (const alias of entity.aliases) {
+                    if (alias !== entityId) {
+                        keys += `, ${alias},(${alias}`;
+                    }
+                }
+            }
+
+            // Add trigger_name if present
+            const triggerName = entity.info?.trigger_name;
+            if (triggerName && triggerName !== entityId) {
+                keys += `, ${triggerName},(${triggerName}`;
+            }
+
+            return keys;
         }
     }
-    
-    function getGlobalValue(varName) {
-        const globalVars = loadGlobalVariables();
-        return globalVars[varName] !== undefined ? globalVars[varName] : null;
+
+    // Build the display for an entity using component-embedded display rules
+    function buildEntityDisplay(entity) {
+        if (!entity || typeof entity !== 'object') {
+            if (debug) console.log(`${MODULE_NAME}: buildEntityDisplay: Invalid entity`);
+            return '';
+        }
+
+        // Collect all display rules from components
+        const displayRules = [];
+
+        // Gather display rules embedded in each component's data
+        if (entity.components && Array.isArray(entity.components)) {
+            for (const componentName of entity.components) {
+                const component = entity[componentName];
+                if (!component || typeof component !== 'object') continue;
+
+                // Check for display rules in the component
+                if (component.display) {
+                    // Handle both single rule and array of rules
+                    const rules = Array.isArray(component.display) ? component.display : [component.display];
+                    for (const rule of rules) {
+                        displayRules.push({
+                            component: componentName,
+                            componentData: component,
+                            ...rule
+                        });
+                    }
+                }
+            }
+        }
+
+        // Sort rules by priority
+        displayRules.sort((a, b) => (a.priority || 100) - (b.priority || 100));
+
+        // Initialize display sections
+        const sections = {
+            prefixline: [],
+            nameline: [],
+            infoline: [],
+            section: [],
+            footer: []
+        };
+
+        // Get display component configuration
+        const displayConfig = entity.display || {
+            separators: {
+                nameline: ' ',
+                infoline: ' | ',
+                section: '\n',
+                footer: '\n'
+            },
+            order: ['prefixline', 'nameline', 'infoline', 'section', 'footer']
+        };
+
+        // 1. Handle prefixline from display component
+        if (displayConfig.prefixline) {
+            sections.prefixline.push(displayConfig.prefixline);
+        } else {
+            // Auto-generate prefix from GameplayTags if not specified
+            if (entity.GameplayTags && entity.GameplayTags.length > 0) {
+                for (const tag of entity.GameplayTags) {
+                    if (tag.startsWith('Character')) {
+                        sections.prefixline.push('<$# Characters>');
+                        break;
+                    } else if (tag.startsWith('User')) {
+                        sections.prefixline.push('<$# Users>');
+                        break;
+                    } else if (tag === 'Location') {
+                        sections.prefixline.push('<$# Locations>');
+                        break;
+                    } else if (tag === 'Quest') {
+                        sections.prefixline.push('<$# Quests>');
+                        break;
+                    }
+                }
+            }
+        }
+
+        // 2. Process all display rules
+        for (const rule of displayRules) {
+            // Check condition if present
+            if (rule.condition) {
+                if (!evaluateTemplateCondition(rule.condition, entity, rule.componentData)) {
+                    continue;
+                }
+            }
+
+            // Format the display text using the new template system
+            const formatted = formatTemplateString(rule.format, entity, rule.componentData, rule.component);
+            if (formatted && formatted.trim()) {
+                const targetSection = sections[rule.line] || sections.section;
+                targetSection.push(formatted);
+            }
+        }
+
+        // 3. Compile final output using display component's order and separators
+        const output = [];
+        const order = displayConfig.order || ['prefixline', 'nameline', 'infoline', 'section', 'footer'];
+
+        for (const sectionName of order) {
+            const section = sections[sectionName];
+            if (!section || section.length === 0) continue;
+
+            const separator = displayConfig.separators?.[sectionName] || '\n';
+
+            if (sectionName === 'infoline' || sectionName === 'nameline') {
+                // Infoline and nameline sections are joined with their separator
+                output.push(section.join(separator));
+            } else {
+                // Other sections are added as individual lines
+                output.push(...section);
+            }
+        }
+
+        // Handle custom footer if specified
+        if (displayConfig.footer) {
+            output.push(displayConfig.footer);
+        }
+
+        return output.join('\n');
     }
-    
-    function setGlobalValue(varName, value) {
-        const globalVars = loadGlobalVariables();
-        globalVars[varName] = value;
-        
-        // Save back as JSON for complex data support
-        return Utilities.storyCard.upsert('[GLOBAL] Global', {
-            entry: 'Global variable storage',
-            description: JSON.stringify(globalVars, null, 2)
+
+    // Evaluate template conditions with enhanced syntax support
+    function evaluateTemplateCondition(condition, entity, componentData) {
+        if (!condition) return true;
+
+        try {
+            // Replace field references with actual values
+            const evaluable = condition.replace(/\{([^}]+)\}/g, (match, path) => {
+                // Navigate the path starting from component data
+                const parts = path.split('.');
+                let value = componentData;
+
+                for (const part of parts) {
+                    value = value?.[part];
+                    if (value === undefined) return 'undefined';
+                }
+
+                return JSON.stringify(value);
+            });
+
+            // Handle Object.keys().length checks
+            if (evaluable.includes('Object.keys')) {
+                const match = evaluable.match(/Object\.keys\((\w+)\)\.length\s*>\s*(\d+)/);
+                if (match) {
+                    const component = entity[match[1]];
+                    const threshold = parseInt(match[2]);
+                    if (component) {
+                        // Exclude 'display' field when counting component keys
+                        const dataKeys = Object.keys(component).filter(k => k !== 'display');
+                        return dataKeys.length > threshold;
+                    }
+                    return false;
+                }
+            }
+
+            // Handle array length checks
+            if (evaluable.includes('.length')) {
+                const match = evaluable.match(/"([^"]*)"\.length\s*>\s*(\d+)/);
+                if (match) {
+                    return match[1].length > parseInt(match[2]);
+                }
+                // Also handle array.length
+                const arrayMatch = evaluable.match(/\[([^\]]*)\]\.length\s*>\s*(\d+)/);
+                if (arrayMatch) {
+                    try {
+                        const arr = JSON.parse(`[${arrayMatch[1]}]`);
+                        return arr.length > parseInt(arrayMatch[2]);
+                    } catch (e) {
+                        return false;
+                    }
+                }
+            }
+
+            // Simple truthy/falsy checks
+            if (evaluable === 'true') return true;
+            if (evaluable === 'false') return false;
+            if (evaluable === 'undefined' || evaluable === 'null') return false;
+
+            // Default to true if we can't evaluate
+            return true;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Failed to evaluate condition: ${condition}`);
+            return true;
+        }
+    }
+
+    // Format template strings with enhanced wildcard and function support
+    function formatTemplateString(format, entity, componentData, componentName) {
+        if (!format) return '';
+
+        let result = format;
+
+        // Debug: Check what componentData looks like
+        if (debug && format.includes('{*\\:') && componentName) {
+            console.log(`${MODULE_NAME}: Formatting ${componentName} with data:`, Object.keys(componentData || {}));
+        }
+
+        // Handle wildcard patterns {*\: template} (escaped colon)
+        if (format.includes('{*\\:')) {
+            // Find the complete {*\: ...} pattern by counting braces
+            const startIndex = format.indexOf('{*\\:');
+            if (startIndex !== -1) {
+                let braceCount = 0;
+                let endIndex = -1;
+
+                for (let i = startIndex; i < format.length; i++) {
+                    if (format[i] === '{') braceCount++;
+                    if (format[i] === '}') {
+                        braceCount--;
+                        if (braceCount === 0) {
+                            endIndex = i;
+                            break;
+                        }
+                    }
+                }
+
+                if (endIndex !== -1) {
+                    const fullPattern = format.substring(startIndex, endIndex + 1);
+                    const template = format.substring(startIndex + 4, endIndex); // Skip '{*\:' and final '}'
+
+                    if (componentData && typeof componentData === 'object') {
+                        const items = [];
+
+                        // Iterate over component data entries
+                        for (const [key, value] of Object.entries(componentData)) {
+                    // Skip the display property itself
+                    if (key === 'display') continue;
+
+                    let itemResult = template.trim();
+
+                    // Replace nested wildcards in order of specificity
+                    // {*.property.subproperty}
+                    itemResult = itemResult.replace(/\{\*\.([^}]+)\}/g, (match, path) => {
+                        const parts = path.split('.');
+                        let val = value;
+                        for (const part of parts) {
+                            val = val?.[part];
+                            if (val === undefined) return '';
+                        }
+                        return val !== null && val !== undefined ? val : '';
+                    });
+
+                    // {*} represents the key itself
+                    itemResult = itemResult.replace(/\{\*\}/g, key);
+
+                    // Replace function calls like {getRelationshipFlavor(*, name, *)}
+                    itemResult = itemResult.replace(/\{(\w+)\(([^)]+)\)\}/g, (match, funcName, args) => {
+                        return evaluateTemplateFunction(funcName, args, entity, key, value);
+                    });
+
+                    if (itemResult.trim()) {
+                        items.push(itemResult);
+                    }
+                }
+
+                        if (items.length > 0) {
+                            const separator = '\n'; // Default to newline for wildcard expansions
+                            result = result.replace(fullPattern, items.join(separator));
+                        } else {
+                            return ''; // No items, return empty
+                        }
+                    }
+                }
+            }
+        }
+
+        // Handle regular field references {field.path}
+        result = result.replace(/\{([^}]+)\}/g, (match, expression) => {
+            // Check if it's a function call
+            const funcMatch = expression.match(/^(\w+)\(([^)]*)\)$/);
+            if (funcMatch) {
+                const [, funcName, args] = funcMatch;
+                return evaluateTemplateFunction(funcName, args, entity, null, null);
+            }
+
+            // Regular path navigation
+            const parts = expression.split('.');
+            let value = componentData;
+
+            for (const part of parts) {
+                value = value?.[part];
+                if (value === undefined) {
+                    // Try looking in entity root
+                    value = entity;
+                    for (const p of parts) {
+                        value = value?.[p];
+                        if (value === undefined) return '';
+                    }
+                    break;
+                }
+            }
+
+            return value !== null && value !== undefined ? value : '';
         });
+
+        return result;
     }
-    
-    function deleteGlobalValue(varName) {
-        const globalVars = loadGlobalVariables();
-        if (!globalVars[varName]) return false;
-        
-        delete globalVars[varName];
-        
-        // Save back as JSON
-        return Utilities.storyCard.upsert('[GLOBAL] Data', {
-            entry: 'Global variable storage',
-            description: JSON.stringify(globalVars, null, 2)
+
+    // Evaluate template functions
+    function evaluateTemplateFunction(funcName, args, entity, currentKey, currentValue) {
+        // Parse arguments
+        const argList = args.split(',').map(arg => arg.trim());
+
+        // Try to find and call the function dynamically
+        let targetFunction = null;
+
+        // Check global scope (GameState functions)
+        if (typeof eval !== 'undefined') {
+            try {
+                targetFunction = eval(funcName);
+            } catch (e) {
+                // Function doesn't exist in global scope
+            }
+        }
+
+        // Check Library functions as fallback
+        if (!targetFunction && Library[funcName] && typeof Library[funcName] === 'function') {
+            targetFunction = Library[funcName];
+        }
+
+        if (targetFunction) {
+            try {
+                // Prepare arguments, replacing * with current values
+                const processedArgs = argList.map(arg => {
+                    if (arg === '*') return currentKey;
+                    if (arg === '*.value' && currentValue && typeof currentValue === 'object') return currentValue.value;
+                    if (arg === 'id') return entity.id;
+                    if (arg === 'name') return entity.name || entity.id;
+                    // Try to parse as number
+                    if (typeof arg === 'string' && !isNaN(arg)) return parseFloat(arg);
+                    return arg;
+                });
+                return targetFunction(...processedArgs);
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Error calling ${funcName}: ${e.message}`);
+                return '';
+            }
+        }
+
+        return `[${funcName}?]`;
+    }
+
+    // Generate Entry field for a display entity
+    function generateEntityEntry(entity) {
+        if (!entity) return '';
+
+        // Use buildEntityDisplay to generate the formatted text
+        const display = buildEntityDisplay(entity);
+
+        // If no display was generated, create a simple default
+        if (!display) {
+            const name = (entity.aliases && entity.aliases[0]) || 'Unknown Entity';
+            return name;
+        }
+
+        return display;
+    }
+
+    // Build structured data string for entity storage
+    function buildStructuredData(entity) {
+        if (!entity) return '<== SANE DATA ==>\n{}\n<== END DATA ==>';
+
+        // Wrap the entity data with SANE DATA markers
+        let data = '<== SANE DATA ==>\n';
+        data += JSON.stringify(entity, null, 2);
+        data += '\n<== END DATA ==>';
+        return data;
+    }
+
+    // Move entity from [SANE:D] to [SANE:E] when display is added
+    function moveToEntityCard(entityId, entity) {
+        // Mark that it has display
+        if (!entity.components) entity.components = [];
+        if (!entity.components.includes('display')) {
+            entity.components.push('display');
+        }
+
+        // Generate Entry field
+        const entry = generateEntityEntry(entity);
+
+        // Save to [SANE:E] card
+        const cardTitle = `[SANE:E] ${entityId}`;
+        const structuredData = buildStructuredData(entity);
+
+        Utilities.storyCard.upsert({
+            title: cardTitle,
+            entry: entry,
+            description: structuredData,
+            type: 'SANE'
         });
+
+        // Update entity card map
+        entityCardMap[entityId] = cardTitle;
+
+        // Remove from [SANE:D] if it was there
+        const dataCards = loadFromDataCards();
+        if (dataCards && dataCards[entityId]) {
+            delete dataCards[entityId];
+            saveToDataCards(dataCards);
+        }
+
+        // Update cache
+        dataCache[entityId] = entity;
+    }
+
+    // Move entity from [SANE:E] to [SANE:D] when display is removed
+    function moveToDataCard(entityId, entity) {
+        // Remove display component
+        if (entity.components) {
+            const index = entity.components.indexOf('display');
+            if (index !== -1) {
+                entity.components.splice(index, 1);
+            }
+        }
+
+        // Delete display config
+        delete entity.display;
+
+
+        // Load existing data cards for this type
+        const dataCards = loadFromDataCards() || {};
+
+        // Add this entity
+        dataCards[entityId] = entity;
+
+        // Save to [SANE:D]
+        saveToDataCards(dataCards);
+
+        // Remove [SANE:E] card and any overflow cards
+        Utilities.storyCard.remove(`[SANE:E] ${entityId}`);
+        cleanupOverflowCards(entityId);
+
+        // Update entity card map
+        delete entityCardMap[entityId];
+
+        // Update cache
+        dataCache[entityId] = entity;
+    }
+
+    // Initialize Display Schema
+
+    // ==========================
+    // Blueprint System
+    // ==========================
+    // Template-based entity creation system with field mapping and inheritance
+
+    function loadBlueprint(blueprintId) {
+        // Validate blueprintId is a string
+        if (!blueprintId || typeof blueprintId !== 'string') {
+            console.log(`${MODULE_NAME}: loadBlueprint requires a string blueprintId, got type: ${typeof blueprintId}, value: ${JSON.stringify(blueprintId)}`);
+            console.trace('Stack trace for non-string blueprintId');
+            return null;
+        }
+
+        // Check cache first
+        if (dataCache[`blueprint.${blueprintId}`]) {
+            return dataCache[`blueprint.${blueprintId}`];
+        }
+
+        // Try to find a blueprint card containing this blueprint
+        const blueprintCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:BP]'),
+            true
+        ) || [];
+
+        for (const card of blueprintCards) {
+            try {
+                const blueprint = JSON.parse(card.description || '{}');
+                if (blueprint.id === blueprintId) {
+                    // Found it - cache in blueprint.* namespace
+                    dataCache[`blueprint.${blueprintId}`] = blueprint;
+                    return blueprint;
+                }
+            } catch (e) {
+                // Continue searching
+            }
+        }
+
+        // Blueprint not found
+        return null;
+    }
+
+    function saveEntity(entityId, entity) {
+        if (debug) console.log(`${MODULE_NAME}: saveEntity called for ${entityId}`);
+
+        // Clean up any existing overflow cards first
+        cleanupOverflowCards(entityId);
+
+        // Determine if entity should have display card (must have active display)
+        if (hasDisplayComponent(entity)) {
+            if (debug) console.log(`${MODULE_NAME}: saveEntity: Entity has active display component`);
+
+            // Save to [SANE:E] card with display
+            const entry = buildEntityDisplay(entity);
+            if (!entry) {
+                console.log(`${MODULE_NAME}: saveEntity: buildEntityDisplay returned empty for ${entityId}`);
+            }
+
+            // Build data section with markers
+            const dataSection = buildEntityData(entityId, entity);
+            if (!dataSection) {
+                console.log(`${MODULE_NAME}: saveEntity: buildEntityData returned empty for ${entityId}`);
+                return false;
+            }
+
+            // Handle overflow if entity is too large
+            if (dataSection.length > 9500) {
+                // Split entity data across overflow cards
+                const chunks = [];
+                let currentChunk = '';
+                const MAX_CHUNK = 9000;
+
+                for (let i = 0; i < dataSection.length; i += MAX_CHUNK) {
+                    chunks.push(dataSection.substring(i, i + MAX_CHUNK));
+                }
+
+                // Save main card with overflow marker
+                const cardTitle = `[SANE:E] ${entityId}`;
+                const existingCard = Utilities.storyCard.get(cardTitle);
+                const upsertData = {
+                    title: cardTitle,
+                    entry: entry,
+                    description: chunks[0] + '~~1~~',
+                    type: 'story'
+                };
+
+                // Only set keys if this is a new card
+                if (!existingCard) {
+                    upsertData.keys = generateEntityKeys(entityId, entity);
+                }
+
+                Utilities.storyCard.upsert(upsertData);
+
+                // Save overflow cards
+                for (let i = 1; i < chunks.length; i++) {
+                    const marker = i < chunks.length - 1 ? `~~${i+1}~~` : '';
+                    Utilities.storyCard.upsert({
+                        title: `[SANE:E] ${entityId} ~${i}~`,
+                        entry: `# ${entityId} Overflow ${i}`,
+                        description: chunks[i] + marker,
+                        type: 'data'
+                    });
+                }
+            } else {
+                // Normal save without overflow
+                try {
+                    const cardTitle = `[SANE:E] ${entityId}`;
+                    const existingCard = Utilities.storyCard.get(cardTitle);
+                    const upsertData = {
+                        title: cardTitle,
+                        entry: entry,
+                        description: dataSection,
+                        type: 'story'
+                    };
+
+                    // Only set keys if this is a new card
+                    if (!existingCard) {
+                        upsertData.keys = generateEntityKeys(entityId, entity);
+                    }
+
+                    Utilities.storyCard.upsert(upsertData);
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: saveEntity: Failed to upsert card [SANE:E] ${entityId}: ${e.message}`);
+                    return false;
+                }
+            }
+
+            // Update card map
+            entityCardMap[entityId] = `[SANE:E] ${entityId}`;
+            return true; // Successfully saved to [SANE:E] card
+        } else {
+            // Save to [SANE:D] collection
+            // Load existing data
+            const existingData = loadFromDataCards() || {};
+
+            // Add/update this entity
+            existingData[entityId] = entity;
+
+            // Save back to cards
+            saveToDataCards(existingData);
+            return true; // Successfully saved to [SANE:D] card
+        }
+    }
+
+    // Helper to check if entity has ACTIVE display component
+    function hasDisplayComponent(entity) {
+        // Check if entity has display in components array
+        if (entity.components && Array.isArray(entity.components)) {
+            if (!entity.components.includes('display')) {
+                return false;
+            }
+        } else {
+            return false;
+        }
+
+        // Check if display component is active
+        if (entity.display && typeof entity.display === 'object') {
+            const active = entity.display.active === true;
+            if (debug) console.log(`${MODULE_NAME}: hasDisplayComponent: display.active = ${entity.display.active}, returning ${active}`);
+            return active; // Only true if explicitly set to true
+        }
+
+        // Has display component but no display object - consider it inactive
+        if (debug) console.log(`${MODULE_NAME}: hasDisplayComponent: No display object found, returning false`);
+        return false;
+    }
+
+    function loadEntityFromCard(cardTitle) {
+        const mainCard = Utilities.storyCard.get(cardTitle);
+        if (!mainCard) return null;
+
+        let dataStr = mainCard.description || '';
+
+        // Check for overflow marker ~~N~~
+        const overflowMatch = dataStr.match(/~~(\d+)~~$/);
+        if (overflowMatch) {
+            // Has overflow cards - load and concatenate them
+            const chunks = [dataStr.replace(/~~\d+~~$/, '')];
+            let nextIndex = parseInt(overflowMatch[1]);
+
+            // Extract base title for overflow cards
+            const baseTitle = cardTitle.replace(/^\[SANE:E\] /, '');
+
+            while (nextIndex) {
+                const overflowCard = Utilities.storyCard.get(`[SANE:E] ${baseTitle} ~${nextIndex}~`);
+                if (!overflowCard) {
+                    console.log(`${MODULE_NAME}: Missing overflow card ${nextIndex} for ${cardTitle}`);
+                    break;
+                }
+
+                const overflowData = overflowCard.description || '';
+                const nextMatch = overflowData.match(/~~(\d+)~~$/);
+
+                if (nextMatch) {
+                    chunks.push(overflowData.replace(/~~\d+~~$/, ''));
+                    nextIndex = parseInt(nextMatch[1]);
+                } else {
+                    chunks.push(overflowData);
+                    nextIndex = 0; // No more overflow
+                }
+            }
+
+            dataStr = chunks.join('');
+        }
+
+        // Parse entity data from between markers
+        return parseEntityData(dataStr);
+    }
+
+    // Clean up old overflow cards when updating/deleting entities
+    function cleanupOverflowCards(entityId) {
+        // Remove any existing overflow cards for this entity
+        let overflowIndex = 1;
+        let removed = 0;
+
+        while (true) {
+            const overflowTitle = `[SANE:E] ${entityId} ~${overflowIndex}~`;
+            const card = Utilities.storyCard.get(overflowTitle);
+
+            if (!card) break;
+
+            Utilities.storyCard.remove(overflowTitle);
+            removed++;
+            overflowIndex++;
+        }
+
+        if (removed > 0 && debug) {
+            console.log(`${MODULE_NAME}: Cleaned up ${removed} overflow cards for ${entityId}`);
+        }
+    }
+
+    // Delete entity and clean up all associated data
+    function deleteEntity(entityId) {
+        // Get entity to find all aliases
+        const entity = dataCache[entityId] || loadEntityFromCard(`[SANE:E] ${entityId}`);
+
+        if (!entity) {
+            console.log(`${MODULE_NAME}: Entity ${entityId} not found for deletion`);
+            return false;
+        }
+
+        // Remove from alias map
+        if (entity.aliases) {
+            for (const alias of entity.aliases) {
+                delete entityAliasMap[alias];
+            }
+        }
+
+        // Remove from cache
+        delete dataCache[entityId];
+
+        // Remove main card
+        Utilities.storyCard.remove(`[SANE:E] ${entityId}`);
+
+        // Clean up overflow cards
+        cleanupOverflowCards(entityId);
+
+        // Remove from card map
+        delete entityCardMap[entityId];
+
+        // If entity was in [SANE:D] collection, remove it
+        const existingData = loadFromDataCards() || {};
+        if (existingData[entityId]) {
+            delete existingData[entityId];
+            saveToDataCards(existingData);
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Deleted entity ${entityId}`);
+        return true;
+    }
+
+    // ==========================
+    // Entity Management Functions
+    // ==========================
+
+    function addComponent(entityId, componentName) {
+        // Load entity
+        const entity = dataCache[entityId] || loadEntityFromCard(`[SANE:E] ${entityId}`);
+        if (!entity) {
+            console.log(`${MODULE_NAME}: Entity ${entityId} not found`);
+            return false;
+        }
+
+        // Check if component already exists
+        if (entity[componentName]) {
+            console.warn(`${MODULE_NAME}: Component ${componentName} already exists on ${entityId}`);
+            return false;
+        }
+
+        // Load component schema
+        const componentSchema = dataCache[`schema.${componentName}`] || loadSchemaIntoCache(componentName);
+        if (!componentSchema) {
+            console.log(`${MODULE_NAME}: Component schema ${componentName} not found`);
+            return false;
+        }
+
+        // Initialize component with defaults
+        entity[componentName] = JSON.parse(JSON.stringify(componentSchema.defaults || {}));
+
+        // Update components array
+        if (!entity.components) {
+            entity.components = [];
+        }
+        if (!entity.components.includes(componentName)) {
+            entity.components.push(componentName);
+        }
+
+        // Handle display component special case
+        if (componentName === 'display') {
+            // Initialize display settings from all existing components
+            entity.display = entity.display || {
+                active: false  // Default to inactive until explicitly activated
+            };
+
+            // Iterate through all components to find *.display properties
+            if (entity.components) {
+                for (const compName of entity.components) {
+                    if (compName === 'display' || !entity[compName]) continue;
+
+                    // Recursively search for display properties in component data
+                    const findDisplaySettings = (obj, path = '') => {
+                        if (!obj || typeof obj !== 'object') return;
+
+                        for (const [key, value] of Object.entries(obj)) {
+                            if (key === 'display' && typeof value === 'object') {
+                                // Found a display property - merge it into entity.display
+                                const displayPath = path ? `${compName}.${path}` : compName;
+                                if (!entity.display[displayPath]) {
+                                    entity.display[displayPath] = value;
+                                }
+                            } else if (typeof value === 'object' && key !== 'display') {
+                                // Recurse into nested objects
+                                const newPath = path ? `${path}.${key}` : key;
+                                findDisplaySettings(value, newPath);
+                            }
+                        }
+                    };
+
+                    findDisplaySettings(entity[compName]);
+                }
+            }
+
+            // Move from [SANE:D] to [SANE:E]
+            moveToEntityCard(entityId, entity);
+        } else {
+            // Save updated entity using proper save function
+            save(entityId, entity);
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Added component ${componentName} to ${entityId}`);
+        return true;
+    }
+
+    function removeComponent(entityId, componentName) {
+        // Load entity
+        const entity = dataCache[entityId] || loadEntityFromCard(`[SANE:E] ${entityId}`);
+        if (!entity) {
+            console.log(`${MODULE_NAME}: Entity ${entityId} not found`);
+            return false;
+        }
+
+        // Check if component exists
+        if (!entity[componentName]) {
+            console.warn(`${MODULE_NAME}: Component ${componentName} not found on ${entityId}`);
+            return false;
+        }
+
+        // Delete the component
+        delete entity[componentName];
+
+        // Update components array
+        if (entity.components && Array.isArray(entity.components)) {
+            const index = entity.components.indexOf(componentName);
+            if (index !== -1) {
+                entity.components.splice(index, 1);
+            }
+        }
+
+        // Handle display component special case
+        if (componentName === 'display') {
+            // Move from [SANE:E] to [SANE:D]
+            moveToDataCard(entityId, entity);
+        } else {
+            // Save updated entity using proper save function
+            save(entityId, entity);
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Removed component ${componentName} from ${entityId}`);
+        return true;
+    }
+
+    // Change the actual entity ID (storage key)
+    function changeEntityId(oldId, newId) {
+        // Load entity
+        const entity = get(oldId);
+        if (!entity) {
+            console.log(`${MODULE_NAME}: Entity ${oldId} not found`);
+            return false;
+        }
+
+        // First do a direct check - does a card with this ID already exist?
+        const existingCard = Utilities.storyCard.get(`[SANE:E] ${newId}`);
+        if (existingCard) {
+            console.log(`${MODULE_NAME}: changeEntityId: ERROR - Entity card [SANE:E] ${newId} already exists!`);
+            return false;
+        }
+
+        // Check if new ID conflicts with existing entities or aliases
+        if (entityAliasMap[newId] && entityAliasMap[newId] !== newId) {
+            const owningEntity = entityAliasMap[newId];
+            console.log(`${MODULE_NAME}: changeEntityId(): ERROR - New ID "${newId}" is already used as an alias for entity "${owningEntity}"`);
+            return false;
+        }
+
+        // Also check if new ID is already taken via get()
+        const existingEntity = get(newId);  // Use get() to load from cards if not cached
+        if (existingEntity && existingEntity !== entity) {
+            console.log(`${MODULE_NAME}: changeEntityId: Entity ID ${newId} already exists`);
+            return false;
+        }
+
+        // Delete the old entity card FIRST (before cache cleanup)
+        Utilities.storyCard.remove(`[SANE:E] ${oldId}`);
+        cleanupOverflowCards(oldId);
+
+        // Also remove from [SANE:D] data cards if it exists there
+        const dataCards = loadFromDataCards() || {};
+        if (dataCards[oldId]) {
+            delete dataCards[oldId];
+            saveToDataCards(dataCards);
+            if (debug) console.log(`${MODULE_NAME}: Removed ${oldId} from [SANE:D] data cards`);
+        }
+
+        // Clean up alias map entries for the old ID
+        delete entityAliasMap[oldId];
+        if (entity.aliases) {
+            for (const alias of entity.aliases) {
+                if (entityAliasMap[alias] === oldId) {
+                    delete entityAliasMap[alias];
+                }
+            }
+        }
+
+        // DON'T delete cache entries yet - save() needs them for duplicate checking
+        // We'll update them after successful save
+
+        // Initialize aliases array if needed, but don't add the ID to its own aliases
+        if (!entity.aliases) {
+            entity.aliases = [];
+        }
+
+        // Update the entity's id field to match the new ID
+        entity.id = newId;
+
+        // Save with new ID (this creates the new card)
+        const saveResult = save(newId, entity);
+        if (!saveResult) {
+            console.log(`${MODULE_NAME}: changeEntityId: Failed to save entity with new ID ${newId}`);
+            console.log(`${MODULE_NAME}: changeEntityId: Entity aliases at save time:`, entity.aliases);
+            console.log(`${MODULE_NAME}: changeEntityId: Save returned:`, saveResult);
+            // Restore alias mappings since rename failed
+            if (entity.aliases) {
+                for (const alias of entity.aliases) {
+                    entityAliasMap[alias] = oldId;
+                }
+            }
+            // Save with original ID
+            save(oldId, entity);
+            return false;
+        }
+
+        // NOW clean up the old cache entries after successful save
+        delete dataCache[oldId];
+        delete entityCardMap[oldId];
+        if (entity.aliases) {
+            for (const alias of entity.aliases) {
+                delete dataCache[alias];
+            }
+        }
+
+        // Re-register all aliases to point to new ID (but not the ID itself)
+        if (entity.aliases) {
+            for (const alias of entity.aliases) {
+                entityAliasMap[alias] = newId;
+            }
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Changed entity ID from ${oldId} to ${newId}`);
+        return true;
+    }
+
+    function loadSchemaIntoCache(schemaId) {
+        // Validate schemaId
+        if (!schemaId || typeof schemaId !== 'string') {
+            if (debug) console.log(`${MODULE_NAME}: Invalid schemaId: ${schemaId}`);
+            return null;
+        }
+
+        // Check if already cached (with schema. prefix)
+        if (dataCache[`schema.${schemaId}`]) {
+            return dataCache[`schema.${schemaId}`];
+        }
+
+        // Try to find a schema card containing this schema
+        const schemaCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:S]'),
+            true
+        ) || [];
+
+        for (const card of schemaCards) {
+            try {
+                const schema = JSON.parse(card.description || '{}');
+                if (schema.id === schemaId) {
+                    // Found it - store in schema.* namespace ONLY
+                    dataCache[`schema.${schemaId}`] = schema;
+                    return schema;
+                }
+            } catch (e) {
+                // Continue searching
+            }
+        }
+
+        // Schema not found
+        return null;
+    }
+
+    // Support array syntax in paths
+    function parsePathSegment(segment) {
+        // Parse segment like "aliases[0]" into {key: "aliases", index: 0}
+        const match = segment.match(/^([^\[]+)(?:\[(\d+)\])?$/);
+        if (!match) return null;
+
+        return {
+            key: match[1],
+            index: match[2] !== undefined ? parseInt(match[2], 10) : undefined
+        };
+    }
+
+    function processEvalDirectives(obj, context) {
+        // Process @eval directives in object
+        if (!obj || typeof obj !== 'object') return;
+
+        for (const [key, value] of Object.entries(obj)) {
+            if (typeof value === 'string' && value.startsWith('@eval ')) {
+                const code = value.substring(6);
+                try {
+                    const evalContext = {
+                        entity: context,
+                        Math: Math,
+                        Date: Date,
+                        JSON: JSON,
+                        // GameState utilities available
+                        // get: (path) => get(path),
+                        // set: (path, val) => set(path, val),
+                        // resolve: (path) => resolve(path),
+                        // random: (min, max) => Math.floor(Math.random() * (max - min + 1)) + min,
+                        // roll: (dice) => rollDice(dice),
+                        // tool: (toolStr) => executeToolString(toolStr)
+                    };
+                    const func = new Function(...Object.keys(evalContext), `return ${code}`);
+                    obj[key] = func(...Object.values(evalContext));
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Failed to eval '${code}': ${e.message}`);
+                    // Keep the @eval string for debugging
+                }
+            } else if (typeof value === 'object' && !Array.isArray(value)) {
+                // Recursively process objects but not arrays
+                processEvalDirectives(value, context);
+            }
+        }
+    }
+
+    // ==========================
+    // GameplayTags System
+    // ==========================
+    // Hierarchical tagging system for entities (e.g., Location.Dangerous.Trap)
+
+    function parseGameplayTag(tag) {
+        // Parse a gameplay tag into its hierarchy
+        // e.g., "Location.Dangerous.Trap" -> ["Location", "Dangerous", "Trap"]
+        if (!tag || typeof tag !== 'string') return [];
+        return tag.split('.').map(t => t.trim()).filter(t => t);
+    }
+
+    function matchesTagPattern(tagParts, searchParts) {
+        // Support wildcards (*) in search patterns
+        // e.g., ["Location", "*"] matches ["Location", "Dangerous", "Trap"]
+        // If search has more parts than tag, can't match
+        if (searchParts.length > tagParts.length) return false;
+
+        for (let i = 0; i < searchParts.length; i++) {
+            const searchPart = searchParts[i];
+            const tagPart = tagParts[i];
+
+            // Wildcard matches anything
+            if (searchPart === '*') continue;
+
+            // Case-insensitive exact match
+            if (searchPart.toLowerCase() !== tagPart.toLowerCase()) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    function hasGameplayTag(entity, searchTag) {
+        // Check if entity has a specific tag or parent tag
+        // e.g., entity with "Location.Dangerous.Trap" matches "Location.Dangerous"
+        // Supports wildcards: "Location.*" matches any Location tag
+        if (!entity || !entity.GameplayTags) return false;
+
+        const searchParts = parseGameplayTag(searchTag);
+        if (searchParts.length === 0) return false;
+
+        for (const tag of entity.GameplayTags) {
+            const tagParts = parseGameplayTag(tag);
+
+            // Check if tag matches the search pattern with wildcard support
+            if (matchesTagPattern(tagParts, searchParts)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    function addGameplayTag(entity, tag) {
+        // Add a gameplay tag to an entity
+        if (!entity) return false;
+        if (!entity.GameplayTags) entity.GameplayTags = [];
+
+        const normalized = tag.split('.').map(t => t.trim()).filter(t => t).join('.');
+        if (!entity.GameplayTags.includes(normalized)) {
+            entity.GameplayTags.push(normalized);
+            return true;
+        }
+        return false;
+    }
+
+    // ================================
+    // GameplayTag Operations
+    // ================================
+
+    // Check if entity has exact tag (no parent matching)
+    function hasTagExact(entity, searchTag) {
+        if (!entity?.GameplayTags) return false;
+        return entity.GameplayTags.includes(searchTag);
+    }
+
+    // Check if entity has ANY of the specified tags
+    function hasAnyTag(entity, searchTags) {
+        if (!entity?.GameplayTags || !Array.isArray(searchTags)) return false;
+
+        for (const searchTag of searchTags) {
+            if (hasGameplayTag(entity, searchTag)) return true;
+        }
+        return false;
+    }
+
+    // Check if entity has ALL of the specified tags
+    function hasAllTags(entity, searchTags) {
+        if (!entity?.GameplayTags || !Array.isArray(searchTags)) return false;
+
+        for (const searchTag of searchTags) {
+            if (!hasGameplayTag(entity, searchTag)) return false;
+        }
+        return true;
+    }
+
+    // Remove a specific tag from entity
+    function removeTag(entity, tagToRemove) {
+        if (!entity?.GameplayTags) return false;
+
+        const index = entity.GameplayTags.indexOf(tagToRemove);
+        if (index === -1) return false;
+
+        entity.GameplayTags.splice(index, 1);
+        return true;
+    }
+
+    // Clear all tags from entity
+    function clearTags(entity) {
+        if (!entity) return false;
+        entity.GameplayTags = [];
+        return true;
+    }
+
+    // Get parent tag (Character.Player.Hero -> Character.Player)
+    function getTagParent(tag) {
+        const parts = parseGameplayTag(tag);
+        if (parts.length <= 1) return null;
+
+        parts.pop();
+        return parts.join('.');
+    }
+
+    // Get tag depth (Character.Player.Hero -> 3)
+    function getTagDepth(tag) {
+        return parseGameplayTag(tag).length;
+    }
+
+    // Check if one tag is parent of another
+    function isTagParent(parentTag, childTag) {
+        const parentParts = parseGameplayTag(parentTag);
+        const childParts = parseGameplayTag(childTag);
+
+        if (parentParts.length >= childParts.length) return false;
+
+        for (let i = 0; i < parentParts.length; i++) {
+            if (parentParts[i] !== childParts[i]) return false;
+        }
+
+        return true;
+    }
+
+    // Check if containers share at least one tag
+    function hasTagOverlap(container1, container2) {
+        if (!container1 || !container2) return false;
+
+        for (const tag of container1) {
+            if (container2.includes(tag)) return true;
+        }
+        return false;
+    }
+
+    // Get all unique tags from loaded entities
+    function getAllUniqueTags() {
+        const tags = new Set();
+
+        for (const entity of Object.values(dataCache)) {
+            if (entity?.GameplayTags) {
+                for (const tag of entity.GameplayTags) {
+                    tags.add(tag);
+                }
+            }
+        }
+
+        return Array.from(tags).sort();
+    }
+
+    // Component-level tag support
+    function hasComponentTag(entity, componentName, searchTag) {
+        const component = entity?.[componentName];
+        if (!component?.GameplayTags) return false;
+
+        // Use same hierarchical matching as entity tags
+        const searchParts = parseGameplayTag(searchTag);
+        for (const tag of component.GameplayTags) {
+            const tagParts = parseGameplayTag(tag);
+            if (matchesTagPattern(tagParts, searchParts)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function addComponentTag(entity, componentName, tag) {
+        if (!entity) return false;
+
+        const component = entity[componentName];
+        if (!component) return false;
+
+        if (!component.GameplayTags) component.GameplayTags = [];
+        if (component.GameplayTags.includes(tag)) return false;
+
+        component.GameplayTags.push(tag);
+        return true;
+    }
+
+    function removeComponentTag(entity, componentName, tag) {
+        const component = entity?.[componentName];
+        if (!component?.GameplayTags) return false;
+
+        const index = component.GameplayTags.indexOf(tag);
+        if (index === -1) return false;
+
+        component.GameplayTags.splice(index, 1);
+        return true;
+    }
+
+    function queryTags(query) {
+
+        // Query entities using either a predicate function or tag expression
+        // query: function(entity) => boolean OR string tag expression
+        // Returns: array of matching entities
+        // Examples:
+        //   queryTags('Character')                    // All characters
+        //   queryTags('Character.NPC')                // All NPCs
+        //   queryTags('Character && Elite')           // Characters with Elite tag
+        //   queryTags(e => e.stats.level.value > 10)  // Custom predicate
+
+        let predicate;
+
+        // If query is a function, use it directly
+        if (typeof query === 'function') {
+            predicate = query;
+        }
+        // If query is a simple tag string (no operators)
+        else if (typeof query === 'string' && !query.includes(' && ') && !query.includes(' || ') &&
+                 !query.includes('!') && !query.includes('(') && !query.includes(')')) {
+            // Simple tag match
+            predicate = entity => hasGameplayTag(entity, query);
+        }
+        // Complex tag expression
+        else if (typeof query === 'string') {
+            // Parse tag expression: "Character && !Monster", "Location || Quest", etc.
+            predicate = parseTagExpression(query);
+        }
+        else {
+            // Invalid query
+            if (debug) console.log(`${MODULE_NAME}: Invalid query type: ${typeof query}`);
+            return [];
+        }
+
+        const results = [];
+        for (const [key, entity] of Object.entries(dataCache)) {
+            if (!entity || typeof entity !== 'object') continue;
+
+            // Skip schema entries and other non-entity data
+            if (key.startsWith('schema.') || key.startsWith('_')) continue;
+
+            // Apply predicate
+            try {
+                if (predicate(entity)) {
+                    results.push(entity);
+                }
+            } catch (e) {
+                // Skip entities that cause errors in predicate
+                if (debug) console.log(`${MODULE_NAME}: Error in queryTags predicate for ${key}: ${e.message}`);
+            }
+        }
+
+        return results;
+    }
+
+    function parseTagExpression(expression) {
+        // Parse complex tag expressions like "Character && !Monster" or "Location || Quest"
+        // Returns a predicate function
+
+        // Simple implementation - can be expanded for more complex expressions
+        const tokens = expression.split(/\s+/);
+
+        return entity => {
+            let i = 0;
+            let result = true;
+            let currentOp = '&&';
+
+            while (i < tokens.length) {
+                const token = tokens[i];
+
+                if (token === '&&' || token === '||') {
+                    currentOp = token;
+                    i++;
+                    continue;
+                }
+
+                let negate = false;
+                let tag = token;
+
+                if (token.startsWith('!')) {
+                    negate = true;
+                    tag = token.substring(1);
+                }
+
+                const hasTag = hasGameplayTag(entity, tag);
+                const tagResult = negate ? !hasTag : hasTag;
+
+                if (i === 0) {
+                    result = tagResult;
+                } else if (currentOp === '&&') {
+                    result = result && tagResult;
+                } else if (currentOp === '||') {
+                    result = result || tagResult;
+                }
+
+                i++;
+            }
+
+            return result;
+        };
+    }
+
+    // ==========================
+    // Alias Management Functions
+    // ==========================
+    // Entity IDs and aliases must be globally unique across ALL entities
+
+    function isAliasAvailable(alias) {
+        // Check if an alias/ID is available (not used by any entity)
+        if (!alias || typeof alias !== 'string') return false;
+
+        const normalized = String(alias).trim().toLowerCase();
+        if (!normalized) return false;
+
+        // Check dataCache for any existing entity with this alias
+        const existing = dataCache[normalized];
+        return !existing; // Available if nothing found
+    }
+
+    function addEntityAlias(entityId, newAlias) {
+        // Add a new alias to an entity, ensuring global uniqueness
+        if (!entityId || !newAlias) return false;
+
+        const entity = get(entityId);
+        if (!entity) {
+            console.log(`${MODULE_NAME}: Cannot add alias - entity "${entityId}" not found`);
+            return false;
+        }
+
+        const normalized = String(newAlias).trim();
+        if (!normalized) return false;
+
+        // Check if alias is already used
+        if (!isAliasAvailable(normalized)) {
+            const existing = dataCache[normalized];
+            if (existing === entity) {
+                // Already has this alias
+                return true;
+            }
+            console.log(`${MODULE_NAME}: Cannot add alias "${normalized}" - already used by entity "${existing.name}"`);
+            return false;
+        }
+
+        // Add the alias
+        if (!entity.aliases) entity.aliases = [];
+        if (!entity.aliases.includes(normalized)) {
+            entity.aliases.push(normalized);
+            // Cache the new alias
+            dataCache[normalized] = entity;
+        }
+
+        return true;
+    }
+
+    function removeEntityAlias(entityId, aliasToRemove) {
+        // Remove an alias from an entity
+        const entity = get(entityId);
+        if (!entity || !entity.aliases) return false;
+
+        const normalized = String(aliasToRemove).trim();
+
+        // Remove from aliases array
+        const index = entity.aliases.indexOf(normalized);
+        if (index >= 0) {
+            entity.aliases.splice(index, 1);
+            // Remove from cache
+            if (dataCache[normalized] === entity) {
+                delete dataCache[normalized];
+            }
+            return true;
+        }
+
+        return false;
+    }
+
+    // ==========================
+    // Global Variables System
+    // ==========================
+
+    // Load variable definitions from [SANE:G] Variables
+    function loadVariableDefinitions() {
+        // Load from [SANE:G] Variables card
+        const vardefCard = Utilities.storyCard.get('[SANE:G] Variables');
+        if (!vardefCard) {
+            if (debug) console.log(`${MODULE_NAME}: No [SANE:G] Variables card found`);
+            return {};
+        }
+
+        const vardefs = {};
+
+        // Parse the simple text format:
+        // variableName: type // description
+        const content = (vardefCard.entry || '') + '\n' + (vardefCard.description || '');
+        const lines = content.split('\n');
+
+        for (const line of lines) {
+            // Skip empty lines and comments
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+
+            // Parse format: "variableName: type = defaultValue // description"
+            // or: "variableName: type // description"
+            const match = trimmed.match(/^(\w+)\s*:\s*(\w+)(?:\s*=\s*([^\/]+))?(?:\s*\/\/\s*(.*))?$/);
+            if (match) {
+                const [, varName, type, defaultValue, description] = match;
+
+                // Validate type is recognized
+                const validTypes = ['integer', 'float', 'number', 'string', 'boolean', 'array', 'object'];
+                if (!validTypes.includes(type)) {
+                    console.log(`${MODULE_NAME}: Invalid type '${type}' for variable '${varName}'`);
+                    continue;
+                }
+
+                // Create variable definition
+                const def = {
+                    type: type,
+                    description: description || ''
+                };
+
+                // Parse default value if provided
+                if (defaultValue) {
+                    const trimmedDefault = defaultValue.trim();
+                    switch (type) {
+                        case 'integer':
+                            def.default = parseInt(trimmedDefault) || 0;
+                            break;
+                        case 'float':
+                            def.default = parseFloat(trimmedDefault) || 0;
+                            break;
+                        case 'boolean':
+                            def.default = trimmedDefault === 'true';
+                            break;
+                        case 'string':
+                            // Remove quotes if present
+                            def.default = trimmedDefault.replace(/^["']|["']$/g, '');
+                            break;
+                        case 'array':
+                            try {
+                                def.default = JSON.parse(trimmedDefault);
+                            } catch {
+                                def.default = [];
+                            }
+                            break;
+                        case 'object':
+                            try {
+                                def.default = JSON.parse(trimmedDefault);
+                            } catch {
+                                def.default = {};
+                            }
+                            break;
+                    }
+                }
+
+                vardefs[varName] = def;
+
+                // Store in dataCache with 'vardef.' prefix
+                dataCache['vardef.' + varName] = def;
+            }
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(vardefs).length} variable definitions`);
+        return vardefs;
+    }
+
+    function loadGlobalVariables() {
+        // Load variable definitions from [SANE:G] Variables
+        loadVariableDefinitions();
+
+        // Load or create Global entity from [SANE:D] Data cards
+        let globalEntity = dataCache['Global'];
+        if (!globalEntity) {
+            // Try loading from [SANE:D] cards
+            const dataCards = loadFromDataCards();
+            if (dataCards && dataCards['Global']) {
+                globalEntity = dataCards['Global'];
+                dataCache['Global'] = globalEntity;
+            } else {
+                // Create new Global entity with default structure
+                globalEntity = {
+                    id: 'Global'  // Use id instead of name, no type field
+                };
+
+                // Initialize with defaults from variable definitions
+                const vardefs = loadVariableDefinitions();
+                for (const [varName, def] of Object.entries(vardefs)) {
+                    // Initialize with default value if specified, otherwise use type default
+                    if (globalEntity[varName] === undefined) {
+                        if (def.default !== undefined) {
+                            globalEntity[varName] = def.default;
+                        } else {
+                            // Use type-based default
+                            switch (def.type) {
+                                case 'integer':
+                                case 'float':
+                                    globalEntity[varName] = 0;
+                                    break;
+                                case 'string':
+                                    globalEntity[varName] = '';
+                                    break;
+                                case 'boolean':
+                                    globalEntity[varName] = false;
+                                    break;
+                                case 'array':
+                                    globalEntity[varName] = [];
+                                    break;
+                                case 'object':
+                                    globalEntity[varName] = {};
+                                    break;
+                            }
+                        }
+                    }
+                }
+
+                dataCache['Global'] = globalEntity;
+                // Save to [SANE:D] cards
+                saveToDataCards({ Global: globalEntity });
+            }
+        }
+
+        return globalEntity;
     }
     
+    // Save data to [SANE:D] cards with overflow handling
+    function saveToDataCards(allData) {
+        const dataType = 'Data';
+
+        // Split data into chunks if it exceeds 9500 chars
+        const chunks = [];
+        let currentChunk = {};
+        let currentSize = 0;
+        const MAX_SIZE = 9000; // Leave buffer for card metadata
+
+        for (const [key, value] of Object.entries(allData)) {
+            const entryStr = JSON.stringify({[key]: value});
+            const entrySize = entryStr.length;
+
+            // If single entry is too large, we need to handle overflow
+            if (entrySize > MAX_SIZE) {
+                console.log(`${MODULE_NAME}: Entity '${key}' is too large (${entrySize} chars) to fit in a single card`);
+                // For now, skip it - in future could implement entity splitting
+                continue;
+            }
+
+            // Check if adding this entry would exceed the limit
+            if (currentSize + entrySize > MAX_SIZE) {
+                // Save current chunk and start new one
+                chunks.push(currentChunk);
+                currentChunk = {};
+                currentSize = 0;
+            }
+
+            currentChunk[key] = value;
+            currentSize += entrySize;
+        }
+
+        // Add remaining chunk
+        if (Object.keys(currentChunk).length > 0) {
+            chunks.push(currentChunk);
+        }
+
+        // If no data left, save an empty card to clear the old data
+        if (chunks.length === 0) {
+            Utilities.storyCard.upsert({
+                title: `[SANE:D] ${dataType}`,
+                entry: `${dataType} data chunk 1 of 1`,
+                description: '{}',
+                type: 'data'
+            });
+            if (debug) console.log(`${MODULE_NAME}: Cleared [SANE:D] ${dataType} - no entities remain`);
+
+            // Also clean up any overflow cards since we have no data
+            let overflowIndex = 2;
+            while (Utilities.storyCard.get(`[SANE:D] ${dataType}~~${overflowIndex}~~`)) {
+                Utilities.storyCard.remove(`[SANE:D] ${dataType}~~${overflowIndex}~~`);
+                if (debug) console.log(`${MODULE_NAME}: Deleted overflow card [SANE:D] ${dataType}~~${overflowIndex}~~`);
+                overflowIndex++;
+            }
+            return 0;
+        }
+
+        // Save chunks to [SANE:D] cards with overflow notation
+        chunks.forEach((chunk, index) => {
+            const cardTitle = index === 0
+                ? `[SANE:D] ${dataType}`
+                : `[SANE:D] ${dataType}~~${index + 1}~~`;
+
+            Utilities.storyCard.upsert({
+                title: cardTitle,
+                entry: `${dataType} data chunk ${index + 1} of ${chunks.length}`,
+                description: JSON.stringify(chunk, null, 2),
+                type: 'data'
+            });
+
+            if (debug) console.log(`${MODULE_NAME}: Saved ${Object.keys(chunk).length} ${dataType} entities to ${cardTitle}`);
+        });
+
+        // Clean up old overflow cards
+        let overflowIndex = chunks.length + 1;
+        let oldCard;
+        while ((oldCard = Utilities.storyCard.get(`[SANE:D] ${dataType}~~${overflowIndex}~~`))) {
+            Utilities.storyCard.delete(`[SANE:D] ${dataType}~~${overflowIndex}~~`);
+            if (debug) console.log(`${MODULE_NAME}: Deleted old overflow card [SANE:D] ${dataType}~~${overflowIndex}~~`);
+            overflowIndex++;
+        }
+
+        return chunks.length;
+    }
+
+    // Load data from all [SANE:D] cards
+    function loadFromDataCards() {
+        const dataType = 'Data'; // Always use 'Data' for non-display entities
+
+        const allData = {};
+        let cardIndex = 0;
+        let hasMore = true;
+
+        while (hasMore) {
+            const cardTitle = cardIndex === 0
+                ? `[SANE:D] ${dataType}`
+                : `[SANE:D] ${dataType}~~${cardIndex}~~`;
+
+            const card = Utilities.storyCard.get(cardTitle);
+            if (!card) {
+                hasMore = false;
+                break;
+            }
+
+            try {
+                const chunkData = JSON.parse(card.description || '{}');
+                Object.assign(allData, chunkData);
+                if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(chunkData).length} ${dataType} entities from ${cardTitle}`);
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Failed to parse ${cardTitle}: ${e.message}`);
+            }
+
+            cardIndex++;
+        }
+
+        return allData;
+    }
+
     // ==========================
     // Custom Tools Loading
     // ==========================
@@ -1353,9 +3039,8 @@ function GameState(hook, text) {
                 debug: debug,
                 get: get,
                 set: set,
-                load: load,
-                save: save,
-                loadAll: loadAll
+                del: del,
+                save: save
             };
             
             // Use a simpler approach - just eval the whole tools definition
@@ -1450,25 +3135,22 @@ function GameState(hook, text) {
             try {
                 // Create context object
                 const context = {
-                    getGlobalValue: getGlobalValue,
-                    setGlobalValue: setGlobalValue,
-                    loadAllCharacters: () => loadAll('Character'),
-                    loadCharacter: function(name) {
-                        const chars = loadAll('Character');
-                        return chars[name.toLowerCase()];
-                    },
-                    saveCharacter: saveCharacter,
-                    createCharacter: createCharacter,
+                    // Direct access to primary APIs
+                    get: get,
+                    set: set,
+                    queryTags: queryTags,
+                    save: save,
+                    create: create,
                     getField: function(characterName, fieldPath) {
-                        const character = loadCharacter(characterName);
+                        const character = get(characterName);
                         if (!character) return null;
-                        return getCharacterField(character, fieldPath);
+                        return getNestedField(character, fieldPath);
                     },
                     setField: function(characterName, fieldPath, value) {
-                        const character = loadCharacter(characterName);
+                        const character = get(characterName);
                         if (!character) return false;
-                        setCharacterField(character, fieldPath, value);
-                        return save('Character', character);
+                        setNestedField(character, fieldPath, value);
+                        return save(characterName, character);
                     },
                     Utilities: Utilities,
                     Calendar: typeof Calendar !== 'undefined' ? Calendar : null,
@@ -1836,6 +3518,58 @@ function GameState(hook, text) {
             if (position < data.entries.length && data.entries[position]) {
                 const existingHash = data.entries[position].h;
                 if (existingHash !== hash) {
+                    // CRITICAL: Revert the tools from the entry we're about to replace
+                    // Otherwise those tool effects remain in the game state
+                    const entryToRevert = data.entries[position];
+                    if (entryToRevert && entryToRevert.t && entryToRevert.t.length > 0) {
+                        if (debug) console.log(`${MODULE_NAME}: Reverting ${entryToRevert.t.length} tools from position ${position} before overwriting`);
+                        
+                        // Revert tools in reverse order
+                        for (let i = entryToRevert.t.length - 1; i >= 0; i--) {
+                            const [tool, params, revertData] = entryToRevert.t[i];
+                            
+                            // Apply the reversion
+                            switch(tool) {
+                                case 'add_item':
+                                    processToolCall('add_item', [params[0], params[1], -params[2]]);
+                                    break;
+                                case 'remove_item':
+                                    processToolCall('add_item', [params[0], params[1], params[2]]);
+                                    break;
+                                case 'transfer_item':
+                                    processToolCall('transfer_item', [params[1], params[0], params[2], params[3]]);
+                                    break;
+                                case 'deal_damage':
+                                    processToolCall('deal_damage', [params[0], params[1], -params[2]]);
+                                    break;
+                                case 'update_relationship':
+                                    processToolCall('update_relationship', [params[0], params[1], -params[2]]);
+                                    break;
+                                case 'add_levelxp':
+                                    processToolCall('add_levelxp', [params[0], -params[1]]);
+                                    break;
+                                case 'add_skillxp':
+                                    processToolCall('add_skillxp', [params[0], params[1], -params[2]]);
+                                    break;
+                                case 'update_location':
+                                    if (revertData && revertData.oldLocation) {
+                                        processToolCall('update_location', [params[0], revertData.oldLocation]);
+                                    }
+                                    break;
+                                default:
+                                    if (tool.startsWith('update_') && revertData && revertData.oldValue !== undefined) {
+                                        const charName = String(params[0]).toLowerCase();
+                                        const char = get(charName);
+                                        if (char && char.attributes && char.attributes[revertData.statName]) {
+                                            char.attributes[revertData.statName].value = revertData.oldValue;
+                                            save(charName, char);
+                                        }
+                                    }
+                                    break;
+                            }
+                        }
+                    }
+                    
                     // Different content at this position - truncate everything after it
                     data.entries = data.entries.slice(0, position);
                     if (debug) console.log(`${MODULE_NAME}: New timeline branch at position ${position}, truncated future entries`);
@@ -1982,8 +3716,7 @@ function GameState(hook, text) {
                 'update_relationship': (params) => ['update_relationship', [params[0], params[1], -params[2]]],
                 'update_location': () => null,  // Can't revert without stored old location
                 // Non-reversible tools return null
-                'offer_quest': () => null,
-                'check_threshold': () => null
+                'offer_quest': () => null
             };
         },
         
@@ -2032,113 +3765,45 @@ function GameState(hook, text) {
                                 break;
                                 
                             case 'add_item':
-                                if (revertData.oldQuantity !== undefined) {
-                                    // Set the item quantity back to what it was
-                                    const charName = String(params[0]).toLowerCase();
-                                    const itemName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                                    const quantity = revertData.oldQuantity;
-                                    
-                                    if (quantity === 0) {
-                                        // Remove the item entirely
-                                        const result = processToolCall('remove_item', [params[0], params[1], params[2]]);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted add_item by removing ${itemName} from ${charName}: ${result}`);
-                                    } else {
-                                        // Set to old quantity
-                                        const char = load('Character', charName);
-                                        if (char && char.inventory) {
-                                            if (!char.inventory[itemName]) char.inventory[itemName] = {};
-                                            char.inventory[itemName].quantity = quantity;
-                                            save('Character', char);
-                                            if (debug) console.log(`${MODULE_NAME}: Reverted add_item by setting ${itemName} quantity to ${quantity} for ${charName}`);
-                                        }
-                                    }
-                                }
+                                // Simply add the negative amount
+                                const result = processToolCall('add_item', [params[0], params[1], -params[2]]);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted add_item by adding -${params[2]} ${params[1]} to ${params[0]}: ${result}`);
                                 break;
                                 
                             case 'remove_item':
-                                if (revertData.oldQuantity !== undefined) {
-                                    // Restore the item to its old quantity
-                                    const result = processToolCall('add_item', [params[0], params[1], revertData.oldQuantity]);
-                                    if (debug) console.log(`${MODULE_NAME}: Reverted remove_item by adding ${params[1]} x${revertData.oldQuantity} to ${params[0]}: ${result}`);
-                                }
+                                // Simply add back the removed amount
+                                const result2 = processToolCall('add_item', [params[0], params[1], params[2]]);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted remove_item by adding ${params[2]} ${params[1]} to ${params[0]}: ${result2}`);
                                 break;
                                 
                             case 'transfer_item':
-                                // Restore both characters to their old quantities
-                                if (revertData.fromOldQuantity !== undefined && revertData.toOldQuantity !== undefined) {
-                                    const fromChar = load('Character', String(params[0]).toLowerCase());
-                                    const toChar = load('Character', String(params[1]).toLowerCase());
-                                    const itemName = String(params[2]).toLowerCase().replace(/\s+/g, '_');
-                                    
-                                    if (fromChar && fromChar.inventory) {
-                                        if (!fromChar.inventory[itemName]) fromChar.inventory[itemName] = {};
-                                        fromChar.inventory[itemName].quantity = revertData.fromOldQuantity;
-                                        save('Character', fromChar);
-                                    }
-                                    
-                                    if (toChar && toChar.inventory) {
-                                        if (revertData.toOldQuantity === 0) {
-                                            delete toChar.inventory[itemName];
-                                        } else {
-                                            if (!toChar.inventory[itemName]) toChar.inventory[itemName] = {};
-                                            toChar.inventory[itemName].quantity = revertData.toOldQuantity;
-                                        }
-                                        save('Character', toChar);
-                                    }
-                                    
-                                    if (debug) console.log(`${MODULE_NAME}: Reverted transfer_item: restored ${itemName} quantities`);
-                                }
+                                // Transfer back in reverse (from receiver to giver)
+                                const transferResult = processToolCall('transfer_item', [params[1], params[0], params[2], params[3]]);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted transfer_item by transferring ${params[2]} x${params[3]} back from ${params[1]} to ${params[0]}: ${transferResult}`);
                                 break;
                                 
                             case 'deal_damage':
-                                if (revertData.oldHp !== undefined) {
-                                    const targetName = params[1];
-                                    const char = load('Character', String(targetName).toLowerCase());
-                                    if (char && char.stats && char.stats.hp) {
-                                        char.stats.hp.current = revertData.oldHp;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted deal_damage for ${targetName}, restored HP to ${revertData.oldHp}`);
-                                    }
-                                }
+                                // Heal for the damage amount
+                                const healResult = processToolCall('deal_damage', [params[0], params[1], -params[2]]);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted deal_damage by healing ${params[1]} for ${params[2]}: ${healResult}`);
                                 break;
                                 
                             case 'update_relationship':
-                                if (revertData.oldValue !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
-                                    if (char && char.relationships) {
-                                        const char2Name = String(params[1]).toLowerCase();
-                                        char.relationships[char2Name] = revertData.oldValue;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted relationship ${params[0]}->${params[1]} to ${revertData.oldValue}`);
-                                    }
-                                }
+                                // Apply negative change amount
+                                const relResult = processToolCall('update_relationship', [params[0], params[1], -params[2]]);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted update_relationship by applying -${params[2]}: ${relResult}`);
                                 break;
                                 
                             case 'add_levelxp':
-                                if (revertData.oldLevel !== undefined && revertData.oldXp !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
-                                    if (char && char.stats && char.stats.level) {
-                                        char.stats.level.value = revertData.oldLevel;
-                                        if (!char.stats.level.xp) char.stats.level.xp = {};
-                                        char.stats.level.xp.current = revertData.oldXp;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted level/XP for ${params[0]} to level ${revertData.oldLevel}, XP ${revertData.oldXp}`);
-                                    }
-                                }
+                                // Apply negative XP (will handle negative XP logic later)
+                                const xpResult = processToolCall('add_levelxp', [params[0], -params[1]]);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted add_levelxp by applying -${params[1]} XP: ${xpResult}`);
                                 break;
                                 
                             case 'add_skillxp':
-                                if (revertData.oldLevel !== undefined && revertData.oldXp !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
-                                    const skillName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                                    if (char && char.skills && char.skills[skillName]) {
-                                        char.skills[skillName].level = revertData.oldLevel;
-                                        if (!char.skills[skillName].xp) char.skills[skillName].xp = {};
-                                        char.skills[skillName].xp.current = revertData.oldXp;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted skill ${skillName} for ${params[0]} to level ${revertData.oldLevel}, XP ${revertData.oldXp}`);
-                                    }
-                                }
+                                // Apply negative skill XP (will handle negative XP logic later)
+                                const skillXpResult = processToolCall('add_skillxp', [params[0], params[1], -params[2]]);
+                                if (debug) console.log(`${MODULE_NAME}: Reverted add_skillxp by applying -${params[2]} XP to ${params[1]}: ${skillXpResult}`);
                                 break;
                                 
                             case 'unlock_newskill':
@@ -2148,10 +3813,11 @@ function GameState(hook, text) {
                             default:
                                 // Check if this is an update_[stat] tool
                                 if (tool.startsWith('update_') && revertData.statName && revertData.oldValue !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
+                                    const charName = String(params[0]).toLowerCase();
+                                    const char = get(charName);
                                     if (char && char.attributes && char.attributes[revertData.statName]) {
                                         char.attributes[revertData.statName].value = revertData.oldValue;
-                                        save('Character', char);
+                                        save(charName, char);
                                         if (debug) console.log(`${MODULE_NAME}: Reverted ${tool} for ${params[0]}, restored ${revertData.statName} to ${revertData.oldValue}`);
                                     }
                                 } else {
@@ -2380,16 +4046,15 @@ function GameState(hook, text) {
             data.position = historyLength - 1;
             RewindSystem.saveStorage(data);
             
-            if (debug) console.log(`${MODULE_NAME}: History check complete - ${data.entries.length} entries tracked`);
         }
     };
     
     
     function createEntityTrackerCards() {
         // Create entity tracker config
-        if (!Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker')) {
+        if (!Utilities.storyCard.get('[SANE:C] Entity Tracker')) {
             Utilities.storyCard.add({
-                title: '[SANE_CONFIG] Entity Tracker',
+                title: '[SANE:C] Entity Tracker',
                 type: 'data',
                 entry: (
                     `# entity_threshold\n` +
@@ -2411,11 +4076,10 @@ function GameState(hook, text) {
     // ==========================
     // RPG Schema Management
     // ==========================
-    // schemaCache already declared at top of file
     
     function calculateLevelXPRequirement(level) {
         // Get stats component for level progression formula
-        const statsComp = Utilities.storyCard.get('[SANE_COMP] stats');
+        const statsComp = Utilities.storyCard.get('[SANE:S] stats');
         if (statsComp && statsComp.description) {
             try {
                 const schema = JSON.parse(statsComp.description);
@@ -2442,7 +4106,7 @@ function GameState(hook, text) {
     
     function calculateMaxHP(level) {
         // Get stats component for HP progression
-        const statsComp = Utilities.storyCard.get('[SANE_COMP] stats');
+        const statsComp = Utilities.storyCard.get('[SANE:S] stats');
         if (statsComp && statsComp.description) {
             try {
                 const schema = JSON.parse(statsComp.description);
@@ -2461,7 +4125,7 @@ function GameState(hook, text) {
     
     function calculateSkillXPRequirement(skillName, level) {
         // Check skills component for formula
-        const skillsComp = Utilities.storyCard.get('[SANE_COMP] skills');
+        const skillsComp = Utilities.storyCard.get('[SANE:S] skills');
         if (skillsComp && skillsComp.description) {
             try {
                 const schema = JSON.parse(skillsComp.description);
@@ -2505,7 +4169,7 @@ function GameState(hook, text) {
     
     function getSkillRegistry() {
         // Get the list of valid skills from component schema
-        const skillsComp = Utilities.storyCard.get('[SANE_COMP] skills');
+        const skillsComp = Utilities.storyCard.get('[SANE:S] skills');
         if (skillsComp && skillsComp.description) {
             try {
                 const schema = JSON.parse(skillsComp.description);
@@ -2522,7 +4186,7 @@ function GameState(hook, text) {
     // ==========================
     function loadRelationshipThresholds() {
         // Load from relationships component schema
-        const relationshipSchema = Utilities.storyCard.get('[SANE_COMP] relationships');
+        const relationshipSchema = Utilities.storyCard.get('[SANE:S] relationships');
         if (!relationshipSchema || !relationshipSchema.description) {
             // No component = no relationship system
             if (debug) console.log(`${MODULE_NAME}: Relationships component not found - relationship system disabled`);
@@ -2546,13 +4210,18 @@ function GameState(hook, text) {
     function getRelationshipFlavor(value, fromName, toName) {
         const thresholds = loadRelationshipThresholds();
         
+        // Capitalize names for display
+        const capitalizeFirst = (str) => str ? str.charAt(0).toUpperCase() + str.slice(1).toLowerCase() : '';
+        const fromDisplay = capitalizeFirst(fromName);
+        const toDisplay = capitalizeFirst(toName);
+        
         // Find matching threshold
         for (const threshold of thresholds) {
             if (value >= threshold.min && value <= threshold.max) {
                 // Replace placeholders in flavor text if present
                 return threshold.flavor
-                    .replace(/\{from\}/g, fromName || '')
-                    .replace(/\{to\}/g, toName || '')
+                    .replace(/\{from\}/g, fromDisplay)
+                    .replace(/\{to\}/g, toDisplay)
                     .replace(/\{value\}/g, value);
             }
         }
@@ -2569,110 +4238,46 @@ function GameState(hook, text) {
         Calendar('api', null);
     }
 
+    // Initialize GenerationWizard API if available
     if (typeof GenerationWizard !== 'undefined' && typeof GenerationWizard === 'function') {
         GenerationWizard('api', null);
     }
-    
-    // ==========================
-    // Universal Format System
-    // ==========================
-    
-    const formatCaches = {}; // Cache for all object formats
-    
-    // Resolve object type aliases using schema definitions
-    function resolveObjectAlias(objectType) {
-        if (!objectType) return objectType;
-        
-        // Initialize schemas and alias map if needed
-        if (!schemaAliasMap) initializeSchemaRegistry();
-        
-        // Simple O(1) lookup in pre-built map
-        const lowerType = objectType.toLowerCase();
-        const resolved = schemaAliasMap[lowerType];
-        
-        // Return resolved name or original if not found
-        return resolved || objectType;
-    }
-    
-    // REMOVED loadObjectFormat - redundant with direct FORMAT card loading in saveEntityCard
-    
-    function parseFormatCard(card) {
-        const format = {
-            template: '',      // The template from description
-            fields: {},        // Field parsing patterns from entry (for reading existing cards)
-            computed: {},      // Computed field templates from entry (for building new cards)
-            formats: {}        // Format hints for how to display specific fields
-        };
-        
-        // Description IS the template
-        format.template = card.description || '';
-        
-        // Entry contains computed fields and format hints
-        // Two formats supported:
-        // 1. fieldname: template_expression (for computed fields like prefix, info_line)
-        // 2. format:fieldname: format_type (for display format hints)
-        if (card.entry) {
-            const lines = card.entry.split('\n');
-            
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
-                
-                // Parse field definition - find the first colon
-                const colonIdx = trimmed.indexOf(':');
-                if (colonIdx === -1) continue;
-                
-                const fieldName = trimmed.substring(0, colonIdx).trim();
-                const rest = trimmed.substring(colonIdx + 1).trim();
-                
-                // Check if this is a format hint
-                if (fieldName.startsWith('format:')) {
-                    // format:fieldname: format_type
-                    const actualField = fieldName.substring(7); // Remove 'format:'
-                    format.formats[actualField] = rest;
-                }
-                // Check if this looks like a template expression (contains { } or $())
-                else if ((rest.includes('{') && rest.includes('}')) || (rest.includes('$(') && rest.includes(')'))) {
-                    // This is a computed field template
-                    // Keep the original template as-is
-                    format.computed[fieldName] = rest;
-                } else {
-                    // Deprecated: regex patterns for parsing
-                    // We now use JSON data storage, so these patterns are no longer used
-                    // Skip storing them to avoid confusion
-                    if (debug) console.log(`${MODULE_NAME}: Skipping deprecated parsing pattern: ${fieldName}`);
-                }
-            }
-        }
-        
-        return format;
-    }
-    
     
     // ==========================
     // Entity Data Parsing
     // ==========================
     
     // Build structured data for DESCRIPTION field
-    function buildEntityData(entity) {
-        // Build clean entity with proper field order
+    function buildEntityData(entityId, entity) {
+        // Build unified data structure
+        // {
+        //   "EntityID": {
+        //     "aliases": [...],
+        //     "GameplayTags": [...],
+        //     "components": [...],
+        //     // component data with embedded display rules
+        //   }
+        // }
         const cleanEntity = {};
-        
+
         // Add primary fields first (in order)
-        if (entity.name) cleanEntity.name = entity.name;
         if (entity._type) cleanEntity.type = entity._type;
-        if (entity._subtype) cleanEntity.subtype = entity._subtype;  // e.g., 'Player' for PLAYER cards
+        if (entity._usedPrefix) cleanEntity.prefix = entity._usedPrefix;  // Store which prefix was used
+        if (entity._tags && entity._tags.length > 0) cleanEntity.tags = entity._tags;  // Store semantic tags
         if (entity.aliases) cleanEntity.aliases = entity.aliases;
-        
+
+        // Add id field to cleanEntity
+        if (entity.id) cleanEntity.id = entity.id;
+
         // Skip these fields entirely
-        const skipFields = ['name', '_type', '_subtype', 'aliases', '_cardTitle', '_isPlayer', '_title', 
-                           'info_line', 'attributes_formatted', 'skills_formatted', 
-                           'inventory_formatted', 'relationships_formatted'];
+        // Note: aliases is skipped here because it's manually added above for ordering
+        // The _* fields are internal tracking fields not meant for persistence
+        const skipFields = ['_type', '_usedPrefix', '_tags', 'aliases', '_cardTitle', '_title'];
         
         // Add all other fields
         for (const [key, value] of Object.entries(entity)) {
-            // Skip internal fields, already-added fields, and computed fields
-            if (skipFields.includes(key) || key.startsWith('_') || key.endsWith('_formatted')) continue;
+            // Skip internal fields and already-added fields
+            if (skipFields.includes(key) || key.startsWith('_')) continue;
             
             // Skip empty objects and null values
             if (value !== null && value !== undefined && 
@@ -2681,9 +4286,14 @@ function GameState(hook, text) {
             }
         }
         
+        // Wrap the entity data with its ID as the key
+        const wrappedData = {
+            [entityId]: cleanEntity
+        };
+
         // Build the JSON data with markers
-        let data = '<== REAL DATA ==>\n';
-        data += JSON.stringify(cleanEntity, null, 2);
+        let data = '<== SANE DATA ==>\n';
+        data += JSON.stringify(wrappedData, null, 2);
         data += '\n<== END DATA ==>';
         return data;
     }
@@ -2692,23 +4302,17 @@ function GameState(hook, text) {
     // Parse structured data from DESCRIPTION field
     function parseEntityData(description) {
         // Extract data between markers
-        const dataMatch = description.match(/<== REAL DATA ==>([\s\S]*?)<== END DATA ==>/);
+        let dataMatch = description.match(/<== SANE DATA ==>([\s\S]*?)<== END DATA ==>/);
         if (!dataMatch) {
-            console.log(`${MODULE_NAME}: WARNING - No data section found in card description`);
-            return {}; // No data section - return empty entity
+            console.log(`${MODULE_NAME}: ERROR - No data section found in card description`);
+            return null; // No data section - entity is invalid
         }
-        
+
         const dataSection = dataMatch[1].trim();
-        
+
         try {
             // Simply parse the entire JSON object
             const entity = JSON.parse(dataSection);
-            
-            // Convert 'type' back to '_type' for internal use
-            if (entity.type) {
-                entity._type = entity.type;
-                delete entity.type;
-            }
             
             return entity;
         } catch (e) {
@@ -2717,154 +4321,6 @@ function GameState(hook, text) {
             return {}; // Return empty entity if parsing fails
         }
     }
-    
-    // ==========================
-    // Display Card Building from Template
-    // ==========================
-    
-    function formatFieldValue(value, formatType) {
-        if (!value || !formatType) return value;
-        
-        switch(formatType.toLowerCase()) {
-            case 'braced':
-            case 'inventory':
-                // Always format inventory as bulleted list for consistency
-                if (typeof value === 'object') {
-                    const items = [];
-                    
-                    for (const [key, val] of Object.entries(value)) {
-                        const itemName = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                        
-                        if (typeof val === 'object') {
-                            const qty = val.quantity || 1;
-                            const props = [];
-                            if (val.equipped) props.push('equipped');
-                            if (val.enhancement) props.push(`+${val.enhancement}`);
-                            if (val.durability) props.push(`durability: ${val.durability}`);
-                            if (val.bound_to) props.push(`bound: ${val.bound_to}`);
-                            
-                            if (props.length > 0) {
-                                items.push(`• ${itemName} x${qty} (${props.join(', ')})`);
-                            } else {
-                                items.push(`• ${itemName} x${qty}`);
-                            }
-                        } else if (typeof val === 'number') {
-                            items.push(`• ${itemName} x${val}`);
-                        } else {
-                            items.push(`• ${itemName}: ${val}`);
-                        }
-                    }
-                    
-                    return items.join('\n');
-                }
-                return value;
-                
-            case 'json':
-                // Format as JSON
-                return JSON.stringify(value);
-                
-            case 'bullets':
-            case 'bulleted':
-                // Format as bulleted list
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        if (typeof val === 'object' && val.name) {
-                            items.push(`• ${val.name}: ${val.status || val.value || JSON.stringify(val)}`);
-                        } else {
-                            items.push(`• ${key}: ${val}`);
-                        }
-                    }
-                    return items.join('\n');
-                }
-                return value;
-                
-            case 'pipe':
-                // Format as pipe-delimited
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        if (typeof val === 'object' && val.name) {
-                            items.push(`${val.name}: ${val.status || val.value}`);
-                        } else {
-                            items.push(`${key}: ${val}`);
-                        }
-                    }
-                    return items.join(' | ');
-                }
-                return value;
-                
-            case 'multiline':
-                // Format as one per line
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        if (typeof val === 'object') {
-                            items.push(`${key}: ${JSON.stringify(val)}`);
-                        } else {
-                            items.push(`${key}: ${val}`);
-                        }
-                    }
-                    return items.join('\n');
-                }
-                return value;
-                
-            case 'comma':
-                // Format as comma-separated list
-                if (Array.isArray(value)) {
-                    return value.join(', ');
-                } else if (typeof value === 'object') {
-                    return Object.keys(value).join(', ');
-                }
-                return value;
-                
-            case 'skills_with_xp':
-                // Format skills with XP progress
-                if (typeof value === 'object') {
-                    const formatted = [];
-                    for (const [skillName, skillData] of Object.entries(value)) {
-                        // Format skill names nicely (one_handed_sword -> One Handed Sword)
-                        const displayName = skillName.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                        if (typeof skillData === 'object' && skillData.level) {
-                            const xp = skillData.xp || 0;
-                            const maxXp = skillData.max_xp || 100;
-                            formatted.push(`• ${displayName}: Level ${skillData.level} (${xp}/${maxXp} XP)`);
-                        } else {
-                            formatted.push(`• ${displayName}: ${JSON.stringify(skillData)}`);
-                        }
-                    }
-                    return formatted.join('\n');
-                }
-                return value;
-                
-            case 'inline_pipes':
-                // Format attributes as pipe-separated (VITALITY: 10 | STRENGTH: 10)
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        // Keep attributes uppercase
-                        const displayKey = key.toUpperCase();
-                        items.push(`${displayKey}: ${val}`);
-                    }
-                    return items.join(' | ');
-                }
-                return value;
-                
-            default:
-                return value;
-        }
-    }
-    
-    function buildDisplayCard(data, template, cardTitle) {
-        // The template IS the description field - just parse it directly
-        // Debug logging removed for cleaner output
-        
-        const parser = new TemplateParser(data);
-        return parser.parse(template);
-    }
-    
-    // Process the ENTRY field to extract and evaluate computed fields
-    // The DESCRIPTION field IS the template, used directly by buildDisplayCard
     
     // Template Parser Class
     class TemplateParser {
@@ -2896,7 +4352,7 @@ function GameState(hook, text) {
             while (this.pos < this.template.length) {
                 const char = this.template[this.pos];
                 
-                // Handle $() syntax ONLY at the top level, not inside {}
+                // Handle $() dynamic resolution syntax
                 if (char === '$' && this.pos + 1 < this.template.length && this.template[this.pos + 1] === '(') {
                     const dollarResult = this.parseDollarExpression();
                     if (dollarResult !== null) {
@@ -3031,7 +4487,7 @@ function GameState(hook, text) {
         
         // Process a loop expression
         processLoop(objectPath, template) {
-            const obj = getNestedValue(this.data, objectPath);
+            const obj = getNestedField(this.data, objectPath);
             if (!obj || typeof obj !== 'object') return '';
             
             // Check for pipe delimiter at start of template
@@ -3061,6 +4517,53 @@ function GameState(hook, text) {
                     return key.charAt(0).toUpperCase() + key.slice(1);
                 });
                 
+                // Handle function calls with *. arguments FIRST
+                processed = processed.replace(/\{(\w+)\(([^)]*)\)\}/g, (m, funcName, argsStr) => {
+                    // Parse and resolve arguments that use *.
+                    const args = argsStr ? argsStr.split(',').map(arg => {
+                        arg = arg.trim();
+                        
+                        // Handle *.value or other *. references
+                        if (arg.startsWith('*.')) {
+                            const prop = arg.slice(2);
+                            if (prop === '') {
+                                return value;
+                            }
+                            return getNestedField(value, prop);
+                        }
+                        
+                        // Handle * (just the key)
+                        if (arg === '*') {
+                            return key;
+                        }
+                        
+                        // Handle field references from data
+                        if (arg && !arg.startsWith('"') && !arg.startsWith("'") && isNaN(arg)) {
+                            return getNestedField(loopData, arg);
+                        }
+                        
+                        // Handle string literals
+                        if ((arg.startsWith('"') && arg.endsWith('"')) || 
+                            (arg.startsWith("'") && arg.endsWith("'"))) {
+                            return arg.slice(1, -1);
+                        }
+                        
+                        // Handle numbers
+                        if (!isNaN(arg)) {
+                            return Number(arg);
+                        }
+                        
+                        return arg;
+                    }) : [];
+                    
+                    // Call the function
+                    if (funcName === 'getRelationshipFlavor' && typeof getRelationshipFlavor === 'function') {
+                        return getRelationshipFlavor(...args);
+                    }
+                    
+                    return m; // Return unchanged if function not found
+                });
+                
                 // Replace {*.prop} with value properties
                 processed = processed.replace(/\{\*\.([^}]*)\}/g, (m, prop) => {
                     // Special case: {*.} means the value itself
@@ -3082,15 +4585,15 @@ function GameState(hook, text) {
                     }
                     
                     // For other properties, use normal nested access
-                    const propValue = getNestedValue(value, prop);
+                    const propValue = getNestedField(value, prop);
                     return propValue !== undefined ? String(propValue) : '';
                 });
                 
                 // Handle nested conditionals within the loop
                 processed = processed.replace(/\{([^?}]+)\?([^}]*)\}/g, (m, condition, condContent) => {
                     const condValue = condition.startsWith('*.') 
-                        ? getNestedValue(value, condition.slice(2))
-                        : getNestedValue(this.data, condition);
+                        ? getNestedField(value, condition.slice(2))
+                        : getNestedField(this.data, condition);
                     return this.isTruthy(condValue) ? condContent : '';
                 });
                 
@@ -3109,7 +4612,7 @@ function GameState(hook, text) {
         
         // Process a conditional expression
         processConditional(fieldPath, content) {
-            const value = getNestedValue(this.data, fieldPath.trim());
+            const value = getNestedField(this.data, fieldPath.trim());
             const truthy = this.isTruthy(value);
             
             
@@ -3161,11 +4664,47 @@ function GameState(hook, text) {
         
         // Process a simple field reference
         processField(fieldPath) {
+            // Handle function calls like getRelationshipFlavor(value, from, to)
+            if (fieldPath.includes('(') && fieldPath.includes(')')) {
+                const funcMatch = fieldPath.match(/^(\w+)\((.*)\)$/);
+                if (funcMatch) {
+                    const funcName = funcMatch[1];
+                    const argsStr = funcMatch[2];
+                    
+                    // Parse arguments (simple comma split for now)
+                    const args = argsStr ? argsStr.split(',').map(arg => {
+                        arg = arg.trim();
+                        // If arg is a field path, resolve it
+                        if (arg && !arg.startsWith('"') && !arg.startsWith("'") && isNaN(arg)) {
+                            return getNestedField(this.data, arg);
+                        }
+                        // If it's a string literal, remove quotes
+                        if ((arg.startsWith('"') && arg.endsWith('"')) || 
+                            (arg.startsWith("'") && arg.endsWith("'"))) {
+                            return arg.slice(1, -1);
+                        }
+                        // If it's a number, parse it
+                        if (!isNaN(arg)) {
+                            return Number(arg);
+                        }
+                        return arg;
+                    }) : [];
+                    
+                    // Call the function if it exists
+                    if (funcName === 'getRelationshipFlavor' && typeof getRelationshipFlavor === 'function') {
+                        return getRelationshipFlavor(...args);
+                    }
+                    // Add more functions here as needed
+                    
+                    return ''; // Unknown function
+                }
+            }
+            
             // Handle nested resolution like {character.{name}.location}
             if (fieldPath.includes('{') && fieldPath.includes('}')) {
                 const innerPattern = /\{([^}]+)\}/;
                 const resolved = fieldPath.replace(innerPattern, (m, innerField) => {
-                    const innerValue = getNestedValue(this.data, innerField);
+                    const innerValue = getNestedField(this.data, innerField);
                     return innerValue || '';
                 });
                 
@@ -3173,48 +4712,19 @@ function GameState(hook, text) {
                 // Check if it's an entity reference (character.Name, Location.Name, etc.)
                 const parts = resolved.split('.');
                 if (parts.length >= 2) {
-                    // Initialize schema registry if needed
-                    if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-                    
-                    // Check if first part might be an entity type
-                    const possibleType = parts[0];
-                    const capitalizedType = possibleType.charAt(0).toUpperCase() + possibleType.slice(1).toLowerCase();
-                    
-                    // Check if this is a valid entity type in the schema registry
-                    if (schemaRegistry[capitalizedType]) {
-                        const entityName = parts[1];
-                        const field = parts.slice(2).join('.');
-                        const entity = load(capitalizedType, entityName);
-                        if (entity) {
-                            return field ? getNestedValue(entity, field) || '' : JSON.stringify(entity);
-                        }
-                    }
-                }
-                return getNestedValue(this.data, resolved) || '';
-            }
-            
-            // Handle direct entity references (character.Name.field, Location.Name.field, etc.)
-            const parts = fieldPath.split('.');
-            if (parts.length >= 2) {
-                // Initialize schema registry if needed
-                if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-                
-                const possibleType = parts[0];
-                const capitalizedType = possibleType.charAt(0).toUpperCase() + possibleType.slice(1).toLowerCase();
-                
-                // Check if this is a valid entity type in the schema registry
-                if (schemaRegistry[capitalizedType]) {
-                    const entityName = parts[1];
-                    const field = parts.slice(2).join('.');
-                    const entity = load(capitalizedType, entityName);
+                    // Try to load as entity.field path
+                    const entityName = parts[0];
+                    const field = parts.slice(1).join('.');
+                    const entity = get(entityName);
                     if (entity) {
-                        return field ? getNestedValue(entity, field) || '' : JSON.stringify(entity);
+                        return field ? getNestedField(entity, field) || '' : JSON.stringify(entity);
                     }
                 }
+                return getNestedField(this.data, resolved) || '';
             }
             
             // Simple field reference
-            const value = getNestedValue(this.data, fieldPath);
+            const value = getNestedField(this.data, fieldPath);
             
             // Debug logging removed
             
@@ -3240,219 +4750,8 @@ function GameState(hook, text) {
     }
     
     // ==========================
-    // Universal Entity Saving
-    // ==========================
-    
-    function saveEntityCard(entity, objectType) {
-        // Normalize object type
-        objectType = resolveObjectAlias(objectType || entity._type);
-        
-        // Get schema for prefixes
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[objectType];
-        if (!schema || !schema.prefixes || schema.prefixes.length === 0) {
-            if (debug) console.log(`${MODULE_NAME}: No schema found for ${objectType}`);
-            return false;
-        }
-        
-        // Check if this entity type is data-only (no display cards)
-        if (schema.dataOnly) {
-            // This entity type doesn't use display cards
-            if (debug) console.log(`${MODULE_NAME}: ${objectType} is data-only, no display card needed`);
-            return true; // Successfully "saved" (no display card needed)
-        }
-        
-        // Determine card title - check for existing card first
-        let title = null;
-        let prefix = null;
-        
-        // Check all possible prefixes for an existing card
-        for (const checkPrefix of schema.prefixes) {
-            const checkTitle = `[${checkPrefix}] ${entity.name}`;
-            if (Utilities.storyCard.get(checkTitle)) {
-                prefix = checkPrefix;
-                title = checkTitle;
-                break;
-            }
-        }
-        
-        // If no existing card, we should NOT create one automatically for PLAYER prefix
-        // PLAYER cards are only created manually by users
-        if (!title) {
-            // Use the first non-PLAYER prefix, or just the first prefix if that's all we have
-            prefix = schema.prefixes.find(p => p !== 'PLAYER') || schema.prefixes[0];
-            title = `[${prefix}] ${entity.name}`;
-        }
-        
-        // Set subtype based on the prefix we're using
-        if (prefix === 'PLAYER') {
-            entity._subtype = 'Player';
-        } else if (prefix !== schema.prefixes[0]) {
-            // If using a non-default prefix, store it as subtype
-            entity._subtype = prefix.charAt(0).toUpperCase() + prefix.slice(1).toLowerCase();
-        }
-        
-        
-        // Load FORMAT card - try prefix-specific first, then fall back to type
-        let formatCard = Utilities.storyCard.get(`[SANE_FORMAT] ${prefix}`);
-        if (!formatCard) {
-            // Try object type as fallback
-            formatCard = Utilities.storyCard.get(`[SANE_FORMAT] ${objectType}`);
-            if (!formatCard) {
-                // No FORMAT card - cannot save display card
-                if (debug) console.log(`${MODULE_NAME}: No FORMAT card for ${prefix} or ${objectType} - cannot save display card`);
-                return false;
-            }
-        }
-        
-        // Parse FORMAT card
-        const formatConfig = parseFormatCard(formatCard);
-        
-        // Always rebuild - no surgical updates in new system
-        const existingCard = Utilities.storyCard.get(title);
-        
-        // Start with entity data
-        const mergedData = { ...entity };
-        
-        // Ensure name is set
-        mergedData.name = entity.name;
-        
-        // Apply format hints to data fields before computing
-        if (formatConfig.formats && Object.keys(formatConfig.formats).length > 0) {
-            if (debug) {
-                console.log(`${MODULE_NAME}: Applying ${Object.keys(formatConfig.formats).length} format hints`);
-                console.log(`${MODULE_NAME}: Format config entries:`, Object.entries(formatConfig.formats));
-                console.log(`${MODULE_NAME}: MergedData keys:`, Object.keys(mergedData));
-            }
-            for (const [fieldPath, formatType] of Object.entries(formatConfig.formats)) {
-                const value = getNestedField(mergedData, fieldPath);
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Looking for field '${fieldPath}', found:`, value !== undefined ? 'YES' : 'NO');
-                    if (value !== undefined) {
-                        console.log(`${MODULE_NAME}: Field value:`, JSON.stringify(value));
-                    }
-                }
-                if (value !== undefined) {
-                    const formatted = formatFieldValue(value, formatType);
-                    setNestedField(mergedData, fieldPath + '_formatted', formatted);
-                    if (debug) {
-                        const preview = typeof formatted === 'string' ? formatted.substring(0, 50) : JSON.stringify(formatted);
-                        console.log(`${MODULE_NAME}: Formatted ${fieldPath} as ${formatType}: ${preview}...`);
-                    }
-                } else {
-                    if (debug) console.log(`${MODULE_NAME}: Field '${fieldPath}' not found in entity data`);
-                }
-            }
-        }
-        
-        // Compute fields from ENTRY before building display
-        if (formatConfig.computed && Object.keys(formatConfig.computed).length > 0) {
-            for (const [fieldName, templateExpr] of Object.entries(formatConfig.computed)) {
-                // Evaluate the template expression with current data
-                const parser = new TemplateParser(mergedData);
-                const computedValue = parser.parse(templateExpr);
-                // Add computed field to data
-                mergedData[fieldName] = computedValue;
-            }
-        }
-        
-        
-        // Build new display card from template
-        const newCardContent = buildDisplayCard(mergedData, formatConfig.template, title);
-        
-        // Build structured data for DESCRIPTION field
-        const structuredData = buildEntityData(mergedData);
-        
-        // Generate keys for character cards
-        let keys = null;
-        if (objectType === 'Character') {
-            // Format: " name,(name, trigger_name,(trigger_name" for characters
-            // Space before names WITHOUT parenthesis, no space before names WITH parenthesis
-            const name = entity.name || '';
-            const triggerName = entity.info?.trigger_name || '';
-            if (triggerName && triggerName.toLowerCase() !== name.toLowerCase()) {
-                keys = ` ${name.toLowerCase()},(${name.toLowerCase()}, ${triggerName.toLowerCase()},(${triggerName.toLowerCase()}`;
-            } else {
-                keys = ` ${name.toLowerCase()},(${name.toLowerCase()}`;
-            }
-        } else if (objectType === 'Location') {
-            // Format: "Snake_Case, Normal Case" for locations
-            const snakeCased = entity.name.replace(/\s+/g, '_');
-            const normalCased = entity.name.replace(/_/g, ' ');
-            keys = `${snakeCased}, ${normalCased}`;
-        }
-        
-        // Save or update the card
-        if (existingCard) {
-            // Preserve existing description content outside data markers
-            let updatedDescription = existingCard.description || '';
-            
-            // Check if there's existing data section to replace
-            if (updatedDescription.includes('<== REAL DATA ==>')) {
-                // Replace just the data section
-                updatedDescription = updatedDescription.replace(
-                    /<== REAL DATA ==>([\s\S]*?)<== END DATA ==>/,
-                    structuredData
-                );
-            } else {
-                // No data section yet - append it
-                if (updatedDescription && !updatedDescription.endsWith('\n')) {
-                    updatedDescription += '\n';
-                }
-                updatedDescription += structuredData;
-            }
-            
-            const updateData = { 
-                entry: newCardContent.trim(),
-                description: updatedDescription
-            };
-            if (keys) updateData.keys = keys;
-            
-            Utilities.storyCard.update(title, updateData);
-        } else {
-            const cardData = {
-                title: title,
-                type: 'data',
-                entry: newCardContent.trim(),
-                description: structuredData
-            };
-            if (keys) cardData.keys = keys;
-            
-            Utilities.storyCard.add(cardData);
-        }
-        
-        // Update the entity card map
-        if (!entityCardMap) entityCardMap = {};
-        if (!entityCardMap[objectType]) entityCardMap[objectType] = {};
-        entityCardMap[objectType][entity.name.toLowerCase()] = title;
-        
-        if (debug) console.log(`${MODULE_NAME}: Saved ${objectType} display card for ${entity.name}`);
-        return true;
-    }
-    
-    // ==========================
     // Inventory Management
     // ==========================
-    
-    function normalizeInventory(inventory) {
-        // Convert old format to new format if needed
-        // Old: { "sword": 1, "potion": 3 }
-        // New: { "sword": { "quantity": 1 }, "potion": { "quantity": 3 } }
-        
-        if (!inventory || typeof inventory !== 'object') return {};
-        
-        const normalized = {};
-        for (const [item, value] of Object.entries(inventory)) {
-            if (typeof value === 'number') {
-                // Old format - convert to new
-                normalized[item] = { quantity: value };
-            } else if (typeof value === 'object' && value !== null) {
-                // Already new format
-                normalized[item] = value;
-            }
-        }
-        return normalized;
-    }
     
     function getItemQuantity(inventory, itemName) {
         if (!inventory || !inventory[itemName]) return 0;
@@ -3477,234 +4776,85 @@ function GameState(hook, text) {
     }
     
     // ==========================
-    // Character Field Accessors
-    // ==========================
-    
-    // Simple wrappers for component-based field access
-    function getCharacterField(character, fieldPath) {
-        if (!character || !fieldPath) return null;
-        return getNestedField(character, fieldPath);
-    }
-    
-    function setCharacterField(character, fieldPath, value) {
-        if (!character || !fieldPath) return false;
-        setNestedField(character, fieldPath, value);
-        return true;
-    }
-    
-    
-    // ==========================
-    // Faction Helper Functions
-    // ==========================
-    function getFactionMembers(factionName) {
-        const faction = load('Faction', factionName);
-        return faction?.members || [];
-    }
-    
-    function getCharacterFaction(characterName) {
-        // Search all factions for this character
-        const factions = loadAll('Faction');
-        for (const [name, faction] of Object.entries(factions || {})) {
-            if (faction.members && faction.members.includes(characterName)) {
-                return name;
-            }
-        }
-        return null;
-    }
-    
-    function getFactionRelations(factionName) {
-        const faction = load('Faction', factionName);
-        if (!faction) return { allies: [], enemies: [] };
-        return {
-            allies: faction.allied_factions || faction.allies || [],
-            enemies: faction.enemy_factions || faction.enemies || []
-        };
-    }
-
-    
-    // ==========================
     // Unified Entity Creation System
     // ==========================
-    
-    // Initialize entity with default component values
-    function initializeEntityComponents(entityType, data = {}) {
-        // Initialize schema registry if needed
-        if (!schemaRegistry) {
-            initializeSchemaRegistry();
-        }
-        
-        const schema = schemaRegistry[entityType];
-        if (!schema) return null;
-        
-        const entity = {
-            name: data.name || 'Unknown',
-            type: entityType
-        };
-        
-        // Initialize each component
-        if (schema.components && schemaRegistry._components) {
-            for (const compName of schema.components) {
-                const compSchema = schemaRegistry._components[compName];
-                if (!compSchema) continue;
-                
-                // Initialize component with defaults
-                entity[compName] = {};
-                
-                // Apply defaults from component schema
-                if (compSchema.defaults) {
-                    entity[compName] = JSON.parse(JSON.stringify(compSchema.defaults));
-                }
-                
-                // Apply data for this component if provided
-                if (data[compName]) {
-                    // Deep merge data into component
-                    entity[compName] = mergeDeep(entity[compName], data[compName]);
-                }
-            }
-        }
-        
-        // Don't apply root-level data that should be in components
-        // Only apply special fields like _triggerName
-        for (const [key, value] of Object.entries(data)) {
-            if (key.startsWith('_') && !entity[key]) {
-                entity[key] = value;
-            }
-        }
-        
-        return entity;
-    }
-    
-    // Deep merge helper
-    function mergeDeep(target, source) {
-        if (!source) return target;
-        if (!target) return source;
-        
-        // If target is not an object, just return source
-        if (typeof target !== 'object' || Array.isArray(target)) {
-            return source;
-        }
-        
-        // If source is not an object, just return it
-        if (typeof source !== 'object' || Array.isArray(source)) {
-            return source;
-        }
-        
-        const output = Object.assign({}, target);
-        
-        for (const key in source) {
-            if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
-                if (target[key] && typeof target[key] === 'object' && !Array.isArray(target[key])) {
-                    output[key] = mergeDeep(target[key], source[key]);
-                } else {
-                    output[key] = source[key];
-                }
-            } else {
-                output[key] = source[key];
-            }
-        }
-        
-        return output;
-    }
-    
     /**
      * Create any entity type with initial data
      * @param {string} entityType - Type of entity (Character, Location, Item, Faction, etc.)
      * @param {object} data - Initial data for the entity (can use flat, component, or dot notation)
      * @returns {object|null} The created entity or null if failed
      */
-    function create(entityType, data = {}) {
-        // Normalize entity type
-        entityType = String(entityType).charAt(0).toUpperCase() + String(entityType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Initialize entity with components
-        const entity = initializeEntityComponents(singularType, data);
-        if (!entity) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to initialize entity of type ${singularType}`);
+    function create(data = {}) {
+        // Get entity ID from data.id or generate one, then normalize case
+        let entityId = data.id || `Entity_${Date.now()}`;
+        entityId = normalizeEntityId(entityId);
+
+        // Check if entity already exists (case-insensitive)
+        const existingEntity = get(entityId);
+        if (existingEntity) {
+            if (debug) console.log(`${MODULE_NAME}: create(): Entity "${entityId}" already exists, returning existing entity`);
+            return existingEntity;
+        }
+
+        // Determine blueprint type from GameplayTags
+        const entityType = data.GameplayTags?.[0]?.split('.')[0] || 'Character';
+
+        // Load blueprint for this entity type
+        const blueprint = loadBlueprint(entityType);
+        if (!blueprint) {
+            console.log(`${MODULE_NAME}: No blueprint found for entity type ${entityType}`);
             return null;
         }
-        
-        // Apply entity-specific initialization
-        switch (singularType) {
-            case 'Character':
-                // Ensure info component exists
-                if (!entity.info) entity.info = {};
-                
-                // Set isPlayer flag if provided
-                const isPlayer = data.isPlayer || data['info.isPlayer'] || false;
-                entity.info.isPlayer = isPlayer;
-                
-                // Merge info component fields for backward compatibility
-                const infoFields = ['full_name', 'gender', 'race', 'class', 'appearance', 'personality', 'background', 'goals'];
-                for (const field of infoFields) {
-                    // Check both root level (backward compat) and info.field
-                    if (data[field] !== undefined) {
-                        entity.info[field] = data[field];
-                    } else if (data[`info.${field}`] !== undefined) {
-                        entity.info[field] = data[`info.${field}`];
-                    }
-                }
-                break;
-                
-            case 'Location':
-                // Location-specific initialization
-                if (!entity.info) entity.info = {};
-                
-                // Handle location type
-                if (data.type !== undefined) {
-                    entity.info.type = data.type;
-                } else if (data['info.type'] !== undefined) {
-                    entity.info.type = data['info.type'];
-                }
-                break;
-                
-            case 'Item':
-                // Item-specific initialization
-                if (!entity.info) entity.info = {};
-                
-                // Handle item type and properties
-                const itemFields = ['type', 'rarity', 'damage', 'defense', 'value'];
-                for (const field of itemFields) {
-                    if (data[field] !== undefined) {
-                        entity.info[field] = data[field];
-                    } else if (data[`info.${field}`] !== undefined) {
-                        entity.info[field] = data[`info.${field}`];
-                    }
-                }
-                break;
-                
-            case 'Faction':
-                // Faction-specific initialization
-                if (!entity.info) entity.info = {};
-                
-                // Handle faction properties
-                const factionFields = ['leader', 'type', 'alignment', 'headquarters'];
-                for (const field of factionFields) {
-                    if (data[field] !== undefined) {
-                        entity.info[field] = data[field];
-                    } else if (data[`info.${field}`] !== undefined) {
-                        entity.info[field] = data[`info.${field}`];
-                    }
-                }
-                break;
+
+        // Deep copy the blueprint to create the entity
+        const entity = JSON.parse(JSON.stringify(blueprint));
+
+        // Override with provided data
+        for (const [key, value] of Object.entries(data)) {
+            if (key.includes('.')) {
+                // Handle dot notation (e.g., "info.gender" or "stats.hp.current")
+                setNestedField(entity, key, value);
+            } else {
+                // Direct field assignment
+                entity[key] = value;
+            }
         }
-        
+
+        // Set the entity ID
+        entity.id = entityId;
+
+        // Validate aliases don't conflict with existing entities
+        if (entity.aliases && Array.isArray(entity.aliases)) {
+            for (const alias of entity.aliases) {
+                if (alias === entityId) continue; // Skip ID duplicates (will be cleaned up in save)
+
+                if (entityAliasMap[alias] && entityAliasMap[alias] !== entityId) {
+                    const owningEntity = entityAliasMap[alias];
+                    console.log(`${MODULE_NAME}: create(): ERROR - Alias "${alias}" is already used by entity "${owningEntity}"`);
+                    return null;
+                }
+            }
+        }
+
         // Save the entity using universal system
-        if (save(singularType, entity)) {
-            // Clear cached version of this entity
-            delete entityCache[`${singularType}.${entity.name}`];
-            
-            if (debug) console.log(`${MODULE_NAME}: Created ${singularType} '${entity.name}' with components`);
+        if (save(entityId, entity)) {
+            // Add to cache for immediate access (using normalized ID)
+            dataCache[entityId] = entity;
+
+            // Update entityAliasMap for new entity (case-insensitive)
+            entityAliasMap[entityId] = entityId; // Already normalized, no need to toLowerCase again
+            if (entity.aliases && Array.isArray(entity.aliases)) {
+                for (const alias of entity.aliases) {
+                    entityAliasMap[normalizeEntityId(alias)] = entityId;
+                }
+            }
+
+            if (debug) console.log(`${MODULE_NAME}: Created entity '${entityId}' from blueprint ${entityType}`);
             return entity;
         }
-        
-        if (debug) console.log(`${MODULE_NAME}: Failed to save ${singularType} '${entity.name}'`);
+
+        if (debug) console.log(`${MODULE_NAME}: Failed to save entity '${entityId}'`);
         return null;
-    }
-    
-    function createCharacter(characterData) {
-        // Redirect to unified create function
-        return create('Character', characterData);
     }
     
     // ==========================
@@ -3715,7 +4865,8 @@ function GameState(hook, text) {
         
         // Handle /GW abort command
         if (command === '/gw abort' || command === '/gw cancel') {
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
+            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
+            if (typeof GenerationWizard !== 'undefined' && gwActive) {
                 GenerationWizard.cancelGeneration();
                 if (debug) console.log(`${MODULE_NAME}: Generation aborted by player`);
                 // Show message to player but hide from LLM
@@ -3842,22 +4993,8 @@ function GameState(hook, text) {
         return current;
     }
     
-    // Helper to find first [PLAYER] card
-    function loadFirstPlayer() {
-        const playerCard = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[PLAYER]')
-        );
-        
-        if (!playerCard) return null;
-        
-        const nameMatch = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-        if (!nameMatch) return null;
-        
-        return loadCharacter(nameMatch[1]);
-    }
-    
     // New flexible getter system with $() syntax
-    function processFlexibleGetters(text) {
+    function processGetters(text) {
         if (!text) return text;
         
         let recursionDepth = 0;
@@ -3869,15 +5006,14 @@ function GameState(hook, text) {
                 return str;
             }
             
-            // First, resolve any $() expressions
+            // First, resolve any $() dynamic expressions
             str = str.replace(/\$\(([^)]+)\)/g, (match, expr) => {
-                // Resolve the inner expression as a getter
                 const resolved = resolveGetters(`get[${expr}]`);
-                // Extract just the value (remove get[] wrapper if present)
                 return resolved.replace(/^get\[|\]$/g, '');
             });
-            
-            // Pattern: get[type.key] or get[key] followed by optional .path.to.field
+
+            // Process get[entity.field] syntax in text output
+            // Supports: get[Kirito.stats.level], get[Global.frontline], get[entity.array[0]]
             const FLEX_GETTER = /get\[([^\]]+)\](?:\.([\w\d_.\[\]]+))?/g;
             
             return str.replace(FLEX_GETTER, (match, selector, pathAfterBracket) => {
@@ -3886,61 +5022,50 @@ function GameState(hook, text) {
                 let entity = null;
                 let fieldPath = null;
                 
-                // Determine the type and entity name
-                if (parts[0] === 'character' || parts[0] === 'char') {
-                    // For character.NAME.FIELD or character.NAME
-                    // Try loading with just the name first
-                    entity = loadCharacter(parts[1]);
-                    // If there are more parts, they're the field path
-                    if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
-                    }
-                } else if (parts[0] === 'location' || parts[0] === 'loc') {
-                    // For location.NAME.FIELD or location.NAME
-                    // Use universal load function instead of quick cache
-                    entity = load('Location', parts[1]);
-                    if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
-                    }
-                } else if (parts[0] === 'faction') {
-                    // For faction.NAME.FIELD or faction.NAME
-                    // Use universal load function instead of quick cache
-                    entity = load('Faction', parts[1]);
-                    if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
-                    }
-                } else if (parts[0] === 'player') {
-                    // Special case: player.FIELD or just player
-                    entity = loadFirstPlayer();
+
+                if (parts[0].toLowerCase() === 'global' || parts[0] === 'var') {
+                    // Access global variables: Global.VAR_NAME or var.VAR_NAME
+                    // Global variables are all stored together, so get all and navigate
+                    entity = loadGlobalVariables();
                     if (parts.length > 1) {
                         fieldPath = parts.slice(1).join('.');
                     }
-                } else if (parts[0] === 'global' || parts[0] === 'var') {
-                    // Access global variables: runtime.VAR_NAME or runtime.VAR_NAME.FIELD
-                    const varName = parts[1];
-                    entity = getGlobalValue(varName);
+                } else if (parts[0] === 'time' || parts[0] === 'calendar') {
+                    // Access time/calendar data: time.current, time.formatted, etc.
+                    const timeField = parts[1];
+                    switch(timeField) {
+                        case 'current':
+                        case 'now':
+                            entity = getCurrentTime() || '???';
+                            break;
+                        case 'formatted':
+                            entity = getFormattedTime() || '???';
+                            break;
+                        case 'day':
+                        case 'daynumber':
+                            entity = getDayNumber() || '???';
+                            break;
+                        case 'date':
+                            entity = getCurrentDate() || '???';
+                            break;
+                        case 'formatteddate':
+                            entity = getFormattedDate() || '???';
+                            break;
+                        case 'timeofday':
+                            entity = getTimeOfDay() || '???';
+                            break;
+                        case 'season':
+                            entity = getSeason() || '???';
+                            break;
+                        default:
+                            entity = getCurrentTime() || '???';
+                    }
+                    // Time values are already strings, no need for field navigation
                     if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
+                        // Ignore additional fields for time
+                        console.log(`${MODULE_NAME}: Time getter doesn't support nested fields: ${parts.slice(2).join('.')}`);
                     }
-                } else {
-                    // Auto-detect type by trying each loader
-                    const name = parts[0];
-                    entity = loadCharacter(name);
-                    
-                    if (!entity) {
-                        // Try loading as location
-                        entity = load('Location', name);
-                    }
-                    
-                    if (!entity) {
-                        // Try loading as faction
-                        entity = load('Faction', name);
-                    }
-                    
-                    // If there are more parts, they're the field path
-                    if (parts.length > 1) {
-                        fieldPath = parts.slice(1).join('.');
-                    }
+                    return String(entity);
                 }
                 
                 // Combine internal field path with any path after the bracket
@@ -3971,206 +5096,6 @@ function GameState(hook, text) {
         }
         
         return resolveGetters(text);
-    }
-    
-    function processGetters(text) {
-        if (!text) return text;
-        
-        // First try the new flexible getter system
-        text = processFlexibleGetters(text);
-        
-        // Then handle legacy function-style getters for Calendar API only
-        return text.replace(FUNCTION_GETTER_PATTERN, function(match) {
-            // Parse the function getter: get_something(parameters)
-            const innerMatch = match.match(/get_([a-z_]+)\s*\(([^)]*)\)/i);
-            if (!innerMatch) return match;
-            
-            const getterType = innerMatch[1];
-            const paramString = innerMatch[2];
-            const params = parseParameters(paramString);
-            
-            // Process different getter types
-            switch(getterType) {
-                // Character getters - redirect to flexible getter system
-                case 'location':
-                case 'hp':
-                case 'level':
-                case 'xp':
-                case 'name':
-                case 'attribute':
-                case 'skill':
-                case 'inventory':
-                case 'stat':
-                    // These should use get[character.NAME.field] syntax instead
-                    // But keep for backward compatibility
-                    let charName = params[0];
-                    if (!charName) return match;
-                    
-                    // Special case: resolve "player" to actual player name
-                    if (charName.toLowerCase() === 'player') {
-                        // Find the first [PLAYER] card
-                        const playerCard = Utilities.storyCard.find(card => {
-                            return card.title && card.title.startsWith('[PLAYER]');
-                        }, false);
-                        
-                        if (playerCard) {
-                            const titleMatch = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-                            if (titleMatch) {
-                                charName = titleMatch[1].trim();
-                            }
-                        }
-                    }
-                    
-                    // Convert to new syntax and process
-                    let newGetter;
-                    if (getterType === 'attribute' || getterType === 'skill') {
-                        newGetter = `get[character.${charName}.${getterType}s.${params[1]}]`;
-                    } else if (getterType === 'stat') {
-                        newGetter = `get[character.${charName}.stats.${params[1]}]`;
-                    } else {
-                        // Map to component paths
-                        const fieldMap = {
-                            'location': 'info.location',
-                            'hp': 'stats.hp',
-                            'level': 'stats.level', 
-                            'xp': 'stats.xp',
-                            'name': 'name',
-                            'inventory': 'inventory'
-                        };
-                        newGetter = `get[character.${charName}.${fieldMap[getterType]}]`;
-                    }
-                    return processFlexibleGetters(newGetter);
-                    
-                // Time getters (Calendar API) - keep these as they interface with Calendar module
-                case 'time':
-                case 'currenttime':
-                    return getCurrentTime() || '00:00';
-                    
-                case 'formattedtime':
-                    return getFormattedTime() || '12:00 AM';
-                    
-                case 'timeofday':
-                    return getTimeOfDay() || 'Unknown';
-                    
-                case 'date':
-                case 'currentdate':
-                    return getCurrentDate() || 'Unknown Date';
-                    
-                case 'formatteddate':
-                    return getFormattedDate() || 'Unknown';
-                    
-                case 'daynumber':
-                    return getDayNumber() || '0';
-                    
-                case 'season':
-                    return getSeason() || 'Unknown';
-                    
-                default:
-                    // For any unknown getter, try to resolve it as a runtime variable
-                    // This allows custom getters defined in [SANE_RUNTIME] Variables
-                    const value = getGlobalValue(getterType);
-                    if (value !== null) {
-                        return typeof value === 'object' ? JSON.stringify(value) : String(value);
-                    }
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Unknown getter type: ${getterType}`);
-                    return match;
-            }
-        });
-    }
-    
-    // Character getter functions
-    // Helper function to get a character from cache efficiently
-    function getCharacterLocation(name) {
-        const character = load('Character', name);
-        return character?.info?.location || null;
-    }
-    
-    function getCharacterHP(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        const hp = character.stats?.hp;
-        return hp ? `${hp.current}/${hp.max}` : null;
-    }
-    
-    function getCharacterLevel(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        const level = character.stats?.level?.value;
-        return level ? level.toString() : null;
-    }
-    
-    function getCharacterXP(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        const xp = character.stats?.level?.xp;
-        return xp ? `${xp.current}/${xp.max}` : null;
-    }
-    
-    function getCharacterName(name) {
-        const character = load('Character', name);
-        return character ? character.name : null;
-    }
-    
-    function getCharacterAttribute(characterName, attrName) {
-        if (!attrName) return null;
-        
-        const character = load('Character', characterName);
-        if (!character) return null;
-        
-        const attrKey = String(attrName).toLowerCase();
-        const attributes = character.attributes || {};
-        const value = attributes[attrKey];
-        if (typeof value === 'object' && value.value !== undefined) {
-            return value.value.toString();
-        }
-        return value ? value.toString() : null;
-    }
-    
-    function getCharacterSkill(characterName, skillName) {
-        if (!skillName) return null;
-        
-        const character = load('Character', characterName);
-        if (!character) return null;
-        
-        const skillKey = String(skillName).toLowerCase();
-        const skills = character.skills || {};
-        const skill = skills[skillKey];
-        if (!skill) return null;
-        if (typeof skill === 'object' && skill.level !== undefined) {
-            return skill.xp ? `Level ${skill.level} (${skill.xp.current}/${skill.xp.max} XP)` : `Level ${skill.level}`;
-        }
-        return skill.toString();
-    }
-    
-    function getCharacterInventory(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        
-        const items = Object.entries(character.inventory || {})
-            .filter(([item, qty]) => qty !== 0)
-            .map(([item, qty]) => `${item}:${qty}`);
-        
-        return items.length > 0 ? `{${items.join(', ')}}` : '{}';
-    }
-    
-    function getCharacterStat(characterName, statName) {
-        if (!statName) return null;
-        
-        const character = load('Character', characterName);
-        if (!character) return null;
-        
-        const statKey = String(statName).toLowerCase();
-        
-        // Check if it's HP (special case)
-        if (statKey === 'hp') {
-            const hp = character.stats?.hp;
-            return hp ? `${hp.current}/${hp.max}` : null;
-        }
-        
-        // Check other core stats
-        const stat = character.coreStats[statKey];
-        return stat ? `${stat.current}/${stat.max}` : null;
     }
     
     // Time getter functions (Calendar API)
@@ -4223,32 +5148,26 @@ function GameState(hook, text) {
     // Scene Injection into Context
     // ==========================
     function createDefaultCurrentScene() {
-        // Find the first [PLAYER] card to use as default
-        const playerCard = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[PLAYER]'),
-            false // Just get the first one
-        );
-        
-        // Extract player name from card title or default to 'player'
+        // Find the first user-controlled entity
+        const userControlled = queryTags('UserControlled');
+
+        // Use first user-controlled entity name or default to 'player'
         let playerName = 'player';
-        if (playerCard) {
-            const titleMatch = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-            if (titleMatch) {
-                playerName = titleMatch[1].trim().toLowerCase();
-            }
+        if (userControlled && userControlled.length > 0) {
+            playerName = userControlled[0].id.toLowerCase();
         }
         
         const defaultText = (
-            `[**Current Scene** Location: get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
+            `[**Current Scene** Location: get(player.info.currentLocation) | get(time.formatted) (get(time.period))\n` +
             `**Available Tools:**\n` +
             `• Location: update_location(name, place) discover_location(character, place, direction) connect_locations(placeA, placeB, direction)\n` +
             `  - Directions: north, south, east, west, inside (enter), outside (exit)\n` +
             `• Time: advance_time(hours, minutes)\n` +
             `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty)\n` +
             `• Relations: update_relationship(name1, name2, points)\n` +
-            `• Quests: offer_quest(npc, quest, type) update_quest(player, quest, stage) complete_quest(player, quest)\n` +
+            `• Quests: offer_quest(npc, quest_name, type) accept_quest(name, quest_name, quest_giver, type) update_quest(name, quest_name, stage) complete_quest(name, quest_name)\n` +
             `• Progression: add_levelxp(name, amount) add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
-            `• Stats: update_attribute(name, attribute, value) update_hp(name, current, max)\n` +
+            `• Stats: update_attribute(name, attribute, value) update_hp(name, current) update_max_hp(name, max)\n` +
             `• Combat: deal_damage(source, target, amount)]`
         );
         
@@ -4256,7 +5175,7 @@ function GameState(hook, text) {
             title: '[CURRENT SCENE]',
             type: 'data',
             entry: defaultText,
-            description: 'Edit this card to customize what appears in the scene block. Use get_*(params) for dynamic values.',
+            description: 'Edit this card to customize what appears in the scene block. Use get(params) for dynamic values.',
             keys: '.,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"'
         });
         
@@ -4276,116 +5195,74 @@ function GameState(hook, text) {
         // Get the scene content
         const sceneContent = sceneCard.entry;
         if (!sceneContent) {
+            if (debug) console.log(`${MODULE_NAME}: No scene content to move`);
             return contextText;
         }
         
-        // Find where the scene starts in context (look for the pattern)
-        const sceneStartPattern = /\[\*\*Current Scene\*\*/;
-        const startMatch = contextText.match(sceneStartPattern);
+        // Try to find the exact scene content in the context
+        let sceneIndex = contextText.indexOf(sceneContent);
+        let sceneToRemove = sceneContent;
         
-        if (!startMatch) {
-            // Scene not found in context
-            return contextText;
+        if (sceneIndex === -1) {
+            // Exact match not found - try to find it by parts
+            const sceneLines = sceneContent.split('\n');
+            const firstLine = sceneLines[0];
+            const lastLine = sceneLines[sceneLines.length - 1];
+            
+            sceneIndex = contextText.indexOf(firstLine);
+            
+            if (sceneIndex === -1) {
+                if (debug) log(`${MODULE_NAME}: Scene not found in context at all`);
+                return contextText;
+            }
+            
+            // Find where the scene ends by looking for the last line
+            const endIndex = contextText.indexOf(lastLine, sceneIndex);
+            if (endIndex === -1) {
+                if (debug) log(`${MODULE_NAME}: Scene end not found, cannot move`);
+                return contextText;
+            }
+            
+            // Extract what's actually in the context
+            sceneToRemove = contextText.substring(sceneIndex, endIndex + lastLine.length);
         }
         
-        const startIdx = startMatch.index;
+        // Remove the scene from its current position
+        let modifiedContext = contextText.substring(0, sceneIndex) + 
+                             contextText.substring(sceneIndex + sceneToRemove.length);
         
-        // Find the end by looking for the closing bracket and newlines
-        // The scene ends with ")] followed by newlines
-        let endIdx = contextText.indexOf(')]', startIdx);
-        if (endIdx === -1) {
-            // Fallback: just remove from start to next double newline
-            endIdx = contextText.indexOf('\n\n', startIdx);
-            if (endIdx === -1) {
-                endIdx = contextText.length;
-            }
-        } else {
-            endIdx += 2; // Include the )]
-            // Skip any trailing whitespace/newlines
-            while (endIdx < contextText.length && /\s/.test(contextText[endIdx])) {
-                endIdx++;
-            }
-        }
-        
-        // Remove the scene from context
-        let modifiedContext = contextText.substring(0, startIdx) + contextText.substring(endIdx);
-        
-        // Clean up any resulting double/triple newlines
+        // Clean up any resulting multiple newlines
         modifiedContext = modifiedContext.replace(/\n\n\n+/g, '\n\n');
         
-        // If no history or very early in adventure, just return without the scene
-        if (!history || history.length < 3) {
-            return modifiedContext;
-        }
+        // Split context by sentences to find insertion point
+        const sentences = modifiedContext.split(/(?<=[.!?])\s+/);
         
-        // Now find where to reinsert it (after first sentence of entry at -3)
-        const targetIndex = history.length - 3;
-        const historyEntry = history[targetIndex];
+        // Try to place scene 6 sentences from the end
+        const sentencesFromEnd = 6;
         
-        if (!historyEntry || !historyEntry.text) {
-            // If we can't find the target, put it back at the start
+        if (sentences.length <= sentencesFromEnd) {
+            if (debug) log(`${MODULE_NAME}: Not enough sentences (${sentences.length}), putting scene at start`);
             return sceneContent + '\n\n' + modifiedContext;
         }
         
-        const lastEntry = historyEntry.text;
+        // Calculate insertion point
+        const insertIndex = sentences.length - sentencesFromEnd;
         
-        // Find where this history entry appears in the modified context
-        const entryIndex = modifiedContext.indexOf(lastEntry);
-        if (entryIndex === -1) {
-            // If we can't find the entry, put scene at the start
-            return sceneContent + '\n\n' + modifiedContext;
+        // Rebuild context with scene inserted
+        const beforeSentences = sentences.slice(0, insertIndex);
+        const afterSentences = sentences.slice(insertIndex);
+        
+        // Join the parts
+        let result = beforeSentences.join(' ');
+        if (result && !result.endsWith('\n')) {
+            result += '\n\n';
+        }
+        result += sceneContent;
+        if (afterSentences.length > 0) {
+            result += '\n\n' + afterSentences.join(' ');
         }
         
-        // Find end of first sentence within that entry
-        const firstSentenceMatch = lastEntry.match(/^[^.!?]+[.!?]/);
-        if (!firstSentenceMatch) {
-            // No sentence found, put scene at start
-            return sceneContent + '\n\n' + modifiedContext;
-        }
-        
-        const firstSentence = firstSentenceMatch[0];
-        const insertPosition = entryIndex + firstSentence.length;
-        
-        // Build the new context with scene at new position
-        const beforeInsert = modifiedContext.substring(0, insertPosition);
-        const afterInsert = modifiedContext.substring(insertPosition);
-        
-        // Ensure proper spacing (entries should be separated by double \n)
-        let separator = '\n\n';
-        if (afterInsert.startsWith('\n')) {
-            // Already has at least one newline
-            separator = afterInsert.startsWith('\n\n') ? '' : '\n';
-        }
-        
-        return beforeInsert + separator + sceneContent + '\n\n' + afterInsert.trimStart();
-    }
-    
-    // ==========================
-    // Character Name Validation
-    // ==========================
-    const INVALID_CHARACTER_NAMES = [
-        // Generic references
-        'player', 'self', 'me', 'you', 'user', 'myself', 'yourself', 
-        'him', 'her', 'them', 'they', 'it', 'this', 'that',
-    ];
-    
-    function isValidCharacterName(name) {
-        if (!name || typeof name !== 'string') return false;
-        
-        // Convert to lowercase for checking
-        const normalized = name.toLowerCase().trim();
-        
-        // Check if empty or just whitespace
-        if (!normalized) return false;
-        
-        // Check against blacklist of generic terms (but allow compound names like "player_unknown")
-        if (INVALID_CHARACTER_NAMES.includes(normalized)) {
-            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (blacklisted)`);
-            return false;
-        }
-        
-        // Valid syntax - doesn't need to exist yet (allows hallucinated names)
-        return true;
+        return result;
     }
     
     // ========================================
@@ -4397,76 +5274,84 @@ function GameState(hook, text) {
     let entityCardMap = null;
     
     function buildEntityCardMap() {
+        // Map all [SANE:E] and [SANE:D] entities
+        // 1. Find all [SANE:E] cards (entity cards with display)
+        // 2. Find all [SANE:D] cards (Data~~1~~, Data~~2~~, etc.)
+        // 3. Parse <== SANE DATA ==> from each
+        // 4. Build map: entityID -> card location
+        // 5. Also map all aliases -> card location
         const map = {};
-        
-        // Initialize schema registry if needed
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        
-        // Build map for each entity type
-        for (const [entityType, schema] of Object.entries(schemaRegistry)) {
-            if (!schema.prefixes || schema.prefixes.length === 0) continue;
-            
-            map[entityType] = {};
-            
-            // Check ALL prefixes for this entity type
-            for (const prefix of schema.prefixes) {
-                const cards = Utilities.storyCard.find(
-                    c => c.title && c.title.startsWith(`[${prefix}] `),
-                    true // return all matches
-                );
-                
-                for (const card of cards) {
-                    // Parse DESCRIPTION to get actual entity ID
-                    if (card.description && card.description.includes('<== REAL DATA ==>')) {
-                        const data = parseEntityData(card.description);
-                        if (data.name) {
-                            // Map the entity ID to the card title
-                            const normalizedName = data.name.toLowerCase();
-                            map[entityType][normalizedName] = card.title;
-                            
-                            // Also map any aliases directly to the card title
-                            if (data.aliases) {
-                                const aliases = Array.isArray(data.aliases) ? data.aliases : 
-                                               typeof data.aliases === 'string' ? data.aliases.split(',').map(a => a.trim()) :
-                                               [];
-                                
-                                for (const alias of aliases) {
-                                    if (alias) {
-                                        const normalizedAlias = alias.toLowerCase();
-                                        // Map alias directly to card title (not to real name)
-                                        map[entityType][normalizedAlias] = card.title;
-                                        
-                                        if (debug) console.log(`${MODULE_NAME}: Mapped alias '${alias}' directly to card '${card.title}' for ${entityType}`);
-                                    }
-                                }
+
+        // Find all [SANE:E] entity cards
+        const entityCards = Utilities.storyCard.find(
+            c => c.title && c.title.startsWith('[SANE:E] '),
+            true // return all matches
+        ) || [];
+
+        for (const card of entityCards) {
+            // Parse DESCRIPTION to get actual entity ID
+            if (card.description && card.description.includes('<== SANE DATA ==>')) {
+                const wrappedData = parseEntityData(card.description);
+
+                // Skip if parsing failed
+                if (!wrappedData) {
+                    console.log(`${MODULE_NAME}: Skipping invalid entity card: ${card.title}`);
+                    continue;
+                }
+
+                // Extract the entity from the wrapper object
+                // The data is in format: {"EntityId": {actual entity data}}
+                const entityId = Object.keys(wrappedData)[0];
+                const data = wrappedData[entityId];
+
+                if (entityId && data) {
+                    // Map the entity ID to the card title
+                    const normalizedName = entityId.toLowerCase();
+                    map[normalizedName] = card.title;
+
+                    // Also map any aliases directly to the card title
+                    if (data.aliases) {
+                        const aliases = Array.isArray(data.aliases) ? data.aliases :
+                                       typeof data.aliases === 'string' ? data.aliases.split(',').map(a => a.trim()) :
+                                       [];
+
+                        for (const alias of aliases) {
+                            if (alias) {
+                                const normalizedAlias = alias.toLowerCase();
+                                // Map alias directly to card title (not to real name)
+                                map[normalizedAlias] = card.title;
+
                             }
-                        } else {
-                            console.log(`${MODULE_NAME}: WARNING - Card ${card.title} has no name in data, using fallback`);
-                            
-                            // Fallback: try to use title without prefix
-                            let fallbackId = card.title.replace(/^\[.*?\]\s*/, '').trim().toLowerCase();
-                            
-                            // If that ID is taken, generate random suffixes until unique
-                            let attempts = 0;
-                            while (map[entityType][fallbackId] && attempts < 100) {
-                                const randomSuffix = Math.random().toString(36).substring(2, 8);
-                                fallbackId = `${fallbackId}_${randomSuffix}`;
-                                attempts++;
-                            }
-                            
-                            if (attempts >= 100) {
-                                console.log(`${MODULE_NAME}: ERROR - Could not generate unique ID for ${card.title}`);
-                                continue;
-                            }
-                            
-                            map[entityType][fallbackId] = card.title;
-                            console.log(`${MODULE_NAME}: Mapped ${card.title} to fallback ID: ${fallbackId}`);
                         }
-                    } else {
-                        // Card doesn't have structured data yet - skip it
-                        if (debug) console.log(`${MODULE_NAME}: Card ${card.title} has no structured data`);
                     }
                 }
+            }
+        }
+
+        // Also check [SANE:D] data cards for entities without display
+        const dataCards = Utilities.storyCard.find(
+            c => c.title && c.title.startsWith('[SANE:D] '),
+            true // return all matches
+        ) || [];
+
+        for (const card of dataCards) {
+            try {
+                const data = JSON.parse(card.description || '{}');
+                // Each data card can contain multiple entities
+                for (const [entityId, entity] of Object.entries(data)) {
+                    const normalizedId = entityId.toLowerCase();
+                    map[normalizedId] = card.title;
+
+                    // Also map aliases
+                    if (entity.aliases) {
+                        for (const alias of entity.aliases) {
+                            const normalizedAlias = alias.toLowerCase();
+                            map[normalizedAlias] = card.title;
+                        }
+                    }
+                }
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Failed to parse data card ${card.title}: ${e.message}`);
             }
         }
         
@@ -4477,258 +5362,113 @@ function GameState(hook, text) {
     function getEntityCardTitle(entityType, entityId) {
         // Build map if not exists
         if (!entityCardMap) buildEntityCardMap();
-        
+
         const normalizedId = entityId.toLowerCase();
-        const typeMap = entityCardMap[entityType];
-        if (!typeMap) return null;
-        
-        // Direct lookup - both real names and aliases are in the same map
-        return typeMap[normalizedId] || null;
+        // Direct lookup - entityCardMap is now flat (not nested by type)
+        return entityCardMap[normalizedId] || null;
     }
-    
-    // Unified load function for ANY object type
-    function load(objectType, name) {
-        if (!objectType || !name) return null;
-        
-        // Normalize the entity type (Character, Location, etc.)
-        const entityType = String(objectType).charAt(0).toUpperCase() + String(objectType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Build cache key: "Character.Bob"
-        const cacheKey = `${singularType}.${name}`;
-        
-        // Check entity cache
-        if (entityCache[cacheKey]) {
-            return entityCache[cacheKey];
-        }
-        
-        // Check if this is a data-only entity type
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[singularType];
-        if (schema && schema.dataOnly) {
-            // Load from [SANE_DATA] card
-            const dataCard = Utilities.storyCard.get(`[SANE_DATA] ${singularType}`);
-            if (dataCard) {
-                try {
-                    const allData = JSON.parse(dataCard.description || '{}');
-                    const entity = allData[name];
-                    if (entity) {
-                        entityCache[cacheKey] = entity;
-                        return entity;
-                    }
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Failed to parse data-only entity ${singularType}.${name}`);
-                }
-            }
-            return null;
-        }
-        
-        // Get card title from mapping for display entities
-        const cardTitle = getEntityCardTitle(singularType, name);
-        if (!cardTitle) {
-            // Entity not found in mapping
-            return null;
-        }
-        
-        // Load the specific card
-        const displayCard = Utilities.storyCard.get(cardTitle);
-        if (!displayCard) {
-            // Card disappeared? Rebuild map
-            entityCardMap = null;
-            return null;
-        }
-        
-        // Parse structured data from DESCRIPTION field
-        let entity = null;
-        
-        if (displayCard.description && displayCard.description.includes('<== REAL DATA ==>')) {
-            entity = parseEntityData(displayCard.description);
-        } else {
-            // No structured data - this shouldn't happen in new system
-            if (debug) console.log(`${MODULE_NAME}: Card missing structured data for ${name}`);
-            return null;
-        }
-        
-        // Set metadata
-        entity._type = singularType;
-        entity._cardTitle = cardTitle; // Store for updates
-        
-        // For Characters, set subtype based on card prefix
-        if (singularType === 'Character') {
-            if (!entity.info) entity.info = {};
-            entity.info.isPlayer = cardTitle.startsWith('[PLAYER]');
-            // Set subtype for special prefixes
-            if (cardTitle.startsWith('[PLAYER]')) {
-                entity._subtype = 'Player';
-            }
-        }
-        
-        // Data comes from JSON.parse() so already in object format
-        // No text parsing needed
-        
-        // Store in cache
-        entityCache[cacheKey] = entity;
-        return entity;
-    }
-    
-    // Unified save function for ANY object type
-    function save(objectType, entity) {
-        if (!objectType || !entity) {
+
+    // Unified save function
+    function save(entityId, entity) {
+        // Save based on display component
+        // - Handle overflow with ~~N~~ pattern
+        if (!entityId || !entity) {
             console.log(`${MODULE_NAME}: ERROR - save() called with invalid parameters`);
             return false;
         }
-        
-        if (!entity.name) {
-            console.log(`${MODULE_NAME}: ERROR - Cannot save entity without name field!`);
-            console.log('Entity:', JSON.stringify(entity));
+
+        // Ensure entityId is a string and normalize case
+        entityId = normalizeEntityId(String(entityId).trim());
+        if (!entityId) {
+            console.log(`${MODULE_NAME}: ERROR - Entity ID cannot be empty!`);
             return false;
         }
-        
-        // Ensure name is a string and not empty
-        entity.name = String(entity.name).trim();
-        if (!entity.name) {
-            console.log(`${MODULE_NAME}: ERROR - Entity name cannot be empty!`);
-            return false;
+
+        // IMPORTANT: Ensure entity.id matches the entityId we're saving under
+        entity.id = entityId;
+
+        // Ensure aliases is an array (can be empty for temporary entities)
+        if (!entity.aliases) {
+            entity.aliases = []; // Empty array is OK - entity might not have a name yet
+        } else if (!Array.isArray(entity.aliases)) {
+            entity.aliases = []; // Fix if not array
         }
-        
-        // Normalize entity type
-        const entityType = String(objectType).charAt(0).toUpperCase() + String(objectType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Check if this is a data-only entity type
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[singularType];
-        if (schema && schema.dataOnly) {
-            // Save to [SANE_DATA] card
-            const dataCardTitle = `[SANE_DATA] ${singularType}`;
-            let dataCard = Utilities.storyCard.get(dataCardTitle);
-            let allData = {};
-            
-            if (dataCard) {
-                try {
-                    allData = JSON.parse(dataCard.description || '{}');
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Failed to parse existing data card ${dataCardTitle}`);
-                }
-            }
-            
+
+        // Remove any aliases that duplicate the entity ID
+        if (entity.aliases.length > 0) {
+            entity.aliases = entity.aliases.filter(alias => alias !== entityId);
+        }
+
+        // Note: Alias collision checking only done in create() and changeEntityId()
+        // save() assumes the entity ID is already valid
+
+        // Check if entity has ACTIVE display component to determine storage location
+        const hasDisplay = hasDisplayComponent(entity);
+
+        if (!hasDisplay) {
+            // Save to [SANE:D] cards - entities without display
+            // Load existing data
+            const existingData = loadFromDataCards() || {};
+
             // Update or add the entity
-            allData[entity.name] = entity;
-            
-            // Save back to card
-            if (dataCard) {
-                Utilities.storyCard.update(dataCardTitle, {
-                    description: JSON.stringify(allData, null, 2)
-                });
-            } else {
-                Utilities.storyCard.add({
-                    title: dataCardTitle,
-                    description: JSON.stringify(allData, null, 2),
-                    type: 'data'
-                });
-            }
-            
-            // Update cache
-            const cacheKey = `${singularType}.${entity.name}`;
-            entityCache[cacheKey] = entity;
-            
+            existingData[entityId] = entity;
+
+            // Save back using the proper overflow handling
+            saveToDataCards(existingData);
+
+            // Add the ID field and update cache
+            entity.id = entityId;
+            dataCache[entityId] = entity;
+
             return true;
         }
-        
-        // Continue with display entity saving (CHARACTER, LOCATION, etc.)
-        
-        // Validation removed - components are flexible now
-        // const validation = validateEntityComponents(singularType, entity);
-        // if (!validation.valid) {
-        //     if (debug) {
-        //         console.log(`${MODULE_NAME}: Entity validation failed for ${entity.name}:`);
-        //         validation.errors.forEach(err => console.log(`  - ${err}`));
-        //     }
-        //     // Still save but log validation errors
-        // }
-        
-        // Build cache key
-        const cacheKey = `${singularType}.${entity.name}`;
-        
-        // Update cache
-        entityCache[cacheKey] = entity;
-        
-        // Save to display card (the ONLY source of truth)
-        return saveEntityCard(entity, singularType);
-    }
-    
-    // Unified loadAll function for ANY object type
-    function loadAll(objectType) {
-        // Normalize the entity type
-        const entityType = String(objectType).charAt(0).toUpperCase() + String(objectType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Check if this is a data-only entity type
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[singularType];
-        if (schema && schema.dataOnly) {
-            // Load from [SANE_DATA] card
-            const dataCard = Utilities.storyCard.get(`[SANE_DATA] ${singularType}`);
-            if (dataCard) {
-                try {
-                    const allData = JSON.parse(dataCard.description || '{}');
-                    // Cache all entities
-                    for (const [name, entity] of Object.entries(allData)) {
-                        const cacheKey = `${singularType}.${name}`;
-                        entityCache[cacheKey] = entity;
-                    }
-                    return allData;
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Failed to parse data-only entities for ${singularType}`);
-                }
-            }
-            return {};
-        }
-        
-        // Build map if not exists for display entities
-        if (!entityCardMap) buildEntityCardMap();
-        
-        // Get all entities of this type from the map
-        const typeMap = entityCardMap[singularType];
-        if (!typeMap) {
-            if (debug) console.log(`${MODULE_NAME}: No entities found for type ${singularType}`);
-            return {};
-        }
-        
-        // Load all entities
-        const entities = {};
-        
-        for (const [entityId, cardTitle] of Object.entries(typeMap)) {
-            // Load each entity using the mapping
-            const entity = load(singularType, entityId);
-            if (entity) {
-                entities[entityId] = entity;
+
+        // Add the ID field to the entity
+        entity.id = entityId;
+
+        // Update cache (AFTER duplicate check)
+        dataCache[entityId] = entity;  // Direct entity ID
+
+        // Cache all aliases
+        if (entity.aliases && Array.isArray(entity.aliases)) {
+            for (const alias of entity.aliases) {
+                dataCache[alias] = entity;
             }
         }
-        
-        return entities;
-    }
-    
-    function loadCharacter(name) {
-        // Delegate to unified load function
-        return load('Character', name);
-    }
-    
-    // Queue entity for generation wizard
-    function queueEntityGeneration(entity) {
-        // This would interface with GenerationWizard
-        // For now, just log that it needs generation
-        if (debug) console.log(`${MODULE_NAME}: Queued ${entity.name} for display card generation`);
-        
-        // Could add to [SANE_CONFIG] Entity Queue card
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-        if (queueCard) {
-            const lines = (queueCard.description || '').split('\n').filter(l => l.trim());
-            lines.push(`${entity.type}:${entity.name}`);
-            Utilities.storyCard.update('[SANE_CONFIG] Entity Queue', {
-                description: lines.join('\n')
-            });
+
+        // Temporary entities with gw_progress should be saved to [SANE:D] cards
+        // so they persist between hooks, but not to [SANE:E] cards
+        if (entity.gw_progress) {
+            if (debug) console.log(`${MODULE_NAME}: Saving temp entity ${entityId} to [SANE:D] card (has gw_progress)`);
+
+            // Load existing data entities
+            const existingData = loadFromDataCards() || {};
+
+            // Add this temporary entity
+            existingData[entityId] = entity;
+
+            // Save back to data cards
+            saveToDataCards(existingData);
+
+            // Entity is already in cache from earlier
+            return true;
         }
+
+        // Clean up stale gw_progress from components array if needed
+        if (entity.components && entity.components.includes('gw_progress')) {
+            const index = entity.components.indexOf('gw_progress');
+            if (index !== -1) {
+                entity.components.splice(index, 1);
+                if (debug) console.log(`${MODULE_NAME}: Cleaned up stale gw_progress from components array for ${entityId}`);
+            }
+        }
+
+        // Save entity (handles both [SANE:E] and [SANE:D] cards based on display component)
+        const saved = saveEntity(entityId, entity);
+
+        // Note: entityAliasMap is maintained during initialization, not individual saves
+
+        return saved;
     }
     
     // ==========================
@@ -4746,7 +5486,7 @@ function GameState(hook, text) {
             
             // Level up!
             character.stats.level.value = (character.stats.level.value || 1) + 1;
-            console.log(character.name + ' reached level ' + character.stats.level.value + '!');
+            console.log(character.id + ' reached level ' + character.stats.level.value + '!');
             
             // Calculate new max XP for next level
             const nextLevelXP = calculateLevelXPRequirement(character.stats.level.value + 1);
@@ -4763,7 +5503,7 @@ function GameState(hook, text) {
             
             console.log(`  HP increased to ${character.stats.hp.current}/${character.stats.hp.max}`);
             
-            // TODO: Process attribute gains if configured
+            // Process attribute gains if configured
             
             // Continue checking for multiple level ups
         }
@@ -4821,32 +5561,32 @@ function GameState(hook, text) {
         },
         
         update_location: function(characterName, location) {
-            if (!characterName || !location) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
+            try {
+                if (!characterName || !location) return 'malformed';
+
+                    if (!isValidCharacterName(characterName)) {
+                    return 'malformed';
+                }
             
             characterName = String(characterName).toLowerCase();
             location = String(location).toLowerCase().replace(/\s+/g, '_');
             
             // Check if character exists using universal system
-            const character = loadCharacter(characterName);
+            const character = get(characterName);
             if (character) {
                 // Character exists, update location using component structure
                 if (!character.info) {
-                    if (debug) console.log(`${MODULE_NAME}: Character ${character.name} missing info component`);
+                    if (debug) console.log(`${MODULE_NAME}: Character ${characterName} missing info component`);
                     return 'malformed';
                 }
-                character.info.location = location;
-                save('Character', character);
-                if (debug) console.log(`${MODULE_NAME}: ${character.name} moved to ${location}`);
+                character.info.currentLocation = location;
+                save(characterName, character);
+                if (debug) console.log(`${MODULE_NAME}: ${characterName} moved to ${location}`);
                 return 'executed';
             }
             
             // Character not found - do a full check
-            const fullCheckCharacter = loadCharacter(characterName);
+            const fullCheckCharacter = get(characterName);
             
             if (!fullCheckCharacter) {
                 // Character doesn't exist
@@ -4860,24 +5600,26 @@ function GameState(hook, text) {
             } else {
                 // Found character - update location
                 if (fullCheckCharacter.info) {
-                    fullCheckCharacter.info.location = location;
+                    fullCheckCharacter.info.currentLocation = location;
                 } else {
                     fullCheckCharacter.location = location;
                 }
-                save('Character', fullCheckCharacter);
-                if (debug) console.log(`${MODULE_NAME}: ${fullCheckCharacter.name} moved to ${location}`);
+                save(characterName, fullCheckCharacter);
+                if (debug) console.log(`${MODULE_NAME}: ${characterName} moved to ${location}`);
             }
-            
+
             return 'executed';
-        },
-        
-        add_item: function(characterName, itemName, quantity) {
-            if (!characterName || !itemName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error in update_location: ${e.message}`);
+                if (debug) console.log(`${MODULE_NAME}: Stack trace:`, e.stack);
                 return 'malformed';
             }
+        },
+
+        add_item: function(characterName, itemName, quantity) {
+            try {
+            if (!characterName || !itemName) return 'malformed';
+            
             
             characterName = String(characterName).toLowerCase();
             itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
@@ -4897,7 +5639,7 @@ function GameState(hook, text) {
             }
             
             // Selectively load only the character needed
-            const character = loadCharacter(characterName);
+            const character = get(characterName);
             
             if (!character) {
                 if (debug) {
@@ -4920,75 +5662,46 @@ function GameState(hook, text) {
             
             const newQty = Math.max(0, currentQty + quantity);
             
-            // Always store as object with quantity
-            inventory[itemName] = { quantity: newQty };
-            
-            if (debug) {
-                console.log(`${MODULE_NAME}: ${character.name}'s ${itemName}: ${currentQty} → ${newQty}`);
+            // Remove item if quantity reaches 0, otherwise store as object
+            if (newQty === 0) {
+                delete inventory[itemName];
+            } else {
+                inventory[itemName] = { quantity: newQty };
             }
             
-            save('Character', character);
+            if (debug) {
+                console.log(`${MODULE_NAME}: ${characterName}'s ${itemName}: ${currentQty} → ${newQty}`);
+            }
+
+            save(characterName, character);
             return 'executed';
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error in add_item: ${e.message}`);
+                if (debug) console.log(`${MODULE_NAME}: Stack trace:`, e.stack);
+                return 'malformed';
+            }
         },
-        
+
         remove_item: function(characterName, itemName, quantity) {
             if (!characterName || !itemName) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
             
-            characterName = String(characterName).toLowerCase();
-            itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
+            // Allow negative numbers (which would add items)
             const qtyStr = String(quantity).trim();
-            if (!/^\d+$/.test(qtyStr)) {
+            if (!/^-?\d+$/.test(qtyStr)) {
                 if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for remove_item: ${quantity}`);
                 return 'malformed';
             }
             quantity = parseInt(qtyStr);
             
-            // 0 or invalid quantity is malformed
-            if (isNaN(quantity) || quantity <= 0) {
+            // 0 is malformed (use positive to remove, negative to add)
+            if (isNaN(quantity) || quantity === 0) {
                 if (debug) console.log(`${MODULE_NAME}: Invalid quantity for remove_item: ${quantity}`);
                 return 'malformed';
             }
             
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) return 'executed';
-            
-            // Access inventory through component or fallback to direct access
-            const inventory = character.inventory || {};
-            
-            // Always convert to object format for reading
-            let currentQty = 0;
-            if (typeof inventory[itemName] === 'object') {
-                currentQty = inventory[itemName].quantity || 0;
-            } else if (typeof inventory[itemName] === 'number') {
-                currentQty = inventory[itemName];
-            }
-            
-            const removeQty = Math.min(currentQty, quantity);
-            const newQty = currentQty - removeQty;
-            
-            if (newQty === 0) {
-                delete inventory[itemName];
-                if (debug) console.log(`${MODULE_NAME}: Removed all ${itemName} from ${character.name}`);
-            } else {
-                // Always store as object with quantity
-                inventory[itemName] = { quantity: newQty };
-                if (debug) console.log(`${MODULE_NAME}: Removed ${removeQty} ${itemName} from ${character.name} (${currentQty} → ${newQty})`);
-            }
-            
-            // Ensure inventory is set back on character
-            character.inventory = inventory;
-            
-            save('Character', character);
-            return 'executed';
+            // Just call add_item with negative quantity
+            return toolProcessors.add_item(characterName, itemName, -quantity);
         },
         
         use_consumable: function(characterName, itemName, quantity) {
@@ -4999,10 +5712,6 @@ function GameState(hook, text) {
         transfer_item: function(giverName, receiverName, itemName, quantity) {
             if (!giverName || !receiverName || !itemName) return 'malformed';
             
-            // Validate both character names before processing
-            if (!isValidCharacterName(giverName) || !isValidCharacterName(receiverName)) {
-                return 'malformed';
-            }
             
             giverName = String(giverName).toLowerCase();
             receiverName = String(receiverName).toLowerCase();
@@ -5022,7 +5731,7 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             
-            const characters = loadAll('Character');
+            const characters = queryTags('Character');
             const giver = characters[giverName];
             const receiver = characters[receiverName];
             
@@ -5044,8 +5753,6 @@ function GameState(hook, text) {
             let transferQty = requestedQty;
             
             if (giver) {
-                // Normalize inventory to new format if needed
-                giver.inventory = normalizeInventory(giver.inventory);
                 
                 const availableQty = getItemQuantity(giver.inventory, itemName);
                 transferQty = Math.min(availableQty, requestedQty);
@@ -5053,7 +5760,7 @@ function GameState(hook, text) {
                 if (transferQty > 0) {
                     setItemQuantity(giver.inventory, itemName, availableQty - transferQty);
                     
-                    save('Character', giver);
+                    save(giverName, giver);
                     anySuccess = true;
                     
                     if (debug) console.log(`${MODULE_NAME}: Removed ${transferQty} ${itemName} from ${giver.name}`);
@@ -5064,13 +5771,11 @@ function GameState(hook, text) {
             }
             
             if (receiver) {
-                // Normalize inventory to new format if needed
-                receiver.inventory = normalizeInventory(receiver.inventory);
                 
                 const currentReceiverQty = getItemQuantity(receiver.inventory, itemName);
                 setItemQuantity(receiver.inventory, itemName, currentReceiverQty + transferQty);
                 
-                save('Character', receiver);
+                save(receiverName, receiver);
                 anySuccess = true;
                 
                 if (debug) console.log(`${MODULE_NAME}: Added ${transferQty} ${itemName} to ${receiver.name}`);
@@ -5105,7 +5810,7 @@ function GameState(hook, text) {
             }
             
             // Load the target character directly
-            const target = loadCharacter(targetName);
+            const target = get(targetName);
             if (!target) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: Target ${targetName} not found`);
@@ -5115,57 +5820,37 @@ function GameState(hook, text) {
             
             // Only load source if needed and exists
             const source = (sourceName !== 'unknown') 
-                ? loadCharacter(sourceName) : null;
+                ? get(sourceName) : null;
             
             const sourceDisplay = source ? source.name : sourceName;
             
-            // Support both old (hp) and new (stats.hp) structures
-            let currentHP, maxHP;
-            if (target.stats && target.stats.hp) {
-                currentHP = target.stats.hp.current;
-                maxHP = target.stats.hp.max;
-            } else if (target.hp) {
-                // Migrate from old structure
-                currentHP = target.hp.current;
-                maxHP = target.hp.max;
-                // Initialize new structure
-                if (!target.stats) target.stats = {};
-                target.stats.hp = { current: currentHP, max: maxHP };
-            } else {
-                // Initialize if missing
-                if (!target.stats) target.stats = {};
+            // Ensure stats component exists
+            if (!target.stats) {
+                target.stats = {};
+            }
+            if (!target.stats.hp) {
                 target.stats.hp = { current: 100, max: 100 };
-                currentHP = 100;
-                maxHP = 100;
             }
             
-            const oldHP = currentHP;
-            const newHP = Math.max(0, currentHP - damageAmount);
+            const oldHP = target.stats.hp.current;
+            const maxHP = target.stats.hp.max;
+            const newHP = Math.max(0, oldHP - damageAmount);
             const actualDamage = oldHP - newHP;
             
-            // Update in new structure
+            // Update HP in stats component
             target.stats.hp.current = newHP;
-            
-            // Also update old structure for backward compatibility
-            if (target.hp) {
-                target.hp.current = newHP;
-            }
             
             if (debug) {
                 console.log(`${MODULE_NAME}: ${sourceDisplay} dealt ${actualDamage} damage to ${target.name} (${oldHP} → ${newHP}/${maxHP})`);
             }
             
-            save('Character', target);
+            save(targetName, target);
             return 'executed';
         },
         
         add_levelxp: function(characterName, xpAmount) {
             if (!characterName) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
             
             characterName = String(characterName).toLowerCase();
             
@@ -5184,7 +5869,7 @@ function GameState(hook, text) {
             }
             
             // Selectively load only the character needed
-            const character = loadCharacter(characterName);
+            const character = get(characterName);
             
             if (!character) {
                 trackUnknownEntity(characterName, 'add_levelxp', info?.actionCount);
@@ -5196,31 +5881,55 @@ function GameState(hook, text) {
             
             // Update XP using nested level.xp structure
             if (!character.stats || !character.stats.level || !character.stats.level.xp) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${character.name} missing stats.level.xp component`);
+                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} missing stats.level.xp component`);
                 return 'malformed';
             }
             character.stats.level.xp.current += xpAmount;
             
-            // Ensure XP doesn't go below 0
+            // Handle negative XP (level down)
+            while (character.stats.level.xp.current < 0 && character.stats.level.value > 1) {
+                // Level down
+                character.stats.level.value--;
+                
+                // Get max XP for the new (lower) level
+                const newMaxXp = getMaxXpForLevel(character.stats.level.value);
+                
+                // Add the max XP to current (negative) XP
+                character.stats.level.xp.current += newMaxXp;
+                character.stats.level.xp.max = newMaxXp;
+                
+                // Adjust HP for level down
+                const newMaxHp = getMaxHpForLevel(character.stats.level.value);
+                if (character.stats.hp) {
+                    character.stats.hp.max = newMaxHp;
+                    // Keep current HP proportional if it exceeds new max
+                    if (character.stats.hp.current > newMaxHp) {
+                        character.stats.hp.current = newMaxHp;
+                    }
+                }
+                
+                if (debug) console.log(`${MODULE_NAME}: ${character.id} leveled DOWN to ${character.stats.level.value}`);
+            }
+            
+            // Ensure XP doesn't go below 0 at level 1
             if (character.stats.level.xp.current < 0) {
                 character.stats.level.xp.current = 0;
             }
             
             const action = xpAmount > 0 ? 'Added' : 'Removed';
-            if (debug) console.log(`${MODULE_NAME}: ${action} ${Math.abs(xpAmount)} XP ${xpAmount > 0 ? 'to' : 'from'} ${character.name} (${character.stats.level.xp.current}/${character.stats.level.xp.max})`);
+            if (debug) console.log(`${MODULE_NAME}: ${action} ${Math.abs(xpAmount)} XP ${xpAmount > 0 ? 'to' : 'from'} ${characterName} (${character.stats.level.xp.current}/${character.stats.level.xp.max})`);
             
-            processLevelUp(character);
-            save('Character', character);
+            // Process level up if XP is positive
+            if (xpAmount > 0) {
+                processLevelUp(character);
+            }
+            save(characterName, character);
             return 'executed';
         },
         
         add_skillxp: function(characterName, skillName, xpAmount) {
             if (!characterName || !skillName) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
             
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
@@ -5240,7 +5949,7 @@ function GameState(hook, text) {
             }
             
             // Selectively load only the character needed
-            const character = loadCharacter(characterName);
+            const character = get(characterName);
             
             if (!character) {
                 trackUnknownEntity(characterName, 'add_skillxp', info?.actionCount);
@@ -5256,27 +5965,47 @@ function GameState(hook, text) {
             }
             
             if (!character.skills[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: Skill ${skillName} not found on ${character.name}`);
+                if (debug) console.log(`${MODULE_NAME}: Skill ${skillName} not found on ${character.id}`);
                 return 'malformed';
             }
             
             const skill = character.skills[skillName];
             skill.xp.current += xpAmount;
             
-            if (debug) console.log(`${MODULE_NAME}: Added ${xpAmount} XP to ${character.name}'s ${skillName} (${skill.xp.current}/${skill.xp.max})`);
+            // Handle negative skill XP (skill level down)
+            while (skill.xp.current < 0 && skill.level > 1) {
+                // Level down the skill
+                skill.level--;
+                
+                // Get max XP for the new (lower) skill level
+                const newMaxXp = getMaxXpForSkill(skillName, skill.level);
+                
+                // Add the max XP to current (negative) XP
+                skill.xp.current += newMaxXp;
+                skill.xp.max = newMaxXp;
+                
+                if (debug) console.log(`${MODULE_NAME}: ${character.id}'s ${skillName} leveled DOWN to ${skill.level}`);
+            }
             
-            processSkillLevelUp(skill, skillName);
-            save('Character', character);
+            // Ensure XP doesn't go below 0 at skill level 1
+            if (skill.xp.current < 0) {
+                skill.xp.current = 0;
+            }
+            
+            const action = xpAmount > 0 ? 'Added' : 'Removed';
+            if (debug) console.log(`${MODULE_NAME}: ${action} ${Math.abs(xpAmount)} XP ${xpAmount > 0 ? 'to' : 'from'} ${character.id}'s ${skillName} (${skill.xp.current}/${skill.xp.max})`);
+            
+            // Process skill level up if XP is positive
+            if (xpAmount > 0) {
+                processSkillLevelUp(skill, skillName);
+            }
+            save(characterName, character);
             return 'executed';
         },
         
         unlock_newskill: function(characterName, skillName) {
             if (!characterName || !skillName) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
             
             characterName = String(characterName).toLowerCase();
             skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
@@ -5289,7 +6018,7 @@ function GameState(hook, text) {
             }
             
             // Selectively load only the character needed
-            const character = loadCharacter(characterName);
+            const character = get(characterName);
             
             if (!character) {
                 trackUnknownEntity(characterName, 'unlock_newskill', info?.actionCount);
@@ -5306,7 +6035,7 @@ function GameState(hook, text) {
             
             // Check if character already has this skill
             if (character.skills[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: ${character.name} already has ${skillName}`);
+                if (debug) console.log(`${MODULE_NAME}: ${character.id} already has ${skillName}`);
                 return 'malformed';
             }
             
@@ -5319,19 +6048,15 @@ function GameState(hook, text) {
                 }
             };
             
-            if (debug) console.log(`${MODULE_NAME}: ${character.name} learned ${skillName}!`);
+            if (debug) console.log(`${MODULE_NAME}: ${character.id} learned ${skillName}!`);
             
-            save('Character', character);
+            save(characterName, character);
             return 'executed';
         },
         
         update_attribute: function(characterName, attrName, value) {
             if (!characterName || !attrName) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
             
             characterName = String(characterName).toLowerCase();
             attrName = String(attrName).toLowerCase();
@@ -5356,29 +6081,39 @@ function GameState(hook, text) {
             }
             
             // Selectively load only the character needed
-            const character = loadCharacter(characterName);
+            const character = get(characterName);
             
-            if (!character) return 'executed';
+            if (!character) {
+                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found for update_attribute`);
+                return 'permitted'; // Allow hallucinated characters
+            }
             
-            character.attributes[attrName] = value;
+            // Initialize attributes component if it doesn't exist
+            if (!character.attributes) {
+                character.attributes = {};
+            }
             
-            if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s ${attrName} to ${value}`);
+            // Set attribute using proper component structure
+            // Attributes use { attributeName: { value: X } } format
+            if (!character.attributes[attrName]) {
+                character.attributes[attrName] = {};
+            }
+            character.attributes[attrName].value = value;
             
-            save('Character', character);
+            if (debug) console.log(`${MODULE_NAME}: Set ${character.id}'s ${attrName} to ${value}`);
+            
+            save(characterName, character);
             return 'executed';
         },
         
         update_relationship: function(name1, name2, changeAmount) {
             if (!name1 || !name2) return 'malformed';
             
-            // Validate both character names before processing
-            if (!isValidCharacterName(name1) || !isValidCharacterName(name2)) {
-                return 'malformed';
-            }
             
-            name1 = String(name1).toLowerCase();
-            name2 = String(name2).toLowerCase();
-            
+            // Convert to consistent case for lookup (get() handles case-insensitive resolution)
+            name1 = String(name1);
+            name2 = String(name2);
+
             // Strict number validation (can be negative)
             const changeStr = String(changeAmount).trim();
             if (!/^-?\d+$/.test(changeStr)) {
@@ -5386,16 +6121,16 @@ function GameState(hook, text) {
                 return 'malformed';
             }
             changeAmount = parseInt(changeStr);
-            
+
             // 0 change is malformed (why call it?)
             if (isNaN(changeAmount) || changeAmount === 0) {
                 if (debug) console.log(`${MODULE_NAME}: Invalid relationship change: ${changeAmount}`);
                 return 'malformed';
             }
-            
-            const characters = loadAll('Character');
-            const char1 = characters[name1];
-            const char2 = characters[name2];
+
+            // Use get() for proper case-insensitive alias resolution
+            const char1 = get(name1);
+            const char2 = get(name2);
             
             // Track unknown entities
             if (!char1) {
@@ -5410,7 +6145,7 @@ function GameState(hook, text) {
                     addToEntityQueue(name2);
                 }
             }
-            
+
             if (!char1 || !char2) {
                 if (debug) {
                     console.log(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
@@ -5432,22 +6167,33 @@ function GameState(hook, text) {
                 }
             }
             
-            // Update bidirectional relationships
-            if (!char1.relationships[name2]) char1.relationships[name2] = 0;
-            if (!char2.relationships[name1]) char2.relationships[name1] = 0;
+            // Update bidirectional relationships with proper object structure
+            if (!char1.relationships[name2]) {
+                char1.relationships[name2] = { value: 0 };
+            } else if (typeof char1.relationships[name2] === 'number') {
+                // Migrate old format
+                char1.relationships[name2] = { value: char1.relationships[name2] };
+            }
             
-            char1.relationships[name2] += changeAmount;
-            char2.relationships[name1] += changeAmount;
+            if (!char2.relationships[name1]) {
+                char2.relationships[name1] = { value: 0 };
+            } else if (typeof char2.relationships[name1] === 'number') {
+                // Migrate old format
+                char2.relationships[name1] = { value: char2.relationships[name1] };
+            }
             
-            const flavorText1 = getRelationshipFlavor(char1.relationships[name2], char1.name, char2.name);
-            const flavorText2 = getRelationshipFlavor(char2.relationships[name1], char2.name, char1.name);
+            char1.relationships[name2].value += changeAmount;
+            char2.relationships[name1].value += changeAmount;
             
-            save('Character', char1);
-            save('Character', char2);
-            
+            const flavorText1 = getRelationshipFlavor(char1.relationships[name2].value, name1, name2);
+            const flavorText2 = getRelationshipFlavor(char2.relationships[name1].value, name2, name1);
+
+            save(name1, char1);
+            save(name2, char2);
+
             if (debug) {
-                console.log(`${MODULE_NAME}: ${char1.name}→${char2.name}: ${flavorText1}`);
-                console.log(`${MODULE_NAME}: ${char2.name}→${char1.name}: ${flavorText2}`);
+                console.log(`${MODULE_NAME}: ${name1}→${name2}: ${flavorText1}`);
+                console.log(`${MODULE_NAME}: ${name2}→${name1}: ${flavorText2}`);
             }
             
             return 'executed';
@@ -5457,10 +6203,6 @@ function GameState(hook, text) {
             // Validate inputs
             if (!characterName || !locationName || !direction) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
             
             characterName = String(characterName).toLowerCase();
             locationName = String(locationName).replace(/\s+/g, '_');
@@ -5475,7 +6217,7 @@ function GameState(hook, text) {
             
             // Get character's current location
             // Selectively load only the character needed
-            const character = loadCharacter(characterName);
+            const character = get(characterName);
             
             if (!character) {
                 if (debug) {
@@ -5486,147 +6228,78 @@ function GameState(hook, text) {
             
             const currentLocation = character.location;
             
-            // Check if location already exists
-            const existingLocation = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
-            if (existingLocation) {
+            // Check if location already exists using universal data system
+            const existingLocation = get(locationName);
+            if (existingLocation && hasGameplayTag(existingLocation, 'Location')) {
                 if (debug) console.log(`${MODULE_NAME}: Location ${locationName} already exists - use connect_locations instead`);
                 return 'malformed';
             }
             
-            // Dynamically determine location header based on player's floor
-            let locationHeaders = '<$# Locations>';
-            
-            // First, check the player's current floor
-            // Find the first [PLAYER] card
-            const playerCard = Utilities.storyCard.find(card => {
-                return card.title && card.title.startsWith('[PLAYER]');
-            }, false);
-            
-            let playerName = null;
-            if (playerCard) {
-                const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-                if (match) {
-                    playerName = match[1].trim();
-                }
-            }
-            
-            // Allow override via global variable if set
-            const customHeader = getGlobalValue('location_header');
-            if (customHeader) {
-                locationHeaders = customHeader; // User override takes precedence
-            }
-            
-            // Create basic location card (will be enhanced by generation)
-            // For inside/outside locations, adjust pathways accordingly
-            let pathwaysList;
-            if (direction === 'inside') {
-                // Interior location - minimal pathways
-                pathwaysList = (
-                    '- Outside: ' + currentLocation + '\n' +
-                    '- Inside: (unexplored)'  // For buildings with multiple rooms
-                );
-            } else if (direction === 'outside') {
-                // Exterior location from interior - include all directions
-                pathwaysList = (
-                    '- Inside: ' + currentLocation + '\n' +
-                    '- North: (unexplored)\n' +
-                    '- South: (unexplored)\n' +
-                    '- East: (unexplored)\n' +
-                    '- West: (unexplored)'
-                );
-            } else {
-                // Standard cardinal direction - include all options
-                pathwaysList = (
-                    '- ' + getOppositeDirection(direction) + ': ' + currentLocation + '\n' +
-                    '- North: (unexplored)\n' +
-                    '- South: (unexplored)\n' +
-                    '- East: (unexplored)\n' +
-                    '- West: (unexplored)\n' +
-                    '- Inside: (unexplored)'  // Buildings can have interiors
-                );
-            }
-            
-            // Create basic location data
-            const locationData = {
-                name: locationName,
-                type: 'Unknown',
-                terrain: 'Unexplored'
-            };
-            
-            // Use default header and info line since we removed formatTemplate
-            let headerLine = `## **${locationName}**`;
-            let infoLine = 'Type: Unknown | Terrain: Unexplored';
-            
-            const locationEntry = (
-                locationHeaders + '\n' +
-                headerLine + '\n' +
-                infoLine + '\n' +
-                '### Description\n' +
-                'An unexplored location. Details will be revealed upon first visit.\n' +
-                '### Pathways\n' +
-                pathwaysList
-            );
-            
-            const snakeCased = locationName.toLowerCase();
-            const spacedName = locationName.replace(/_/g, ' ');
-            
-            const locationCard = {
-                title: `[LOCATION] ${locationName}`,
-                type: 'Location',
-                keys: `${snakeCased}, ${spacedName}`,  // Keys as comma-separated string
-                entry: locationEntry,
-                description: `Discovered by ${character.name} on turn ${info?.actionCount || 0}`
-            };
-            
-            Utilities.storyCard.add(locationCard);
-            
-            // Update current location's pathway
-            updateLocationPathway(currentLocation, direction, locationName);
-            
             // Queue for generation if GenerationWizard is available
             if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startGeneration) {
-                GenerationWizard.startGeneration('Location', null, {
+                const oppositeDir = getOppositeDirection(direction);
+                GenerationWizard.startGeneration('Location', {
                     NAME: locationName,
-                    metadata: {
-                        from: currentLocation,
-                        direction: direction,
-                        discoveredBy: character.name
-                    }
+                    CONNECTED_FROM: currentLocation,
+                    DIRECTION_FROM: oppositeDir || 'unknown',
+                    DISCOVERED_BY: character.id
                 });
             }
             
-            if (debug) console.log(`${MODULE_NAME}: ${character.name} discovered ${locationName} to the ${direction}`);
+            
+            if (debug) console.log(`${MODULE_NAME}: ${character.id} discovered ${locationName} to the ${direction}`);
             return 'executed';
         },
         
-        connect_locations: function(locationA, locationB, directionFromA) {
+        connect_locations: function(locationA, locationB, directionFromA, bidirectional) {
             if (!locationA || !locationB || !directionFromA) return 'malformed';
-            
+
             locationA = String(locationA).replace(/\s+/g, '_');
             locationB = String(locationB).replace(/\s+/g, '_');
             directionFromA = String(directionFromA).toLowerCase();
-            
-            // Validate direction (cardinal directions + inside/outside for nested locations)
-            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
-            if (!validDirections.includes(directionFromA)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${directionFromA}. Valid: ${validDirections.join(', ')}`);
-                return 'malformed';
+
+            // Parse bidirectional parameter - default to true if not specified
+            if (bidirectional === undefined || bidirectional === null || bidirectional === '') {
+                bidirectional = true;
+            } else if (typeof bidirectional === 'string') {
+                bidirectional = bidirectional.toLowerCase() === 'true' || bidirectional === '1' || bidirectional === 'yes' || bidirectional === "t";
+            } else {
+                bidirectional = Boolean(bidirectional);
             }
-            
-            // Check both locations exist
-            const cardA = Utilities.storyCard.get(`[LOCATION] ${locationA}`);
-            const cardB = Utilities.storyCard.get(`[LOCATION] ${locationB}`);
-            
-            if (!cardA || !cardB) {
+
+            // Don't validate direction - let scenarios define their own
+
+            // Check both locations exist using universal data system
+            const locA = get(locationA);
+            const locB = get(locationB);
+
+            if (!locA || !locB) {
                 if (debug) console.log(`${MODULE_NAME}: One or both locations not found`);
                 return 'malformed';
             }
-            
-            // Update pathways bidirectionally
-            updateLocationPathway(locationA, directionFromA, locationB);
-            updateLocationPathway(locationB, getOppositeDirection(directionFromA), locationA);
-            
-            if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} ${directionFromA} to ${locationB}`);
+
+            // Verify they have Location gameplay tag
+            if (!hasGameplayTag(locA, 'Location') || !hasGameplayTag(locB, 'Location')) {
+                if (debug) console.log(`${MODULE_NAME}: One or both entities are not locations`);
+                return 'malformed';
+            }
+
+            // Update pathway from A to B
+            updateLocationPathway(locationA, directionFromA, locationB, false); // false = don't auto-bidirectional
+
+            // Update reverse pathway if bidirectional
+            if (bidirectional) {
+                const oppositeDir = getOppositeDirection(directionFromA);
+                if (oppositeDir) {
+                    updateLocationPathway(locationB, oppositeDir, locationA, false);
+                    if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} <-${directionFromA}/${oppositeDir}-> ${locationB} (bidirectional)`);
+                } else {
+                    if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} -${directionFromA}-> ${locationB} (one-way, no opposite for '${directionFromA}')`);
+                }
+            } else {
+                if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} -${directionFromA}-> ${locationB} (one-way)`);
+            }
+
             return 'executed';
         },
         
@@ -5699,7 +6372,8 @@ function GameState(hook, text) {
             }
             
             // Check if already generating
-            if (GenerationWizard.isActive()) {
+            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
+            if (gwActive) {
                 if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
                 return 'executed';
             }
@@ -5732,30 +6406,25 @@ function GameState(hook, text) {
             return 'executed';
         },
         
-        update_quest: function(characterName, questName, objective, progress, total) {
+        update_quest: function(playerName, questName, stage) {
             if (!questName) return 'malformed';
             
-            // If characterName is provided, validate it
-            if (characterName && !isValidCharacterName(characterName)) {
+            // If playerName is provided, validate it
+            if (playerName && !isValidCharacterName(playerName)) {
                 return 'malformed';
             }
             
             questName = String(questName).toLowerCase().replace(/\s+/g, '_');
             
-            // Get the quest card
-            const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
-            if (!questCard) {
+            // Get the quest using universal data system
+            const quest = get(questName);
+            if (!quest || !hasGameplayTag(quest, 'Quest')) {
                 if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
                 return 'unknown';  // Return unknown so it gets removed
             }
             
             // Parse the new stage number
-            let newStage = 1;
-            if (objective && !isNaN(parseInt(objective))) {
-                newStage = parseInt(objective);
-            } else if (progress && !isNaN(parseInt(progress))) {
-                newStage = parseInt(progress);
-            }
+            const newStage = parseInt(stage) || 1;
             
             // Replace "Current Stage: X" with the new value
             let entry = questCard.entry;
@@ -5772,31 +6441,27 @@ function GameState(hook, text) {
             if (!characterName || !questName) return 'malformed';
             
             try {
-                // Validate character name before processing
-                if (!isValidCharacterName(characterName)) {
+                    if (!isValidCharacterName(characterName)) {
                     return 'malformed';
                 }
                 
                 characterName = String(characterName).toLowerCase();
                 questName = String(questName).toLowerCase().replace(/\s+/g, '_');
                 
-                // Find the quest card
-                const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
-                if (!questCard) {
+                // Find the quest using universal data system
+                const quest = get(questName);
+                if (!quest || !hasGameplayTag(quest, 'Quest')) {
                     if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
                     return 'executed';
                 }
-                
-                // Replace the first line to mark as completed
-                let entry = questCard.entry;
-                entry = entry.replace(
-                    '<\$# Quests><\$## Active Quests>',
-                    '<\$# Quests><\$## Completed Quests>'
-                );
-                
-                // Update the card
-                Utilities.storyCard.update(questCard.title, { entry: entry });
-                
+
+                // Update quest status to completed
+                if (!quest.state) quest.state = {};
+                quest.state.status = 'completed';
+
+                // Save the updated quest
+                save(questName, quest);
+
                 if (debug) console.log(`${MODULE_NAME}: Completed quest: ${questName}`);
                 return 'executed';
             } catch (e) {
@@ -5811,23 +6476,20 @@ function GameState(hook, text) {
             characterName = String(characterName).toLowerCase();
             questName = String(questName).toLowerCase().replace(/\s+/g, '_');
             
-            // Find the quest card
-            const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
-            if (!questCard) {
+            // Find the quest using universal data system
+            const quest = get(questName);
+            if (!quest || !hasGameplayTag(quest, 'Quest')) {
                 if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
                 return 'executed';
             }
-            
-            // Replace the first line to mark as abandoned
-            let entry = questCard.entry;
-            entry = entry.replace(
-                '<\$# Quests><\$## Active Quests>',
-                '<\$# Quests><\$## Abandoned Quests>'
-            );
-            
-            // Update the card
-            Utilities.storyCard.update(questCard.title, { entry: entry });
-            
+
+            // Update quest status to abandoned
+            if (!quest.state) quest.state = {};
+            quest.state.status = 'abandoned';
+
+            // Save the updated quest
+            save(questName, quest);
+
             if (debug) console.log(`${MODULE_NAME}: Abandoned quest: ${questName}`);
             return 'executed';
         },
@@ -5835,10 +6497,6 @@ function GameState(hook, text) {
         death: function(characterName) {
             if (!characterName) return 'malformed';
             
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
             
             characterName = String(characterName).toLowerCase();
             if (debug) console.log(`${MODULE_NAME}: Death recorded for: ${characterName}`);
@@ -5851,7 +6509,7 @@ function GameState(hook, text) {
     // ==========================
     function loadEntityTrackerConfig() {
         // Use centralized sectioned config loader
-        const sections = Utilities.config.loadSectioned('[SANE_CONFIG] Entity Tracker', '# ');
+        const sections = Utilities.config.loadSectioned('[SANE:C] Entity Tracker', '# ');
         
         if (Object.keys(sections).length === 0) {
             createEntityTrackerCards();
@@ -5879,7 +6537,7 @@ function GameState(hook, text) {
         
         // First check if character exists in the loaded character cache
         // This is the most reliable way to check for existing characters
-        const allCharacters = loadAll('Character');
+        const allCharacters = queryTags('Character');
         if (allCharacters[entityName]) {
             if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${entityName}`);
             return;
@@ -5896,7 +6554,7 @@ function GameState(hook, text) {
                 
                 const normalizedTriggers = triggers.map(t => String(t).toLowerCase());
                 if (normalizedTriggers.includes(entityName)) {
-                    if (debug) console.log(`${MODULE_NAME}: Skipping tracking - ${entityName} is trigger_name for character: ${character.name}`);
+                    if (debug) console.log(`${MODULE_NAME}: Skipping tracking - ${entityName} is trigger_name for character: ${character.id}`);
                     // Clean up any existing tracking data for this entity
                     removeFromTracker(entityName);
                     return;
@@ -5904,36 +6562,14 @@ function GameState(hook, text) {
             }
         }
         
-        // Also check story cards directly as a fallback
-        const characterCards = Utilities.storyCard.find(card => {
-            if (!card.title.startsWith('[CHARACTER]') && !card.title.startsWith('[PLAYER]')) {
-                return false;
-            }
-            
-            // Check if title matches (case-insensitive)
-            const titleMatch = card.title.match(/\[(CHARACTER|PLAYER)\]\s+(.+)/);
-            if (titleMatch && titleMatch[2] && titleMatch[2].toLowerCase() === entityName) {
-                return true;
-            }
-            
-            // Don't try to parse - just check title
-            // (parsing without FORMAT card would fail anyway)
-            
-            return false;
-        }, true);
-        
-        // If character already exists, don't track
-        if (characterCards && characterCards.length > 0) {
-            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character card: ${entityName}`);
-            return;
-        }
+        // Entity tracking handled by universal data system - no old card fallback needed
         
         // Load and check blacklist from config
         const config = loadEntityTrackerConfig();
         if (config.blacklist && config.blacklist.includes(entityName)) return;
         
         // Load tracker from config card's description field
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
+        const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
         if (!configCard) {
             createEntityTrackerCards();
             return;
@@ -6011,7 +6647,7 @@ function GameState(hook, text) {
             description += `tool: ${data.lastTool}\n`;
         }
         
-        Utilities.storyCard.update('[SANE_CONFIG] Entity Tracker', {
+        Utilities.storyCard.update('[SANE:C] Entity Tracker', {
             description: description
         });
         
@@ -6022,7 +6658,7 @@ function GameState(hook, text) {
     
     function removeFromTracker(entityName) {
         // Load tracker from config card's description field
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
+        const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
         if (!configCard || !configCard.description) return;
         
         let tracker = {};
@@ -6061,7 +6697,7 @@ function GameState(hook, text) {
                 description += `tool: ${data.lastTool}\n`;
             }
             
-            Utilities.storyCard.update('[SANE_CONFIG] Entity Tracker', {
+            Utilities.storyCard.update('[SANE:C] Entity Tracker', {
                 description: description
             });
             
@@ -6077,7 +6713,7 @@ function GameState(hook, text) {
         entityName = entityName.toLowerCase();
         
         // Check if any existing character has this as a trigger_name
-        const allCharacters = loadAll('Character');
+        const allCharacters = queryTags('Character');
         for (const charName in allCharacters) {
             const character = allCharacters[charName];
             if (character.info && character.info.trigger_name) {
@@ -6087,7 +6723,7 @@ function GameState(hook, text) {
                 
                 const normalizedTriggers = triggers.map(t => String(t).toLowerCase());
                 if (normalizedTriggers.includes(entityName)) {
-                    if (debug) console.log(`${MODULE_NAME}: Not triggering generation - ${entityName} already exists as trigger_name for: ${character.name}`);
+                    if (debug) console.log(`${MODULE_NAME}: Not triggering generation - ${entityName} already exists as trigger_name for: ${character.id}`);
                     removeFromTracker(entityName);
                     return false;
                 }
@@ -6095,7 +6731,7 @@ function GameState(hook, text) {
         }
         
         // Load tracker from config card's description
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
+        const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
         if (!configCard || !configCard.description) return false;
         
         let tracker = {};
@@ -6126,7 +6762,7 @@ function GameState(hook, text) {
         if (!entityData) return false;
         
         // Check if already in queue or being generated
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
+        const queueCard = Utilities.storyCard.get('[SANE:C] Entity Queue');
         let queue = [];
         if (queueCard) {
             try {
@@ -6151,7 +6787,7 @@ function GameState(hook, text) {
         entityName = entityName.toLowerCase();
         
         // Get entity tracker data to see what tool referenced this entity
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
+        const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
         let lastTool = null;
         if (configCard && configCard.description) {
             try {
@@ -6179,7 +6815,7 @@ function GameState(hook, text) {
         }
         
         // Fallback to queue system if GenerationWizard not available
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
+        const queueCard = Utilities.storyCard.get('[SANE:C] Entity Queue');
         let queue = [];
         if (queueCard) {
             try {
@@ -6194,66 +6830,12 @@ function GameState(hook, text) {
             queue.push(entityName);
             
             // Save queue to Story Card
-            Utilities.storyCard.update('[SANE_CONFIG] Entity Queue', {
+            Utilities.storyCard.update('[SANE:C] Entity Queue', {
                 entry: JSON.stringify(queue, null, 2),
                 type: 'data'
             });
             
             if (debug) console.log(`${MODULE_NAME}: Added ${entityName} to entity generation queue`);
-        }
-    }
-    
-    function queuePendingEntities() {
-        // Load queue from Story Card
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-        if (!queueCard) return false;
-        
-        let queue = [];
-        try {
-            queue = JSON.parse(queueCard.entry || '[]');
-        } catch (e) {
-            return false;
-        }
-        
-        // If already generating something, wait
-        if (currentEntityGeneration) {
-            if (debug) console.log(`${MODULE_NAME}: Already generating ${currentEntityGeneration}, waiting...`);
-            return false;
-        }
-        
-        // If queue is empty, nothing to do
-        if (queue.length === 0) {
-            return false;
-        }
-        
-        // Pop the first entity from queue
-        const nextEntity = queue.shift();
-        
-        // Save updated queue
-        Utilities.storyCard.update('[SANE_CONFIG] Entity Queue', {
-            entry: JSON.stringify(queue, null, 2),
-            type: 'data'
-        });
-        
-        // Mark as currently generating
-        currentEntityGeneration = nextEntity;
-        
-        if (debug) console.log(`${MODULE_NAME}: Starting generation for ${nextEntity}`);
-        
-        // Trigger GenerationWizard if available
-        if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startEntityGeneration) {
-            // Start the classification query process
-            const classificationData = {
-                name: nextEntity,
-                stage: 'classification'
-            };
-            GenerationWizard.startEntityGeneration(classificationData);
-            return true;
-        } else {
-            if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available for entity generation`);
-            // Clear the current generation flag since we can't proceed
-            currentEntityGeneration = null;
-            return false;
         }
     }
     
@@ -6271,7 +6853,7 @@ function GameState(hook, text) {
         entityName = entityName.toLowerCase();
         
         // Clear from tracker in config card's description
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
+        const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
         if (configCard && configCard.description) {
             try {
                 // Parse tracker data from description
@@ -6303,7 +6885,7 @@ function GameState(hook, text) {
                     description += `tool: ${data.lastTool}\n`;
                 }
                 
-                Utilities.storyCard.update('[SANE_CONFIG] Entity Tracker', {
+                Utilities.storyCard.update('[SANE:C] Entity Tracker', {
                     description: description
                 });
             } catch (e) {
@@ -6359,16 +6941,22 @@ function GameState(hook, text) {
                 // Set cache for all tools to use
                 // Load all characters into entity cache
                 try {
-                    const allChars = loadAll('Character');
+                    const allChars = queryTags('Character');
                     for (const [name, char] of Object.entries(allChars || {})) {
-                        entityCache[`Character.${name}`] = char;
+                        // Update to use just entity ID
+                        dataCache[name] = char;  // New way
+                        dataCache[`Character.${name}`] = char;  // Old way
                     }
                 } catch(e) {
-                    // Fall back to GameState.loadAll if available
-                    if (GameState && GameState.loadAll) {
-                        const allChars = GameState.loadAll('Character');
-                        for (const [name, char] of Object.entries(allChars || {})) {
-                            entityCache[`Character.${name}`] = char;
+                    // Fall back to GameState.queryTags if available
+                    if (GameState && GameState.queryTags) {
+                        const allChars = GameState.queryTags('Character');
+                        for (const char of allChars || []) {
+                            const name = char.aliases && char.aliases[0] ? char.aliases[0] : char.name;
+                            if (name) {
+                                dataCache[name] = char;  // New way
+                                dataCache[`Character.${name}`] = char;  // Old way
+                            }
                         }
                     } else {
                         if (debug) console.log(`${MODULE_NAME}: Unable to load characters: ${e}`);
@@ -6378,15 +6966,17 @@ function GameState(hook, text) {
             }
             
             // Capture revert data BEFORE executing the tool
-            const revertData = captureRevertData(toolName.toLowerCase(), params, getCachedEntitiesOfType('Character'));
-            
-            let result = processToolCall(toolName, params, getCachedEntitiesOfType('Character'));
+            const revertData = captureRevertData(toolName.toLowerCase(), params);
+
+            let result = processToolCall(toolName, params);
             
             // Log tool result
             if (debug) {
                 const toolCall = `${toolName}(${params.join(',')})`;
                 if (result === 'executed') {
                     console.log(`${MODULE_NAME}: Tool EXECUTED: ${toolCall}`);
+                } else if (result === 'permitted') {
+                    console.log(`${MODULE_NAME}: Tool PERMITTED (hallucinated entity): ${toolCall}`);
                 } else if (result === 'malformed') {
                     console.log(`${MODULE_NAME}: Tool MALFORMED: ${toolCall}`);
                 } else if (result === 'unknown') {
@@ -6429,9 +7019,21 @@ function GameState(hook, text) {
                     normalizedParams[3] = questType;
                 }
                 
+                // Check if add_item has negative quantity - convert to remove_item for display
+                let displayToolName = toolName;
+                let displayParams = [...normalizedParams];
+
+                if (toolName.toLowerCase() === 'add_item' && normalizedParams[2]) {
+                    const qty = parseInt(normalizedParams[2]);
+                    if (!isNaN(qty) && qty < 0) {
+                        displayToolName = 'remove_item';
+                        displayParams[2] = String(Math.abs(qty));
+                    }
+                }
+
                 // Build the normalized tool string
-                const normalizedTool = `${toolName}(${normalizedParams.join(', ')})`;
-                
+                const normalizedTool = `${displayToolName}(${displayParams.join(', ')})`;
+
                 if (normalizedTool !== fullMatch) {
                     toolsToModify.push({
                         match: fullMatch,
@@ -6444,6 +7046,7 @@ function GameState(hook, text) {
             }
             
             // Only remove if malformed or unknown tool
+            // Only remove malformed and unknown tools, keep permitted ones
             if (result === 'malformed' || result === 'unknown') {
                 toolsToRemove.push({
                     match: fullMatch,
@@ -6455,6 +7058,7 @@ function GameState(hook, text) {
                     console.log(`${MODULE_NAME}: Marking for removal (${result}): ${fullMatch}`);
                 }
             }
+            // Permitted tools stay in the text but aren't executed
         }
         
         // Apply modifications and removals from end to beginning
@@ -6502,87 +7106,39 @@ function GameState(hook, text) {
         return { modifiedText, executedTools };
     }
     
+    // Helper to convert entity array to dict keyed by name/ID
+    function entitiesToDict(entities) {
+        const dict = {};
+        for (const entity of entities) {
+            const entityId = entity.aliases && entity.aliases[0] ? entity.aliases[0] : 'unknown';
+            if (entityId) {
+                dict[entityId.toLowerCase()] = entity;
+                // Also store by original case for compatibility
+                dict[entityId] = entity;
+            }
+        }
+        return dict;
+    }
+
     // Capture revert data for specific tools
     function captureRevertData(toolName, params, characters) {
-        if (!characters) characters = loadAll('Character');
+        if (!characters) {
+            const entities = queryTags('Character');
+            characters = entitiesToDict(entities);
+        }
         const revertData = {};
         
         switch(toolName) {
             case 'update_location':
                 const char = characters[String(params[0]).toLowerCase()];
                 if (char && char.info) {
-                    revertData.oldLocation = char.info.location;
+                    revertData.oldLocation = char.info.currentLocation;
                 }
                 break;
                 
-            case 'add_item':
-                // Store current quantity so we can revert to it
-                const addChar = characters[String(params[0]).toLowerCase()];
-                if (addChar && addChar.inventory) {
-                    const itemName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                    const currentItem = addChar.inventory[itemName];
-                    revertData.oldQuantity = currentItem ? currentItem.quantity : 0;
-                }
-                break;
-                
-            case 'remove_item':
-                // Store current quantity so we can restore it
-                const removeChar = characters[String(params[0]).toLowerCase()];
-                if (removeChar && removeChar.inventory) {
-                    const itemName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                    const currentItem = removeChar.inventory[itemName];
-                    revertData.oldQuantity = currentItem ? currentItem.quantity : 0;
-                }
-                break;
-                
-            case 'transfer_item':
-                // Store current quantities for both characters
-                const fromChar = characters[String(params[0]).toLowerCase()];
-                const toChar = characters[String(params[1]).toLowerCase()];
-                const transferItem = String(params[2]).toLowerCase().replace(/\s+/g, '_');
-                
-                if (fromChar && fromChar.inventory) {
-                    const fromItem = fromChar.inventory[transferItem];
-                    revertData.fromOldQuantity = fromItem ? fromItem.quantity : 0;
-                }
-                if (toChar && toChar.inventory) {
-                    const toItem = toChar.inventory[transferItem];
-                    revertData.toOldQuantity = toItem ? toItem.quantity : 0;
-                }
-                break;
-                
-            case 'deal_damage':
-                const target = characters[String(params[1]).toLowerCase()];
-                if (target && target.stats && target.stats.hp) {
-                    revertData.oldHp = target.stats.hp.current;
-                }
-                break;
-                
-            case 'update_relationship':
-                const char1 = characters[String(params[0]).toLowerCase()];
-                if (char1 && char1.relationships) {
-                    const char2Name = String(params[1]).toLowerCase();
-                    revertData.oldValue = char1.relationships[char2Name] || 0;
-                }
-                break;
-                
-            case 'add_levelxp':
-                const xpChar = characters[String(params[0]).toLowerCase()];
-                if (xpChar && xpChar.stats && xpChar.stats.level) {
-                    revertData.oldLevel = xpChar.stats.level.value;
-                    revertData.oldXp = xpChar.stats.level.xp ? xpChar.stats.level.xp.current : 0;
-                }
-                break;
-                
-            case 'add_skillxp':
-                const skillChar = characters[String(params[0]).toLowerCase()];
-                const skillName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                if (skillChar && skillChar.skills && skillChar.skills[skillName]) {
-                    const skill = skillChar.skills[skillName];
-                    revertData.oldLevel = skill.level || 1;
-                    revertData.oldXp = skill.xp ? skill.xp.current : 0;
-                }
-                break;
+            // These tools use inverse operations, no data storage needed:
+            // add_item, remove_item, transfer_item, deal_damage, 
+            // update_relationship, add_levelxp, add_skillxp
                 
             default:
                 // Check if this is an update_[stat] tool
@@ -6625,10 +7181,15 @@ function GameState(hook, text) {
         // Check for dynamic core stat tools (update_hp, update_mp, etc)
         if (normalizedToolName.startsWith('update_')) {
             // Just try to process it as a core stat tool
-            // The function will handle validation
-            if (processCoreStatTool(normalizedToolName, params)) {
+            const result = processCoreStatTool(normalizedToolName, params);
+            if (result === true) {
                 return 'executed';
+            } else if (result === 'not_found') {
+                // Character doesn't exist - permit the tool to allow hallucination
+                return 'permitted';
             }
+            // Other failures are malformed
+            return 'malformed';
         }
         
         // Check runtime tools
@@ -6657,10 +7218,10 @@ function GameState(hook, text) {
             const statName = toolName.substring(11).toLowerCase();
             
             // Load the character
-            const character = load('Character', characterName);
+            const character = get(characterName);
             if (!character) {
                 if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                return false;
+                return 'not_found';
             }
             
             const newMax = parseInt(params[1]);
@@ -6680,8 +7241,8 @@ function GameState(hook, text) {
                 character.stats[statName].current = newMax;
             }
             
-            save('Character', character);
-            if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s max ${statName} to ${newMax}`);
+            save(characterName, character);
+            if (debug) console.log(`${MODULE_NAME}: Set ${characterName}'s max ${statName} to ${newMax}`);
             return true;
         }
         
@@ -6689,10 +7250,10 @@ function GameState(hook, text) {
         const statName = toolName.substring(7).toLowerCase();
         
         // Load the character
-        const character = load('Character', characterName);
+        const character = get(characterName);
         if (!character) {
             if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-            return false;
+            return 'not_found';
         }
         
         const current = parseInt(params[1]);
@@ -6701,28 +7262,38 @@ function GameState(hook, text) {
             return false;
         }
         
-        // Update current value using component paths
-        // First check stats component
-        if (character.stats && character.stats[statName]) {
-            if (typeof character.stats[statName] === 'object') {
-                character.stats[statName].current = current;
-            }
-        }
-        // Fallback to legacy paths
-        else if (character[statName] && typeof character[statName] === 'object') {
-            character[statName].current = current;
-        }
-        // Try coreStats for very old format
-        else if (character.coreStats && character.coreStats[statName]) {
-            character.coreStats[statName].current = current;
-        }
-        else {
-            if (debug) console.log(`${MODULE_NAME}: Stat ${statName} not found on character`);
-            return false;
+        // Initialize stats component if missing
+        if (!character.stats) {
+            character.stats = {};
         }
         
-        save('Character', character);
-        if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s current ${statName} to ${current}`);
+        // Initialize the stat if it doesn't exist
+        if (!character.stats[statName]) {
+            // Stats like hp/mp have current/max, others might just have value
+            if (statName === 'hp' || statName === 'mp' || statName === 'sp' || statName === 'stamina') {
+                character.stats[statName] = { current: 100, max: 100 };
+            } else {
+                character.stats[statName] = { value: current };
+            }
+            if (debug) console.log(`${MODULE_NAME}: Created new stat ${statName} for ${character.id}`);
+        }
+        
+        // Update the stat value
+        if (typeof character.stats[statName] === 'object') {
+            // Check if this stat uses current/max or just value
+            if ('current' in character.stats[statName]) {
+                character.stats[statName].current = current;
+                // NO 3rd parameter handling - use update_max_[stat] instead
+            } else if ('value' in character.stats[statName]) {
+                character.stats[statName].value = current;
+            } else {
+                // Fallback - assume it's a value-based stat
+                character.stats[statName].value = current;
+            }
+        }
+        
+        save(characterName, character);
+        if (debug) console.log(`${MODULE_NAME}: Updated ${characterName}'s ${statName} to ${current}`);
         return true;
     }
     
@@ -6730,223 +7301,111 @@ function GameState(hook, text) {
     // Debug Helper Functions (only work when debug = true)
     // ==========================
     
-    // Handle debug commands directly
+    // Load debug commands from external module if available
     function handleDebugCommand(commandName, args) {
         const debugCommands = [
-            // GenerationWizard tests
-            'gw_activate', 'gw_npc', 'gw_quest', 'gw_location',
-            // Status and listing commands
+            'gw_activate', 'gw_npc', 'gw_quest', 'gw_location', 'gw_status', 'gw_blueprints',
             'entity_status', 'char_list', 'schema_all',
-            // System tests
             'runtime_test', 'test_footer', 'test_info', 'test_template', 'test_inventory', 'test_all',
-            // Maintenance
             'cleanup', 'fix_format',
-            // Debug utilities
             'debug_log', 'debug_help'
         ];
-        
-        // Check if it's a debug command
+
         if (debugCommands.includes(commandName)) {
             if (commandName === 'debug_help') {
                 return `\n<<<[DEBUG COMMANDS]\n${debugCommands.filter(c => c !== 'debug_help').map(c => `/${c}`).join('\n')}>>>\n`;
             }
-            
+
             if (commandName === 'debug_log') {
-                const result = outputDebugLog();
-                return `\n<<<${result}>>>\n`;
+                return `\n<<<${outputDebugLog()}>>>\n`;
             }
-            
-            // GenerationWizard tests
+
             if (commandName === 'gw_activate') {
                 if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
                 GenerationWizard('activate', null);
                 return "\n<<<GenerationWizard activated for next turn>>>\n";
             }
-            
+
             if (commandName === 'gw_npc') {
                 if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                const result = GenerationWizard.startGeneration('NPC', {name: 'Debug_Test_NPC'});
-                const progressCard = Utilities.storyCard.get('[ENTITY_GEN] In Progress');
-                const isActive = GenerationWizard.isActive();
-                console.log(`[DEBUG] Started NPC generation for Debug_Test_NPC\nResult: ${result}\nActive: ${isActive}\nProgress card exists: ${progressCard ? 'yes' : 'no'}`);
-                return "\n<<<Started NPC generation for Debug_Test_NPC>>>\n";
-            }
-            
-            if (commandName === 'gw_quest') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Quest', {
-                    NAME: 'Debug_Test_Quest',
-                    QUEST_GIVER: 'Debug_NPC',
-                    QUEST_TYPE: 'side',
-                    STAGE_COUNT: 3
+                const triggerName = `debug_trigger_${Math.floor(Math.random() * 10000)}`;
+                const result = GenerationWizard.startGeneration('Character', {
+                    'info.trigger_name': triggerName
                 });
-                return "\n<<<Started Quest generation for Debug_Test_Quest>>>\n";
+                const progressCard = Utilities.storyCard.get('[GW_IN_PROGRESS]');
+                console.log(`[DEBUG] Started Character generation for trigger: ${triggerName}`);
+                return `\n<<<Started Character generation for trigger: ${triggerName}>>>\n`;
             }
-            
-            if (commandName === 'gw_location') {
+
+            if (commandName === 'gw_status') {
                 if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Location', null, {NAME: 'Debug_Test_Location'});
-                return "\n<<<Started Location generation for Debug_Test_Location>>>\n";
-            }
-            
-            // Status and listing commands
-            if (commandName === 'entity_status') {
-                const config = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
-                const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-                
-                let status = `Entity Tracker Status:\n`;
-                if (config) {
-                    const parsed = parseConfigEntry(config.entry || '');
-                    status += `- Threshold: ${parsed.threshold || 3}\n`;
-                    status += `- Auto Generate: ${parsed.auto_generate || 'true'}\n`;
-                    status += `- Blacklist: ${parsed.blacklist || 'none'}\n`;
+                const progressCard = Utilities.storyCard.get('[GW_IN_PROGRESS]');
+                const queueCard = Utilities.storyCard.get('[GW_STATE] Queue');
+
+                let status = "=== GenerationWizard Status ===\n";
+                status += `Active: ${Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null}\n`;
+
+                if (progressCard) {
+                    try {
+                        const data = JSON.parse(progressCard.entry || '{}');
+                        status += `\nIn Progress:\n`;
+                        status += `- Type: ${data.entityType}\n`;
+                        status += `- Trigger: ${data.triggerName}\n`;
+                        status += `- Blueprint: ${data.blueprintName}\n`;
+                    } catch (e) {}
                 }
-                
-                if (queueCard && queueCard.entry) {
-                    const lines = queueCard.entry.split('\n').filter(l => l.trim());
-                    status += `- Queue has ${lines.length} entities\n`;
-                }
-                
+
                 return status;
             }
-            
-            if (commandName === 'char_list') {
-                const chars = loadAll('Character');
-                const names = Object.keys(chars);
-                return `Characters (${names.length}): ${names.join(', ')}`;
+
+            if (commandName === 'gw_blueprints') {
+                const blueprints = Utilities.storyCard.find(card => card.title && card.title.startsWith('[SANE:BP]'), true) || [];
+                const prompts = Utilities.storyCard.find(card => card.title && card.title.startsWith('[GW:P]'), true) || [];
+
+                let output = "=== Blueprints and Prompts ===\n";
+                output += "\n[SANE:BP] Blueprints:\n";
+                blueprints.forEach(bp => {
+                    const name = bp.title.replace('[SANE:BP] ', '');
+                    output += `  • ${name}\n`;
+                });
+
+                output += "\n[GW:P] Prompts:\n";
+                prompts.forEach(p => {
+                    const name = p.title.replace('[GW:P] ', '');
+                    output += `  • ${name}\n`;
+                });
+
+                return output;
             }
-            
-            if (commandName === 'schema_all') {
-                const entities = [
-                    '[SANE_ENTITY] Character',
-                    '[SANE_ENTITY] Location', 
-                    '[SANE_ENTITY] Item',
-                    '[SANE_ENTITY] Faction',
-                    '[SANE_ENTITY] Global'
-                ];
-                
-                let result = "=== All Entity Types ===\n";
-                for (const title of entities) {
-                    const card = Utilities.storyCard.get(title);
-                    if (card) {
-                        result += `\n${title}:\n${(card.description || '').substring(0, 200)}...\n`;
-                    }
-                }
-                return result;
-            }
-            
-            // System tests
-            if (commandName === 'runtime_test') {
-                // Test runtime variables
-                const testVar = 'debug_test_var';
-                set(`Global.${testVar}`, 'test_value_' + Date.now());
-                const value = get(`Global.${testVar}`);
-                return `Set Global.${testVar} = ${value}`;
-            }
-            
-            // Maintenance
+
             if (commandName === 'cleanup') {
-                const testNames = ['Debug_Test_NPC', 'Debug_Test_Monster', 'Debug_Test_Boss', 
-                                 'Debug_Test_Item', 'Debug_Test_Location', 'Debug_Test_Quest',
-                                 'DebugFooterTest', 'QuickTest', 'TemplateTest'];
+                const testNames = ['Debug_Test_NPC', 'Debug_Test_Monster', 'Debug_Test_Boss',
+                                 'DebugFooterTest', 'QuickTest', 'TemplateTest',
+                                 'TempNPC_', 'debug_trigger_'];
                 let removed = 0;
-                
+
                 for (const name of testNames) {
-                    // Try both CHARACTER and PLAYER prefixes
-                    const titles = [`[CHARACTER] ${name}`, `[PLAYER] ${name}`];
-                    for (const title of titles) {
-                        if (Utilities.storyCard.get(title)) {
-                            Utilities.storyCard.remove(title);
-                            removed++;
-                        }
+                    const saneCards = Utilities.storyCard.find(
+                        card => card.title && card.title.includes(name),
+                        true
+                    ) || [];
+
+                    for (const card of saneCards) {
+                        Utilities.storyCard.remove(card.title);
+                        removed++;
                     }
                 }
-                
-                return `Cleanup complete. Removed ${removed} debug cards.`;
+
+                return `Cleanup complete. Removed ${removed} debug/test cards.`;
             }
-            
-            
-            if (commandName === 'test_datastorage') {
-                let result = '=== Testing Data Storage System ===\n\n';
-                
-                // Create test character with various info fields
-                const testChar = {
-                    name: 'DataTest',
-                    info: {
-                        isPlayer: false,
-                        gender: 'Male',
-                        race: 'Human',
-                        class: 'Warrior',
-                        location: 'Test_Zone',
-                        // Test arbitrary info fields
-                        favorite_color: 'blue',
-                        secret_fear: 'spiders',
-                        battle_cry: 'For glory!',
-                        hometown: 'Village_of_Testing'
-                    },
-                    stats: {
-                        level: {
-                            value: 5,
-                            xp: { current: 2500, max: 3000 }
-                        },
-                        hp: { current: 85, max: 100 }
-                    },
-                    inventory: {
-                        iron_sword: 1,
-                        health_potion: 3
-                    }
-                };
-                
-                // Save the character
-                save('Character', testChar);
-                result += '1. Character saved with arbitrary info fields\n';
-                
-                // Check the card's DESCRIPTION field
-                const card = Utilities.storyCard.get('[CHARACTER] DataTest');
-                if (card && card.description) {
-                    result += '\n2. DESCRIPTION field contains:\n';
-                    if (card.description.includes('<== REAL DATA ==>')) {
-                        result += '   ✓ Data markers found\n';
-                        if (card.description.includes('favorite_color: blue')) {
-                            result += '   ✓ Arbitrary info field saved\n';
-                        }
-                        if (card.description.includes('secret_fear: spiders')) {
-                            result += '   ✓ Another arbitrary field saved\n';
-                        }
-                    } else {
-                        result += '   ✗ No data markers - using old format\n';
-                    }
-                }
-                
-                // Load the character back
-                const loaded = load('Character', 'DataTest');
-                result += '\n3. Loading character back:\n';
-                result += `   Level: ${get('Character.DataTest.stats.level')}\n`;
-                result += `   Location: ${get('Character.DataTest.info.location')}\n`;
-                result += `   Favorite Color: ${get('Character.DataTest.info.favorite_color') || 'undefined'}\n`;
-                result += `   Secret Fear: ${get('Character.DataTest.info.secret_fear') || 'undefined'}\n`;
-                result += `   Battle Cry: ${get('Character.DataTest.info.battle_cry') || 'undefined'}\n`;
-                
-                // Test setting a new arbitrary field
-                set('Character.DataTest.info.lucky_number', 7);
-                result += '\n4. Added new info field via set()\n';
-                result += `   Lucky Number: ${get('Character.DataTest.info.lucky_number')}\n`;
-                
-                // Clean up
-                Utilities.storyCard.remove('[CHARACTER] DataTest');
-                result += '\n5. Test complete - card cleaned up\n';
-                
-                return result;
-            }
-            
-            
+
             return null;
         }
-        
+
         return null;
     }
-    
-    
+
+
     // ==========================
     // Hook Processing
     // ==========================
@@ -6954,209 +7413,311 @@ function GameState(hook, text) {
     // Auto-initialize runtime cards on first run
     
     // Auto-initialize entity tracker cards
-    if (!Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker')) {
+    if (!Utilities.storyCard.get('[SANE:C] Entity Tracker')) {
         createEntityTrackerCards();
+    }
+
+    // Auto-initialize global variables card
+    if (!Utilities.storyCard.get('[SANE:G] Variables')) {
+        Utilities.storyCard.add({
+            title: '[SANE:G] Variables',
+            type: 'data',
+            entry: '# Global Variables Definition\n' +
+                   'frontline: integer = 1 // Current highest floor reached\n' +
+                   'currentFloor: integer = 1 // Floor the player is on\n' +
+                   'weather: string = "clear" // Current weather conditions',
+            description: 'Define variables as: name: type = default // description'
+        });
+        if (debug) console.log(`${MODULE_NAME}: Created [SANE:G] Variables card`);
+    }
+
+    // Auto-initialize [SANE:D] Data card with Global entity
+    if (!Utilities.storyCard.get('[SANE:D] Data')) {
+        // Create initial Global entity with default values from [SANE:G] Variables
+        const globalEntity = {
+            id: 'Global',
+            frontline: 1,
+            currentFloor: 1,
+            weather: 'clear'
+        };
+
+        // Save to [SANE:D] Data card
+        Utilities.storyCard.add({
+            title: '[SANE:D] Data',
+            type: 'data',
+            entry: 'Data chunk 1 of 1',
+            description: JSON.stringify({ Global: globalEntity }, null, 2)
+        });
+        if (debug) console.log(`${MODULE_NAME}: Created initial [SANE:D] Data card with Global entity`);
     }
 
     // Test dynamic resolution functionality
     
     // Initialize SANE schemas if they don't exist
-    function createSANESchemas() {
-        // Create new SANE_ENTITY cards
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Character')) {
+    function createSANEBlueprints() {
+        // Create complete blueprint templates with all component data
+
+        // Character blueprint
+        if (!Utilities.storyCard.get('[SANE:BP] Character')) {
             Utilities.storyCard.add({
-                title: '[SANE_ENTITY] Character',
+                title: '[SANE:BP] Character',
                 description: JSON.stringify({
-                    components: ['info', 'stats', 'attributes', 'skills', 'inventory', 'relationships'],
-                    prefixes: ['CHARACTER', 'PLAYER'],
-                    dataOnly: false
+                    id: 'Character',
+                    GameplayTags: ['Character'],
+                    components: ['info', 'stats', 'skills', 'inventory', 'attributes', 'relationships', 'display'],
+                    aliases: [],
+
+                    info: {
+                        gender: null,
+                        race: null,
+                        class: null,
+                        currentLocation: null,
+                        username: null,
+                        realname: null,
+                        description: null,
+                        appearance: null,
+                        personality: null,
+                        background: null,
+                        display: [
+                            { line: "nameline", priority: 10, format: "## **{username || id}**" },
+                            { line: "nameline", priority: 11, format: " [{realname}]", condition: "{realname}" },
+                            { line: "infoline", priority: 10, format: "Gender: {gender}", condition: "{gender}" },
+                            { line: "infoline", priority: 20, format: "Class: {class}", condition: "{class}" },
+                            { line: "infoline", priority: 50, format: "Location: {currentLocation}", condition: "{currentLocation}" }
+                        ]
+                    },
+
+                    stats: {
+                        level: { value: 1, xp: { current: 0, max: 500 } },
+                        hp: { current: 100, max: 100 },
+                        display: [
+                            { line: "infoline", priority: 30, format: "Level {level.value} ({level.xp.current}/{level.xp.max})" },
+                            { line: "infoline", priority: 40, format: "HP: {hp.current}/{hp.max}" }
+                        ]
+                    },
+
+                    skills: {
+                        display: {
+                            line: "section",
+                            priority: 30,
+                            format: "**Skills**\n{*\\: • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}"
+                        }
+                    },
+
+                    inventory: {
+                        display: {
+                            line: "section",
+                            priority: 40,
+                            format: "**Inventory**\n{*\\: • {*} x{*.quantity}}"
+                        }
+                    },
+
+                    attributes: {
+                        display: {
+                            line: "section",
+                            priority: 20,
+                            format: "**Attributes**\n{*\\: • {*}: {*.value}}"
+                        }
+                    },
+
+                    relationships: {
+                        display: {
+                            line: "section",
+                            priority: 50,
+                            format: "**Relationships**\n{*\\: • {capitalize(*)}: {*.value} ({getRelationshipFlavor(*, id, *.value)})}",
+                        }
+                    },
+
+                    display: {
+                        prefixline: "<$# Character>",
+                        separators: {
+                            nameline: " ",
+                            infoline: " | ",
+                            section: "\n",
+                            footer: "\n"
+                        },
+                        order: ["prefixline", "nameline", "infoline", "section", "footer"],
+                        active: false  // Should be false in blueprint - set to true when generation completes
+                    }
                 }, null, 2),
-                type: 'schema'
+                type: 'blueprint'
             });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_ENTITY] Character');
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:BP] Character');
+        }
+
+        // Location blueprint
+        if (!Utilities.storyCard.get('[SANE:BP] Location')) {
+            Utilities.storyCard.add({
+                title: '[SANE:BP] Location',
+                description: JSON.stringify({
+                    id: 'Location',
+                    GameplayTags: ['Location'],
+                    components: ['info', 'pathways', 'display'],
+                    aliases: [],
+
+                    info: {
+                        type: null,
+                        description: null,
+                        atmosphere: null,
+                        display: [
+                            { line: "nameline", priority: 10, format: "## **{id}**" },
+                            { line: "infoline", priority: 10, format: "{type}" },
+                            { line: "infoline", priority: 20, format: "{description}" }
+                        ]
+                    },
+
+                    pathways: {
+                        display: {
+                            line: "section",
+                            priority: 30,
+                            format: "**Exits**\n{*: • {*}: {*}}",
+                            condition: "{Object.keys(pathways).filter(k => k !== 'display').length > 0}"
+                        }
+                    },
+
+                    display: {
+                        prefixline: "<$# Location>",
+                        separators: {
+                            nameline: " ",
+                            infoline: " | ",
+                            section: "\n"
+                        },
+                        order: ["prefixline", "nameline", "infoline", "section"],
+                        active: false  // Should be false in blueprint - set to true when generation completes
+                    }
+                }, null, 2),
+                type: 'blueprint'
+            });
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:BP] Location');
         }
     }
-    
-    // Initialize component definitions using new SANE_COMP cards
-    function createComponentSchemas() {
-        // Info component
-        if (!Utilities.storyCard.get('[SANE_COMP] info')) {
+
+    function createSANESchemas() {
+        // Create component schemas using [SANE:S] cards
+        // All schemas use embedded display rules within defaults
+
+        // Stats component
+        if (!Utilities.storyCard.get('[SANE:S] stats')) {
             Utilities.storyCard.add({
-                title: '[SANE_COMP] info',
-                description: JSON.stringify({
-                    fields: {
-                        gender: "string",
-                        race: "string", 
-                        class: "string",
-                        location: "reference:Location",
-                        faction: "reference:Faction",
-                        appearance: "string",
-                        personality: "string",
-                        background: "string"
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] info');
-        }
-        
-        // Stats component with progression formulas
-        if (!Utilities.storyCard.get('[SANE_COMP] stats')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] stats',
+                title: '[SANE:S] stats',
                 description: JSON.stringify({
                     defaults: {
-                        level: {
-                            value: 1,
-                            xp: { current: 0, max: 500 }
-                        },
-                        hp: { current: 100, max: 100 }
+                        level: { value: 1, xp: { current: 0, max: 500 } },
+                        hp: { current: 100, max: 100 },
+                        display: [
+                            { line: "infoline", priority: 30, format: "Level {level.value} ({level.xp.current}/{level.xp.max})" },
+                            { line: "infoline", priority: 40, format: "HP: {hp.current}/{hp.max}" }
+                        ]
                     },
                     level_progression: {
-                        xp_formula: "level * (level - 1) * 500",
-                        xp_overrides: {
-                            "1": 500,
-                            "2": 1000
-                        }
-                    },
-                    hp_progression: {
-                        base: 100,
-                        per_level: 20
+                        xp_formula: "level * (level - 1) * 500"
                     }
                 }, null, 2),
                 type: 'schema'
             });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] stats with progression formulas');
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] stats');
         }
-        
-        // Attributes component with master attributes
-        if (!Utilities.storyCard.get('[SANE_COMP] attributes')) {
+
+        // Info component
+        if (!Utilities.storyCard.get('[SANE:S] info')) {
             Utilities.storyCard.add({
-                title: '[SANE_COMP] attributes',
+                title: '[SANE:S] info',
                 description: JSON.stringify({
                     defaults: {
-                        "VITALITY": { "value": 10 },
-                        "STRENGTH": { "value": 10 },
-                        "DEXTERITY": { "value": 10 },
-                        "AGILITY": { "value": 10 }
-                    },
-                    registry: {
-                        "VITALITY": {
-                            "description": "Determines max HP and resistance to status effects",
-                            "abbreviation": "VIT"
-                        },
-                        "STRENGTH": {
-                            "description": "Physical power for melee damage and carry capacity",
-                            "abbreviation": "STR"
-                        },
-                        "DEXTERITY": {
-                            "description": "Precision and accuracy for critical hits",
-                            "abbreviation": "DEX"
-                        },
-                        "AGILITY": {
-                            "description": "Speed and evasion capabilities",
-                            "abbreviation": "AGI"
+                        gender: null,
+                        race: null,
+                        class: null,
+                        currentLocation: null,
+                        username: null,
+                        realname: null,
+                        description: null,
+                        appearance: null,
+                        display: [
+                            { line: "nameline", priority: 10, format: "## **{id}**" },
+                            { line: "nameline", priority: 11, format: " [{realname}]", condition: "{realname}" },
+                            { line: "infoline", priority: 10, format: "{gender}" },
+                            { line: "infoline", priority: 20, format: "{class}" },
+                            { line: "infoline", priority: 50, format: "Location: {currentLocation}" }
+                        ]
+                    }
+                }, null, 2),
+                type: 'schema'
+            });
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] info');
+        }
+
+    // Removed createComponentSchemas - all schemas now in createSANESchemas with embedded display format
+
+        // Inventory component
+        if (!Utilities.storyCard.get('[SANE:S] inventory')) {
+            Utilities.storyCard.add({
+                title: '[SANE:S] inventory',
+                description: JSON.stringify({
+                    defaults: {
+                        display: {
+                            line: "section",
+                            priority: 40,
+                            format: "**Inventory**\n{*: • {*} x{*.quantity}}",
+                            condition: "{Object.keys(inventory).length > 0}"
                         }
                     }
                 }, null, 2),
                 type: 'schema'
             });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] attributes with master attributes');
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] inventory');
         }
-        
-        // Skills component with comprehensive registry and formulas
-        if (!Utilities.storyCard.get('[SANE_COMP] skills')) {
+
+        // Skills component
+        if (!Utilities.storyCard.get('[SANE:S] skills')) {
             Utilities.storyCard.add({
-                title: '[SANE_COMP] skills',
+                title: '[SANE:S] skills',
                 description: JSON.stringify({
-                    defaults: {},  // Skills are dynamic, added as needed
-                    categories: {
-                        "default": { "xp_formula": "level * 100", "description": "Standard progression" },
-                        "combat": { "xp_formula": "level * 80", "description": "Fighting and weapon skills" },
-                        "crafting": { "xp_formula": "level * 150", "description": "Creating items and equipment" },
-                        "social": { "xp_formula": "level * 120", "description": "Interpersonal abilities" },
-                        "gathering": { "xp_formula": "level * 130", "description": "Resource collection" },
-                        "support": { "xp_formula": "level * 90", "description": "Combat support abilities" }
-                    },
-                    registry: {
-                        // Combat skills
-                        "one_handed_sword": { "category": "combat" },
-                        "two_handed_sword": { "category": "combat" },
-                        "rapier": { "category": "combat" },
-                        "one_handed_curved_sword": { "category": "combat" },
-                        "dagger": { "category": "combat" },
-                        "blade_throwing": { "xp_formula": "level * 110" },
-                        "spear": { "category": "combat" },
-                        "mace": { "category": "combat" },
-                        "katana": { "xp_formula": "level * 200" },
-                        "martial_arts": { "category": "combat" },
-                        "scimitar": { "xp_formula": "level * 150" },
-                        
-                        // Combat Support
-                        "parrying": { "category": "support" },
-                        "battle_healing": { "category": "support" },
-                        "searching": { "category": "support" },
-                        "tracking": { "xp_formula": "level * 120" },
-                        "hiding": { "category": "support" },
-                        "night_vision": { "category": "support" },
-                        "extended_weight_limit": { "category": "support" },
-                        "straining": { "category": "support" },
-                        
-                        // Crafting
-                        "blacksmithing": { "category": "crafting" },
-                        "tailoring": { "category": "crafting" },
-                        "cooking": { "category": "crafting" },
-                        "alchemy": { "category": "crafting" },
-                        "woodcrafting": { "category": "crafting" },
-                        
-                        // Gathering
-                        "fishing": { "xp_formula": "level * 200" },
-                        "herbalism": { "category": "gathering" },
-                        "mining": { "category": "gathering" },
-                        
-                        // Social
-                        "trading": { "category": "social" },
-                        "negotiation": { "category": "social" },
-                        "persuasion": { "category": "social" },
-                        "intimidation": { "category": "social" },
-                        "bartering": { "category": "social" },
-                        "leadership": { "xp_formula": "level * 140" },
-                        "performing": { "category": "social" }
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] skills with full registry');
-        }
-        
-        // Inventory component with quantity tracking
-        if (!Utilities.storyCard.get('[SANE_COMP] inventory')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] inventory',
-                description: JSON.stringify({
-                    defaults: {},  // Items added dynamically
-                    structure: {
-                        // Each item stored as: "item_name": { "quantity": number }
-                        example: {
-                            "health_potion": { "quantity": 5 },
-                            "iron_sword": { "quantity": 1 },
-                            "bread": { "quantity": 10 }
+                    defaults: {
+                        display: {
+                            line: "section",
+                            priority: 30,
+                            format: "**Skills**\n{*: • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
+                            condition: "{Object.keys(skills).length > 0}"
                         }
                     },
-                    // Note: Item registry could be added here for validation
-                    // registry: { "health_potion": { "max_stack": 99, "type": "consumable" } }
+                    registry: ["One_Handed_Sword", "Two_Handed_Sword", "Rapier", "Shield", "Parry",
+                              "Battle_Healing", "Searching", "Tracking", "Hiding", "Night_Vision",
+                              "Sprint", "Acrobatics", "Cooking", "Fishing", "Blacksmithing",
+                              "Tailoring", "Alchemy", "Medicine_Mixing"]
                 }, null, 2),
                 type: 'schema'
             });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] inventory with quantity tracking');
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] skills');
         }
-        
-        // Relationships component with detailed thresholds
-        if (!Utilities.storyCard.get('[SANE_COMP] relationships')) {
+
+        // Attributes component
+        if (!Utilities.storyCard.get('[SANE:S] attributes')) {
             Utilities.storyCard.add({
-                title: '[SANE_COMP] relationships',
+                title: '[SANE:S] attributes',
                 description: JSON.stringify({
-                    defaults: {},  // Relationships are dynamic
+                    defaults: {
+                        STRENGTH: { value: 10 },
+                        AGILITY: { value: 10 },
+                        VITALITY: { value: 10 },
+                        display: {
+                            line: "infoline",
+                            priority: 25,
+                            format: "STR: {STRENGTH.value} | AGI: {AGILITY.value} | VIT: {VITALITY.value}"
+                        }
+                    },
+                    registry: ["STRENGTH", "AGILITY", "VITALITY", "INTELLIGENCE", "WISDOM", "CHARISMA", "LUCK"]
+                }, null, 2),
+                type: 'schema'
+            });
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] attributes');
+        }
+
+        // Relationships component
+        if (!Utilities.storyCard.get('[SANE:S] relationships')) {
+            Utilities.storyCard.add({
+                title: '[SANE:S] relationships',
+                description: JSON.stringify({
+                    id: 'relationships',
                     thresholds: [
                         { min: -9999, max: -2000, flavor: "{from}'s hatred for {to} consumes their every thought" },
                         { min: -1999, max: -1000, flavor: "{from} would sacrifice everything to see {to} destroyed" },
@@ -7170,83 +7731,224 @@ function GameState(hook, text) {
                         { min: 50, max: 99, flavor: "{from} enjoys {to}'s company" },
                         { min: 100, max: 199, flavor: "{from} considers {to} a friend" },
                         { min: 200, max: 499, flavor: "{from} cares deeply about {to}'s wellbeing" },
-                        { min: 500, max: 999, flavor: "{from} has strong affection and loyalty toward {to}" },
-                        { min: 1000, max: 1999, flavor: "{from} loves {to} deeply" },
+                        { min: 500, max: 999, flavor: "{from} trusts {to} completely" },
+                        { min: 1000, max: 1999, flavor: "{from} considers {to} family" },
                         { min: 2000, max: 9999, flavor: "{from} would do absolutely anything for {to}" }
                     ]
                 }, null, 2),
                 type: 'schema'
             });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] relationships with detailed thresholds');
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] relationships');
         }
-        
-        // Pathways component (for locations)
-        if (!Utilities.storyCard.get('[SANE_COMP] pathways')) {
+
+        // Pathways component
+        if (!Utilities.storyCard.get('[SANE:S] pathways')) {
             Utilities.storyCard.add({
-                title: '[SANE_COMP] pathways',
+                title: '[SANE:S] pathways',
                 description: JSON.stringify({
-                    fields: {
-                        north: "reference:Location",
-                        south: "reference:Location",
-                        east: "reference:Location",
-                        west: "reference:Location",
-                        up: "reference:Location",
-                        down: "reference:Location",
-                        inside: "reference:Location",
-                        outside: "reference:Location"
+                    defaults: {
+                        north: null,
+                        south: null,
+                        east: null,
+                        west: null,
+                        up: null,
+                        down: null,
+                        display: {
+                            line: "section",
+                            priority: 60,
+                            format: "**Exits**\n{*: • {*}: to {*}}",
+                            condition: "{Object.keys(pathways).length > 0}"
+                        }
+                    },
+                    // Direction opposites for bidirectional pathways
+                    // Scenarios can override/extend this in their own [SANE:S] pathways card
+                    opposites: {
+                        'north': 'south',
+                        'south': 'north',
+                        'east': 'west',
+                        'west': 'east',
+                        'inside': 'outside',
+                        'outside': 'inside',
+                        'above': 'below',
+                        'below': 'above'
                     }
                 }, null, 2),
                 type: 'schema'
             });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] pathways');
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] pathways');
+        }
+
+        // Objectives component
+        if (!Utilities.storyCard.get('[SANE:S] objectives')) {
+            Utilities.storyCard.add({
+                title: '[SANE:S] objectives',
+                description: JSON.stringify({
+                    defaults: {
+                        type: null,
+                        status: "active",
+                        stages: {},
+                        display: {
+                            line: "section",
+                            priority: 35,
+                            format: "**Objectives** [{type}]\n{stages: • Stage {*}: {*}}",
+                            condition: "{status === 'active'}"
+                        }
+                    }
+                }, null, 2),
+                type: 'schema'
+            });
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] objectives');
+        }
+
+        // Rewards component
+        if (!Utilities.storyCard.get('[SANE:S] rewards')) {
+            Utilities.storyCard.add({
+                title: '[SANE:S] rewards',
+                description: JSON.stringify({
+                    defaults: {
+                        xp: 0,
+                        col: 0,
+                        items: {},
+                        display: {
+                            line: "section",
+                            priority: 45,
+                            format: "**Rewards**\nXP: {xp} | Col: {col}\n{items: • {*} x{*.quantity}}",
+                            condition: "{xp > 0 || col > 0 || Object.keys(items).length > 0}"
+                        }
+                    }
+                }, null, 2),
+                type: 'schema'
+            });
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] rewards');
+        }
+
+        // Display component
+        if (!Utilities.storyCard.get('[SANE:S] display')) {
+            Utilities.storyCard.add({
+                title: '[SANE:S] display',
+                description: JSON.stringify({
+                    defaults: {
+                        prefixline: null,
+                        footer: null,
+                        separators: {
+                            nameline: " ",
+                            infoline: " | ",
+                            section: "\n",
+                            footer: "\n"
+                        },
+                        order: ["prefixline", "nameline", "infoline", "section", "footer"],
+                        active: true
+                    }
+                }, null, 2),
+                type: 'schema'
+            });
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] display');
+        }
+
+        // GenerationWizard progress component
+        if (!Utilities.storyCard.get('[SANE:S] gw_progress')) {
+            Utilities.storyCard.add({
+                title: '[SANE:S] gw_progress',
+                description: JSON.stringify({
+                    defaults: {
+                        status: "collecting",
+                        turnsElapsed: 0,
+                        currentField: null,
+                        retryCount: 0,
+                        lastActivity: 0,
+                        fieldsCollected: {},
+                        fieldsRemaining: [],
+                        display: null  // No display for progress tracking
+                    }
+                }, null, 2),
+                type: 'schema'
+            });
+            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] gw_progress');
         }
     }
     
     // Auto-initialize SANE schemas on first run
+    createSANEBlueprints();
     createSANESchemas();
-    createComponentSchemas();
-    
+
+    // Initialize data cache after creating schemas
+    initializeDataCache();
 
     // Public API
-    
+
     // Universal Data System - NEW PRIMARY API
-    GameState.load = load;
     GameState.save = save;
-    GameState.loadAll = loadAll;
-    GameState.get = get;
-    GameState.set = set;
     GameState.resolve = resolve;  // Dynamic path resolution
     GameState.create = create;  // Unified entity creator
 
+    // Query system
+    GameState.queryTags = queryTags;  // Primary query interface
+    GameState.hasGameplayTag = hasGameplayTag;  // Tag checking utility
+
     GameState.processTools = processTools;
     GameState.processGetters = processGetters;
-    GameState.getGlobalValue = getGlobalValue;
-    GameState.setGlobalValue = setGlobalValue;
-    
-    // Character API - redirects to universal functions
-    GameState.loadCharacter = (name) => load('Character', name);
-    GameState.saveCharacter = (character) => save('Character', character);
-    GameState.createCharacter = createCharacter;  // Legacy, redirects to create()
-    
-    // Location API - redirects to universal functions  
-    GameState.loadLocation = (name) => load('Location', name);
-    GameState.saveLocation = (location) => save('Location', location);
+
+    // Display system
+    GameState.buildEntityDisplay = buildEntityDisplay;  // Build display text for entity
+
+    // Blueprint system
+    GameState.loadBlueprint = loadBlueprint;  // Load blueprint by name
+
+    // Universal data access (replaces getGlobalValue/setGlobalValue)
+    GameState.get = get;
+    GameState.set = set;
+    GameState.del = del;
+
+    // Entity management functions for GenerationWizard
+    GameState.changeEntityId = changeEntityId;  // Change the actual entity ID
+    GameState.removeComponent = removeComponent;
+    GameState.addComponent = addComponent;
+    GameState.deleteEntity = deleteEntity;  // Delete an entity completely
+
+    // Debug functions for DebugCommands module
+    GameState.outputDebugLog = outputDebugLog;
+
+    // Activate or deactivate display for an entity
+    GameState.setDisplayActive = function(entityId, active = true) {
+        const entity = get(entityId);
+        if (!entity) {
+            console.log(`${MODULE_NAME}: Entity ${entityId} not found`);
+            return false;
+        }
+
+        // Ensure entity has display component
+        if (!entity.components || !entity.components.includes('display')) {
+            console.log(`${MODULE_NAME}: Entity ${entityId} doesn't have display component`);
+            return false;
+        }
+
+        // Initialize display object if needed
+        if (!entity.display) {
+            entity.display = {};
+        }
+
+        // Set active state
+        entity.display.active = active;
+
+        // Save the entity - this will move it to/from [SANE:E] based on active state
+        const result = save(entityId, entity);
+
+        if (debug) console.log(`${MODULE_NAME}: Set display.active=${active} for ${entityId}`);
+        return result;
+    };
+
+    // Export TemplateParser for use by other modules
+    GameState.TemplateParser = TemplateParser;
     
     GameState.getPlayerName = function() {
-        // Find the first [PLAYER] card
-        const playerCard = Utilities.storyCard.find(card => {
-            return card.title && card.title.startsWith('[PLAYER]');
-        }, false); // false = return first match only
-        
-        if (playerCard) {
-            // Extract name from title: [PLAYER] Name
-            const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-            if (match) {
-                return match[1].trim();
-            }
+        // Find the first user-controlled entity
+        const userControlled = queryTags('UserControlled');
+
+        if (userControlled && userControlled.length > 0) {
+            return userControlled[0].id;
         }
-        
-        if (debug) console.log(`${MODULE_NAME}: No [PLAYER] card found`);
+
+        if (debug) console.log(`${MODULE_NAME}: No user-controlled entity found`);
         return null;
     };
     
@@ -7255,26 +7957,26 @@ function GameState(hook, text) {
     GameState.completeLocationGeneration = completeLocationGeneration;
     GameState.loadEntityTrackerConfig = loadEntityTrackerConfig;
     
-    // Tool processing API (for testing)
+    // Tool processing API
     GameState.processToolCall = processToolCall;
     
     // Rewind System API
     GameState.RewindSystem = RewindSystem;
     
     // Field accessor methods
-    GameState.getCharacterField = getCharacterField;
-    GameState.setCharacterField = setCharacterField;
+    GameState.getCharacterField = getNestedField;
+    GameState.setCharacterField = setNestedField;
     GameState.getField = function(characterName, fieldPath) {
-        const character = GameState.loadCharacter(characterName);
+        const character = GameState.get(characterName);
         if (!character) return null;
-        return getCharacterField(character, fieldPath);
+        return getNestedField(character, fieldPath);
     };
     GameState.setField = function(characterName, fieldPath, value) {
-        const character = GameState.loadCharacter(characterName);
+        const character = GameState.get(characterName);
         if (!character) return false;
-        
-        setCharacterField(character, fieldPath, value);
-        return save('Character', character);
+
+        setNestedField(character, fieldPath, value);
+        return save(characterName, character);
     };
     GameState.modifyField = function(characterName, fieldPath, delta) {
         const current = GameState.getField(characterName, fieldPath);
@@ -7282,539 +7984,18 @@ function GameState(hook, text) {
         
         return GameState.setField(characterName, fieldPath, current + delta);
     };
-    
-    // Testing functions
-    GameState.testComponentTools = function() {
-        console.log(`${MODULE_NAME}: Testing component-aware tools...`);
-        
-        // Create test character with components
-        const testChar = createCharacter({
-            name: 'ToolTestHero',
-            isPlayer: false
-        });
-        
-        if (!testChar) {
-            console.log('ERROR: Failed to create test character');
-            return false;
-        }
-        
-        console.log('1. Testing HP modification (stats.hp)...');
-        // Test damage tool
-        const damageResult = toolProcessors.deal_damage('unknown', 'ToolTestHero', 20);
-        console.log(`  - deal_damage result: ${damageResult}`);
-        console.log(`  - HP after damage: ${get('Character.ToolTestHero.stats.hp.current')}/${get('Character.ToolTestHero.stats.hp.max')}`);
-        
-        console.log('2. Testing XP addition (stats.level.xp)...');
-        const xpResult = toolProcessors.add_levelxp('ToolTestHero', 250);
-        console.log(`  - add_levelxp result: ${xpResult}`);
-        console.log(`  - XP after: ${get('Character.ToolTestHero.stats.level.xp.current')}/${get('Character.ToolTestHero.stats.level.xp.max')}`);
-        
-        console.log('3. Testing inventory (component)...');
-        const addItemResult = toolProcessors.add_item('ToolTestHero', 'test_sword', 1);
-        console.log(`  - add_item result: ${addItemResult}`);
-        const inventory = get('Character.ToolTestHero.inventory');
-        console.log(`  - Inventory: ${JSON.stringify(inventory)}`);
-        
-        console.log('4. Testing location update (info.location)...');
-        const locResult = toolProcessors.update_location('ToolTestHero', 'Test_Dungeon');
-        console.log(`  - update_location result: ${locResult}`);
-        console.log(`  - Location: ${get('Character.ToolTestHero.info.location')}`);
-        
-        console.log('5. Testing attribute update...');
-        const attrResult = toolProcessors.update_attribute('ToolTestHero', 'strength', 15);
-        console.log(`  - update_attribute result: ${attrResult}`);
-        const attributes = get('Character.ToolTestHero.attributes');
-        console.log(`  - Attributes: ${JSON.stringify(attributes)}`);
-        
-        console.log(`${MODULE_NAME}: Component tools test complete!`);
-        return true;
-    };
-    GameState.testComponentSystem = function() {
-        console.log(`${MODULE_NAME}: Starting component system test...`);
-        
-        // 1. Create a new character with components
-        console.log('1. Creating character with components...');
-        const testChar = createCharacter({
-            name: 'TestHero',
-            isPlayer: false
-        });
-        
-        if (!testChar) {
-            console.log('ERROR: Failed to create character');
-            return false;
-        }
-        
-        // 2. Verify components were initialized
-        console.log('2. Verifying components...');
-        if (!testChar.stats || !testChar.info) {
-            console.log('ERROR: Required components missing');
-            return false;
-        }
-        
-        console.log(`  - stats.level: ${testChar.stats.level}`);
-        console.log(`  - stats.hp: ${JSON.stringify(testChar.stats.hp)}`);
-        console.log(`  - info.location: ${testChar.info.location}`);
-        
-        // 3. Modify using component paths
-        console.log('3. Modifying via component paths...');
-        set('Character.TestHero.stats.level', 5);
-        set('Character.TestHero.info.location', 'Test_Town');
-        set('Character.TestHero.stats.hp.current', 150);
-        
-        // 4. Load and verify changes
-        console.log('4. Loading and verifying changes...');
-        const loaded = load('Character', 'TestHero');
-        
-        if (!loaded) {
-            console.log('ERROR: Failed to load character');
-            return false;
-        }
-        
-        console.log(`  - Loaded level: ${get('Character.TestHero.stats.level')}`);
-        console.log(`  - Loaded location: ${get('Character.TestHero.info.location')}`);
-        console.log(`  - Loaded HP: ${get('Character.TestHero.stats.hp.current')}`);
-        
-        // 5. Component check (validation removed)
-        console.log('5. Component check...');
-        console.log('  - Has stats: ' + !!loaded.stats);
-        console.log('  - Has info: ' + !!loaded.info);
-        console.log('  - Has inventory: ' + !!loaded.inventory);
-        console.log('  - Has skills: ' + !!loaded.skills);
-        
-        // Migration test removed - no longer needed
-        
-        console.log(`${MODULE_NAME}: Component system test complete!`);
-        return true;
-    };
-    
-    // Test dynamic resolution with components
-    GameState.testDynamicResolution = function() {
-        console.log(`${MODULE_NAME}: Testing dynamic resolution with components...`);
-        
-        // 1. Test basic component path access
-        console.log('1. Testing basic component paths:');
-        const hero = load('Character', 'TestHero');
-        if (hero) {
-            console.log(`  - Direct: hero.stats.level = ${hero.stats?.level}`);
-            console.log(`  - get('Character.TestHero.stats.level') = ${get('Character.TestHero.stats.level')}`);
-            console.log(`  - get('Character.TestHero.stats.hp.current') = ${get('Character.TestHero.stats.hp.current')}`);
-            console.log(`  - get('Character.TestHero.info.location') = ${get('Character.TestHero.info.location')}`);
-        }
-        
-        // 2. Test dynamic resolution
-        console.log('2. Testing dynamic resolution:');
-        set('Global.currentPlayer', 'TestHero');
-        console.log(`  - Set Global.currentPlayer = 'TestHero'`);
-        console.log(`  - get('Character.$(Global.currentPlayer).stats.level') = ${get('Character.$(Global.currentPlayer).stats.level')}`);
-        console.log(`  - get('Character.$(Global.currentPlayer).stats.hp.current') = ${get('Character.$(Global.currentPlayer).stats.hp.current')}`);
-        
-        // 3. Test nested dynamic resolution
-        console.log('3. Testing nested dynamic resolution:');
-        const playerLocation = get('Character.$(Global.currentPlayer).info.location');
-        console.log(`  - Player location: ${playerLocation}`);
-        
-        // Create a test location if needed
-        const testLoc = {
-            name: 'Test_Town',
-            type: 'town',
-            description: 'A test location'
-        };
-        save('Location', testLoc);
-        
-        console.log(`  - get('Location.$(Character.$(Global.currentPlayer).info.location).type') = ${get('Location.$(Character.$(Global.currentPlayer).info.location).type')}`);
-        
-        // 4. Test setting component values via paths
-        console.log('4. Testing set() with component paths:');
-        set('Character.TestHero.stats.level', 10);
-        set('Character.TestHero.stats.hp.current', 200);
-        set('Character.TestHero.info.location', 'New_Location');
-        
-        console.log(`  - After set, level = ${get('Character.TestHero.stats.level')}`);
-        console.log(`  - After set, HP = ${get('Character.TestHero.stats.hp.current')}`);
-        console.log(`  - After set, location = ${get('Character.TestHero.info.location')}`);
-        
-        console.log(`${MODULE_NAME}: Dynamic resolution test complete!`);
-        return true;
-    };
-    
-    // Test runtime variable functions
-    GameState.testRuntimeVariables = function() {
-        console.log(`${MODULE_NAME}: Testing runtime variable functions with components...`);
-        
-        // Create test character if needed
-        const testChar = createCharacter({
-            name: 'RuntimeTestHero',
-            isPlayer: false
-        });
-        
-        if (testChar) {
-            // Set some component values
-            set('Character.RuntimeTestHero.stats.level', 7);
-            set('Character.RuntimeTestHero.stats.hp.current', 140);
-            set('Character.RuntimeTestHero.stats.hp.max', 200);
-            set('Character.RuntimeTestHero.info.location', 'Test_Village');
-            set('Character.RuntimeTestHero.attributes.strength', 18);
-            set('Character.RuntimeTestHero.skills.swordsmanship', { level: 5, xp: { current: 250, max: 400 } });
-        }
-        
-        console.log('1. Testing function-style getters:');
-        console.log(`  - getCharacterHP('RuntimeTestHero') = ${getCharacterHP('RuntimeTestHero')}`);
-        console.log(`  - getCharacterLevel('RuntimeTestHero') = ${getCharacterLevel('RuntimeTestHero')}`);
-        console.log(`  - getCharacterLocation('RuntimeTestHero') = ${getCharacterLocation('RuntimeTestHero')}`);
-        console.log(`  - getCharacterAttribute('RuntimeTestHero', 'strength') = ${getCharacterAttribute('RuntimeTestHero', 'strength')}`);
-        console.log(`  - getCharacterSkill('RuntimeTestHero', 'swordsmanship') = ${getCharacterSkill('RuntimeTestHero', 'swordsmanship')}`);
-        
-        console.log('2. Testing processGetters with both styles:');
-        const testText = '\n' +
-            'Current Status:\n' +
-            '- HP: get_hp(RuntimeTestHero)\n' +
-            '- Level: get_level(RuntimeTestHero)\n' +
-            '- Location: get_location(RuntimeTestHero)\n' +
-            '- Using new syntax: get[Character.RuntimeTestHero.stats.hp.current]\n' +
-            '- Mixed: HP is get_hp(RuntimeTestHero) and level is get[Character.RuntimeTestHero.stats.level]\n' +
-            '        ';
-        
-        const processed = processGetters(testText);
-        console.log('Processed text:', processed);
-        
-        console.log('3. Testing with dynamic resolution:');
-        set('Global.testHero', 'RuntimeTestHero');
-        const dynamicText = '\n' +
-            'Hero: get[Global.testHero]\n' +
-            'Hero HP: get[Character.$(Global.testHero).stats.hp.current]/get[Character.$(Global.testHero).stats.hp.max]\n' +
-            'Hero Location: get[Character.$(Global.testHero).info.location]\n' +
-            '        ';
-        
-        const dynamicProcessed = processGetters(dynamicText);
-        console.log('Dynamic processed:', dynamicProcessed);
-        
-        console.log(`${MODULE_NAME}: Runtime variables test complete!`);
-        return true;
-    };
-    
-    // test of universal get/set system
-    GameState.testUniversalSystem = function() {
-        console.log(`${MODULE_NAME}: Testing universal get/set system comprehensively...`);
-        
-        // 1. Test basic get/set
-        console.log('1. Testing basic get/set:');
-        set('Global.testValue', 42);
-        console.log(`  - set('Global.testValue', 42) -> get = ${get('Global.testValue')}`);
-        
-        // 2. Test nested object creation
-        console.log('2. Testing nested object creation:');
-        set('Global.nested.deep.value', 'deep value');
-        console.log(`  - set('Global.nested.deep.value', 'deep value') -> get = ${get('Global.nested.deep.value')}`);
-        
-        // 3. Test entity loading and modification
-        console.log('3. Testing entity operations:');
-        const testChar = createCharacter({ name: 'UniversalTestHero' });
-        if (testChar) {
-            set('Character.UniversalTestHero.stats.level', 99);
-            set('Character.UniversalTestHero.stats.hp.current', 9999);
-            set('Character.UniversalTestHero.info.location', 'Test_Zone');
-            console.log(`  - Level: ${get('Character.UniversalTestHero.stats.level')}`);
-            console.log(`  - HP: ${get('Character.UniversalTestHero.stats.hp.current')}`);
-            console.log(`  - Location: ${get('Character.UniversalTestHero.info.location')}`);
-        }
-        
-        // 4. Test dynamic resolution
-        console.log('4. Testing dynamic resolution:');
-        set('Global.targetChar', 'UniversalTestHero');
-        set('Global.targetField', 'stats.level');
-        console.log(`  - Single $(): ${get('Character.$(Global.targetChar).stats.level')}`);
-        console.log(`  - Nested $(): ${get('Character.$(Global.targetChar).$(Global.targetField)')}`);
-        
-        // 5. Test error cases
-        console.log('5. Testing error handling:');
-        console.log(`  - Invalid path 'NoType': ${get('NoType')}`);
-        console.log(`  - Missing entity: ${get('Character.DoesNotExist.level')}`);
-        console.log(`  - Missing field: ${get('Character.UniversalTestHero.nonexistent.field')}`);
-        
-        // 6. Test array notation
-        console.log('6. Testing array notation:');
-        set('Global.testArray[0]', 'first');
-        set('Global.testArray[1]', 'second');
-        set('Global.nested.array[0].name', 'item1');
-        console.log(`  - Array[0]: ${get('Global.testArray[0]')}`);
-        console.log(`  - Array[1]: ${get('Global.testArray[1]')}`);
-        console.log(`  - Nested array: ${get('Global.nested.array[0].name')}`);
-        
-        // 7. Test cache behavior
-        console.log('7. Testing cache:');
-        const before = get('Character.UniversalTestHero.stats.level');
-        set('Character.UniversalTestHero.stats.level', 100);
-        const after = get('Character.UniversalTestHero.stats.level');
-        console.log(`  - Before: ${before}, After: ${after}, Cache updated: ${after === '100'}`);
-        
-        // 8. Test component paths with missing components
-        console.log('8. Testing missing component paths:');
-        const noComponents = { name: 'FlatHero', level: 5, hp: 100 };
-        save('Character', noComponents);
-        console.log(`  - Flat hero level: ${get('Character.FlatHero.level')}`);
-        console.log(`  - Flat hero stats.level (missing): ${get('Character.FlatHero.stats.level')}`);
-        
-        // 9. Test Global special handling
-        console.log('9. Testing Global special handling:');
-        set('Global.complex', { a: 1, b: { c: 2 } });
-        console.log(`  - Complex global: ${JSON.stringify(get('Global.complex'))}`);
-        set('Global.complex.b.c', 3);
-        console.log(`  - After nested set: ${get('Global.complex.b.c')}`);
-        
-        // 10. Test resolution edge cases
-        console.log('10. Testing resolution edge cases:');
-        set('Global.circular', 'Global.circular');
-        console.log(`  - Circular reference: ${get('$(Global.circular)')}`);
-        set('Global.undefined', undefined);
-        console.log(`  - Undefined value: ${get('Global.undefined')}`);
-        set('Global.null', null);
-        console.log(`  - Null value: ${get('Global.null')}`);
-        
-        console.log(`${MODULE_NAME}: Universal system test complete!`);
-        return true;
-    };
-    
-    // Master test 
-    GameState.runAllTests = function() {
-        console.log('\n' + '='.repeat(60));
-        console.log('SANE COMPREHENSIVE TEST SUITE');
-        console.log('='.repeat(60) + '\n');
-        
-        const tests = [
-            { name: 'Component System', fn: GameState.testComponentSystem },
-            { name: 'Component Tools', fn: GameState.testComponentTools },
-            { name: 'Dynamic Resolution', fn: GameState.testDynamicResolution },
-            { name: 'Runtime Variables', fn: GameState.testRuntimeVariables },
-            { name: 'Universal System', fn: GameState.testUniversalSystem },
-            { name: 'Tool Processing', fn: testToolProcessing },
-            { name: 'Entity Validation', fn: testEntityValidation },
-            { name: 'Template Processing', fn: testTemplateProcessing }
-        ];
-        
-        let passed = 0;
-        let failed = 0;
-        
-        for (const test of tests) {
-            console.log(`\n${'*'.repeat(40)}`);
-            console.log(`Running: ${test.name}`);
-            console.log('*'.repeat(40));
-            
-            try {
-                const result = test.fn();
-                if (result) {
-                    console.log(`✓ ${test.name} PASSED`);
-                    passed++;
-                } else {
-                    console.log(`✗ ${test.name} FAILED`);
-                    failed++;
-                }
-            } catch (e) {
-                console.log(`✗ ${test.name} ERRORED: ${e.message}`);
-                console.log(e.stack);
-                failed++;
-            }
-        }
-        
-        console.log('\n' + '='.repeat(60));
-        console.log(`TEST RESULTS: ${passed} passed, ${failed} failed`);
-        console.log('='.repeat(60));
-        
-        return failed === 0;
-    };
-    
-    // Test tool processing
-    function testToolProcessing() {
-        console.log(`${MODULE_NAME}: Testing tool processing...`);
-        
-        // Create test character
-        const testChar = createCharacter({ 
-            name: 'ToolTestChar',
-            isPlayer: false
-        });
-        
-        if (testChar) {
-            // Initialize with component values
-            set('Character.ToolTestChar.stats.level', 1);
-            set('Character.ToolTestChar.stats.hp.current', 100);
-            set('Character.ToolTestChar.stats.hp.max', 100);
-            set('Character.ToolTestChar.inventory.sword', { quantity: 1 });
-        }
-        
-        // 1. Test damage tool
-        console.log('1. Testing deal_damage:');
-        const damageResult = processTool('deal_damage', ['Monster', 'ToolTestChar', '30']);
-        console.log(`  - Result: ${damageResult}`);
-        const afterDamage = get('Character.ToolTestChar.stats.hp.current');
-        console.log(`  - HP after damage: ${afterDamage}`);
-        
-        // 2. Test healing
-        console.log('2. Testing heal:');
-        const healResult = processTool('heal', ['ToolTestChar', '20']);
-        console.log(`  - Result: ${healResult}`);
-        const afterHeal = get('Character.ToolTestChar.stats.hp.current');
-        console.log(`  - HP after heal: ${afterHeal}`);
-        
-        // 3. Test item management
-        console.log('3. Testing add_item:');
-        const addResult = processTool('add_item', ['ToolTestChar', 'potion', '5']);
-        console.log(`  - Result: ${addResult}`);
-        const potions = get('Character.ToolTestChar.inventory.potion');
-        console.log(`  - Potions: ${potions?.quantity || potions}`);
-        
-        // 4. Test XP addition
-        console.log('4. Testing add_levelxp:');
-        set('Character.ToolTestChar.stats.level.xp', { current: 0, max: 500 });
-        const xpResult = processTool('add_levelxp', ['ToolTestChar', '250']);
-        console.log(`  - Result: ${xpResult}`);
-        const xp = get('Character.ToolTestChar.stats.level.xp.current');
-        console.log(`  - XP: ${xp}`);
-        
-        console.log(`${MODULE_NAME}: Tool processing test complete!`);
-        return true;
-    }
-    
-    // Test entity validation
-    function testEntityValidation() {
-        console.log(`${MODULE_NAME}: Testing entity validation...`);
-        
-        // 1. Test valid entity
-        console.log('1. Testing valid entity:');
-        const validEntity = {
-            name: 'ValidHero',
-            stats: { 
-                level: {
-                    value: 5,
-                    xp: { current: 2000, max: 2500 }
-                },
-                hp: { current: 100, max: 100 } 
-            },
-            info: { location: 'Town' }
-        };
-        const validResult = validateEntityComponents('Character', validEntity);
-        console.log(`  - Valid: ${validResult.valid}`);
-        console.log(`  - Errors: ${validResult.errors?.length || 0}`);
-        
-        // 2. Test missing required component
-        console.log('2. Testing missing required component:');
-        const missingEntity = {
-            name: 'IncompleteHero',
-            stats: { 
-                level: {
-                    value: 1,
-                    xp: { current: 0, max: 500 }
-                }
-            }
-            // Missing info component
-        };
-        const missingResult = validateEntityComponents('Character', missingEntity);
-        console.log(`  - Valid: ${missingResult.valid}`);
-        console.log(`  - Errors: ${missingResult.errors?.join(', ')}`);
-        
-        // 3. Test component initialization
-        console.log('3. Testing component initialization:');
-        const newEntity = initializeEntityComponents('Character', { name: 'NewHero' });
-        console.log(`  - Has stats: ${!!newEntity.stats}`);
-        console.log(`  - Has info: ${!!newEntity.info}`);
-        console.log(`  - Stats.level.value: ${newEntity.stats?.level?.value}`);
-        console.log(`  - Info.location: ${newEntity.info?.location}`);
-        
-        console.log(`${MODULE_NAME}: Entity validation test complete!`);
-        return true;
-    }
-    
-    // Test template processing
-    function testTemplateProcessing() {
-        console.log(`${MODULE_NAME}: Testing template processing...`);
-        
-        // Create test data
-        const testData = {
-            name: 'Template Hero',
-            stats: {
-                level: {
-                    value: 10,
-                    xp: { current: 4500, max: 5000 }
-                },
-                hp: { current: 150, max: 200 }
-            },
-            skills: {
-                sword: { level: 5, unlocked: true },
-                magic: { level: 3, unlocked: true },
-                stealth: { level: 1, unlocked: false }
-            },
-            isPlayer: false
-        };
-        
-        // 1. Test simple replacements
-        console.log('1. Testing simple replacements:');
-        let template = 'Name: {name}, Level: {stats.level}';
-        let result = processTemplateLine(template, testData);
-        console.log(`  - Result: ${result}`);
-        
-        // 2. Test conditionals
-        console.log('2. Testing conditionals:');
-        template = '{info.isPlayer?Player Character:NPC Character}';
-        result = processTemplateLine(template, testData);
-        console.log(`  - Result: ${result}`);
-        
-        // 3. Test loops
-        console.log('3. Testing loops:');
-        template = 'Skills: {skills.*:{*.unlocked?{*} (Level {*.level})}}';
-        result = processTemplateLine(template, testData);
-        console.log(`  - Result: ${result}`);
-        
-        // 4. Test entity references
-        console.log('4. Testing entity references:');
-        // Save test character for reference
-        save('Character', testData);
-        set('Global.currentHero', 'Template Hero');
-        
-        template = 'Hero Level: {Character.Template Hero.stats.level}';
-        result = processTemplateLine(template, {});
-        console.log(`  - Direct reference: ${result}`);
-        
-        template = 'Current Hero Level: {Character.{Global.currentHero}.stats.level}';
-        result = processTemplateLine(template, { Global: { currentHero: 'Template Hero' } });
-        console.log(`  - Dynamic reference: ${result}`);
-        
-        console.log(`${MODULE_NAME}: Template processing test complete!`);
-        return true;
-    }
-    
-    // Test schema registry
-    GameState.testSchemaRegistry = function() {
-        console.log(`${MODULE_NAME}: Testing schema registry...`);
-        
-        // Initialize if needed
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        
-        console.log('1. Registered entity types:');
-        for (const [type, schema] of Object.entries(schemaRegistry)) {
-            if (!type.startsWith('_')) {
-                console.log(`  - ${type}: ${schema.prefixes?.join(', ')}`);
-            }
-        }
-        
-        console.log('2. Component schemas:');
-        const components = schemaRegistry._components || {};
-        for (const [name, schema] of Object.entries(components)) {
-            console.log(`  - ${name}: ${schema.component_of}`);
-        }
-        
-        console.log('3. Schema aliases:');
-        const aliases = schemaAliasMap || {};
-        console.log(`  - Total aliases: ${Object.keys(aliases).length}`);
-        
-        console.log(`${MODULE_NAME}: Schema registry test complete!`);
-        return true;
-    };
-    
 
     switch(hook) {
-        case 'input':
-            // Initialize debug logging for this turn
-            if (debug) initDebugLogging();
-            
-            
+        case 'input': {
+            try {
+                // Initialize debug logging for this turn
+                if (debug) initDebugLogging();
+
+                // Initialize all core systems on first run
+                loadVariableDefinitions();
+
+            // Data cache is already initialized at module load, no need to re-initialize
+
             // Store original input for logging
             const originalInput = text;
             
@@ -7875,7 +8056,6 @@ function GameState(hook, text) {
             
             // If any commands were processed, return their combined results
             if (commandResults.length > 0) {
-                logTime();
                 const result = commandResults.join('\n');
                 // Calculate hash of the result
                 currentHash = RewindSystem.quickHash(result);
@@ -7884,7 +8064,8 @@ function GameState(hook, text) {
             }
             
             // If GenerationWizard is active, delegate to it
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
+            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
+            if (typeof GenerationWizard !== 'undefined' && gwActive) {
                 const result = GenerationWizard.process('input', text);
                 const finalResult = result.active ? '\n' : text;
                 
@@ -7906,11 +8087,17 @@ function GameState(hook, text) {
             
             // Calculate hash of the modified input text (what will be stored in history)
             currentHash = RewindSystem.quickHash(text);
-            
+
             logTime();
             return text;
-            
-        case 'context':
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error in input hook:`, e);
+                console.log(`${MODULE_NAME}: Stack trace:`, e.stack);
+                throw e;
+            }
+        }
+
+        case 'context': {
             // Initialize debug logging for this turn
             if (debug) initDebugLogging();
             
@@ -7924,7 +8111,7 @@ function GameState(hook, text) {
             state.lastContextLength = text ? text.length : 0;
             
             // Cache cards are no longer needed with the universal data system
-            // All data is loaded on-demand through load()/loadAll() functions
+            // All data is loaded on-demand through get() and loadAll() functions
             
             // Check for edits in history (RewindSystem)
             RewindSystem.handleContext();
@@ -7940,15 +8127,13 @@ function GameState(hook, text) {
             
             // Process all getters in the entire context (if getters exist)
             let gettersReplaced = {};
-            // Check both universal object getters and function getters
+            // Check for universal object getters
             const hasUniversalGetters = UNIVERSAL_GETTER_PATTERN.test(modifiedText);
-            const hasFunctionGetters = FUNCTION_GETTER_PATTERN.test(modifiedText);
             
-            if (hasUniversalGetters || hasFunctionGetters) {
+            if (hasUniversalGetters) {
                 // Track which getters are being replaced (count only, not every instance)
-                const universalMatches = hasUniversalGetters ? modifiedText.match(UNIVERSAL_GETTER_PATTERN) : [];
-                const functionMatches = hasFunctionGetters ? modifiedText.match(FUNCTION_GETTER_PATTERN) : [];
-                const getterMatches = [...(universalMatches || []), ...(functionMatches || [])];
+                const universalMatches = modifiedText.match(UNIVERSAL_GETTER_PATTERN) || [];
+                const getterMatches = [...universalMatches];
                 
                 if (getterMatches.length > 0) {
                     // Check if any getters need character data
@@ -7976,9 +8161,11 @@ function GameState(hook, text) {
                     
                     // Pre-load characters if needed
                     if (needsCharacters) {
-                        const allChars = loadAll('Character');
+                        const allChars = queryTags('Character');
                         for (const [name, char] of Object.entries(allChars || {})) {
-                            entityCache[`Character.${name}`] = char;
+                            // Update to use just entity ID
+                        dataCache[name] = char;  // New way
+                        dataCache[`Character.${name}`] = char;  // Old way
                         }
                     }
                 }
@@ -7987,7 +8174,7 @@ function GameState(hook, text) {
             
             // Build trigger name to username mapping and replace in tool usages
             const triggerNameMap = {};
-            const allCharacters = loadAll('Character');
+            const allCharacters = queryTags('Character');
             
             // Get current action count for cleanup check
             const currentTurn = info?.actionCount || 0;
@@ -7996,11 +8183,11 @@ function GameState(hook, text) {
             for (const [charName, character] of Object.entries(allCharacters || {})) {
                 if (character.info?.trigger_name) {
                     const triggerName = character.info.trigger_name;
-                    const username = character.name.toLowerCase();
-                    
+                    const username = character.id.toLowerCase();
+
                     // Get generation turn if available
                     const generatedTurn = character.info.generation_turn || 0;
-                    
+
                     // Check if trigger name should be cleaned up (10+ turns old and not in context)
                     if (generatedTurn > 0 && currentTurn - generatedTurn >= 10) {
                         // Check if trigger name still exists in the context
@@ -8009,20 +8196,10 @@ function GameState(hook, text) {
                             // Remove trigger name from character info
                             delete character.info.trigger_name;
                             delete character.info.generation_turn;
-                            
-                            // When saving, the keys will be regenerated without the trigger_name
-                            // since it's no longer in character.info.trigger_name
-                            save('Character', character);
-                            
-                            // Also need to update the card's keys directly since save() might not regenerate them
-                            const cardTitle = `[CHARACTER] ${character.name}`;
-                            const card = Utilities.storyCard.get(cardTitle);
-                            if (card) {
-                                // Regenerate keys without trigger name
-                                const newKeys = ` ${character.name.toLowerCase()},(${character.name.toLowerCase()}`;
-                                Utilities.storyCard.update(cardTitle, { keys: newKeys });
-                            }
-                            
+
+                            // Save handles all key regeneration automatically
+                            save(charName, character);
+
                             if (debug) {
                                 console.log(`${MODULE_NAME}: Cleaned up trigger name "${triggerName}" for ${username} (${currentTurn - generatedTurn} turns old)`);
                             }
@@ -8059,19 +8236,17 @@ function GameState(hook, text) {
             }
             
             // Check if GenerationWizard needs to append prompts
-            if (typeof GenerationWizard !== 'undefined') {
-                const isActive = GenerationWizard.isActive();
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard active check: ${isActive}`);
-                
-                if (isActive) {
-                    const result = GenerationWizard.process('context', modifiedText);
-                    if (debug) console.log(`${MODULE_NAME}: GenerationWizard.process result: active=${result.active}, text length before=${modifiedText.length}, after=${result.text ? result.text.length : 'null'}`);
-                    if (result.active) {
-                        modifiedText = result.text;  // Use wizard's modified context (with prompts appended)
-                    }
+            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
+            if (typeof GenerationWizard !== 'undefined' && gwActive) {
+                if (debug) console.log(`${MODULE_NAME}: GenerationWizard is active`);
+
+                const result = GenerationWizard.process('context', modifiedText);
+                if (debug) console.log(`${MODULE_NAME}: GenerationWizard.process result: active=${result.active}, text length before=${modifiedText.length}, after=${result.text ? result.text.length : 'null'}`);
+                if (result.active) {
+                    modifiedText = result.text;  // Use wizard's modified context (with prompts appended)
                 }
-            } else {
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available`);
+            } else if (gwActive && typeof GenerationWizard === 'undefined') {
+                if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available but generation is active`);
             }
             
             // Apply CONTEXT_MODIFIER if available
@@ -8079,10 +8254,10 @@ function GameState(hook, text) {
                 try {
                     // Create context for the modifier
                     const context = {
-                        getGlobalValue: getGlobalValue,
-                        setGlobalValue: setGlobalValue,
+                        get: get,
+                        set: set,
                         loadCharacter: function(name) {
-                            const chars = loadAll('Character');
+                            const chars = queryTags('Character');
                             return chars[name.toLowerCase()];
                         },
                         Utilities: Utilities,
@@ -8110,8 +8285,9 @@ function GameState(hook, text) {
             
             logTime();
             return modifiedText;  // Return the fully modified text
-            
-        case 'output':
+            }
+
+        case 'output': {
             // Initialize debug logging for this turn
             if (debug) initDebugLogging();
             
@@ -8123,7 +8299,8 @@ function GameState(hook, text) {
             loadOutputModifier();
             
             // Check if GenerationWizard is processing
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
+            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
+            if (typeof GenerationWizard !== 'undefined' && gwActive) {
                 const result = GenerationWizard.process('output', text);
                 if (result.active) {
                     // Log early return
@@ -8135,6 +8312,7 @@ function GameState(hook, text) {
             }
 
             // Process tools in LLM's output
+            let modifiedText = text || '';
             if (text) {
                 // Check if there are any tool patterns first
                 const hasToolPatterns = TOOL_PATTERN.test(text);
@@ -8145,7 +8323,7 @@ function GameState(hook, text) {
                 }
                 
                 const result = processTools(text);
-                let modifiedText = result.modifiedText;
+                modifiedText = result.modifiedText;
                 const executedTools = result.executedTools || [];
                 
                 // Calculate hash AFTER tool removal so it matches what gets stored
@@ -8159,13 +8337,17 @@ function GameState(hook, text) {
                 const entityQueued = queuePendingEntities();
                 
                 // Check if GenerationWizard was triggered by any tool or entity generation
-                if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
-                    // Add warning that GM will take control next turn
-                    modifiedText += '\n\n<<<The GM will use the next turn to think. Use `/GW abort` if undesired.>>>';
+                gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
+                if (typeof GenerationWizard !== 'undefined' && gwActive) {
+                    // Set message via state instead of adding to text
+                    state.message = 'The GM will use the next turn to think. Use `/GW abort` if undesired.';
+                    // Add zero-width character to preserve text structure
+                    modifiedText += '\u200B';
                     if (debug) console.log(`${MODULE_NAME}: GenerationWizard activated, adding warning to output`);
                 } else if (entityQueued) {
                     // Entity generation was triggered
-                    modifiedText += '\n\n<<<The GM will generate a new entity next turn. Use `/GW abort` if undesired.>>>';
+                    state.message = 'The GM will generate a new entity next turn. Use `/GW abort` if undesired.';
+                    modifiedText += '\u200B';
                     if (debug) console.log(`${MODULE_NAME}: Entity generation triggered, adding warning to output`);
                 }
                 
@@ -8183,31 +8365,31 @@ function GameState(hook, text) {
                 logDebugTurn('output', null, null, {
                     toolsExecuted: executedTools,
                     entityQueued: entityQueued,
-                    generationWizardActive: typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()
+                    generationWizardActive: Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null
                 });
                 
                 // Clear entity cache after processing
-                entityCache = {};
+                // Clear the unified cache
+                dataCache = {};
                 
                 // Pin important cards to top for fast access
                 // [PLAYER] cards go at the very top
                 if (typeof storyCards !== 'undefined' && storyCards.length > 0) {
                     const playerCards = [];
-                    
+
                     // Extract all special cards in one pass (backwards to avoid index issues)
                     for (let i = storyCards.length - 1; i >= 0; i--) {
                         const card = storyCards[i];
                         if (!card || !card.title) continue;
-                        
+
                         if (card.title.startsWith('[PLAYER]')) {
                             playerCards.unshift(storyCards.splice(i, 1)[0]);
                         }
-                        // Cache cards are obsolete - no longer pinned
                     }
-                    
+
                     // Re-insert in optimal order at the top
                     let insertPos = 0;
-                    
+
                     // Insert player cards at the very top
                     if (playerCards.length > 0) {
                         storyCards.splice(insertPos, 0, ...playerCards);
@@ -8216,12 +8398,15 @@ function GameState(hook, text) {
 
                 }
                 
-                logTime();
-                return modifiedText;
             }
+
+            // Return the processed text (or empty string if text was null)
+            logTime();
+            return modifiedText;
             break;
+        }
     }
-    
+
     // Log execution time before returning
     logTime();
     return GameState;
