@@ -1,7 +1,7 @@
 function GameState(hook, text) {
     'use strict';
 
-    // GenerationWizard active state - checked once per hook
+    // BlueprintManager active state - checked once per hook
     let gwActive = false;
 
     const debug = true;
@@ -12,7 +12,7 @@ function GameState(hook, text) {
     let currentHash = null;
     
     // Unified data cache for everything - entities, variables, functions, schemas, etc.
-    // Keys are just the ID (no type prefix)
+    // Keys are just the ID
     // Stores data from:
     // - [SANE:E] cards: entities with display
     // - [SANE:D] cards: entities without display, variables
@@ -24,7 +24,7 @@ function GameState(hook, text) {
     let entityAliasMap = {}; // alias -> entityId
 
     // Library functions storage
-    let Library = {}; // Populated from [SANE_RUNTIME] LIBRARY card
+    let Library = {}; 
 
     // Normalize entity ID to consistent case for case-insensitive operations
     function normalizeEntityId(entityId) {
@@ -35,7 +35,6 @@ function GameState(hook, text) {
     // Load Library functions from [SANE_RUNTIME] LIBRARY card and add built-in helpers
     function loadLibraryFunctions() {
 
-        // Simply reference Utilities instead of copying all functions
         Library.Utilities = Utilities;
 
 
@@ -94,8 +93,11 @@ function GameState(hook, text) {
     function initializeDataCache() {
         if (debug) console.log(`${MODULE_NAME}: Initializing data cache...`);
 
-        // 1. Load schemas from [SANE:S] cards
-        if (schemaCount === 0) {
+        // 1. Load ALL schemas from [SANE:S] cards
+        let schemaCount = 0;
+
+        // Use find() to get all schema cards
+        if (Utilities?.storyCard?.find) {
             const schemaCards = Utilities.storyCard.find(
                 card => card.title && card.title.startsWith('[SANE:S]'),
                 true  // Get all matching cards
@@ -310,9 +312,76 @@ function GameState(hook, text) {
         }
     }
     
-    // Entity generation tracking 
+    // Entity generation tracking
     let currentEntityGeneration = null;
-    
+
+    // Helper functions for generation state tracking
+    function hasActiveGeneration() {
+        // Check if any entity has generationwizard component that's active (generating or queued)
+        const allEntities = loadFromDataCards() || {};
+        for (const [id, entity] of Object.entries(allEntities)) {
+            const state = entity?.generationwizard?.state;
+            if (state === 'generating' || state === 'queued') {
+                return true;
+            }
+        }
+        // Also check [SANE:E] cards
+        const entityCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:E]'),
+            true
+        ) || [];
+        for (const card of entityCards) {
+            try {
+                const entities = parseEntityData(card.description || '');
+                for (const entity of Object.values(entities)) {
+                    const state = entity?.generationwizard?.state;
+                    if (state === 'generating' || state === 'queued') {
+                        return true;
+                    }
+                }
+            } catch (e) {}
+        }
+        return false;
+    }
+
+    function findActiveGeneration() {
+        // Find entity with generationwizard.state = 'generating'
+        const allEntities = loadFromDataCards() || {};
+        for (const [id, entity] of Object.entries(allEntities)) {
+            if (entity?.generationwizard?.state === 'generating') {
+                return { entityId: id, entity };
+            }
+        }
+        // Check [SANE:E] cards too
+        const entityCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:E]'),
+            true
+        ) || [];
+        for (const card of entityCards) {
+            try {
+                const entities = parseEntityData(card.description || '');
+                for (const [id, entity] of Object.entries(entities)) {
+                    if (entity?.generationwizard?.state === 'generating') {
+                        return { entityId: id, entity };
+                    }
+                }
+            } catch (e) {}
+        }
+        return null;
+    }
+
+    function findQueuedGenerations() {
+        const queued = [];
+        // Check all entities for queued generations
+        const allEntities = loadFromDataCards() || {};
+        for (const [id, entity] of Object.entries(allEntities)) {
+            if (entity?.generationwizard?.state === 'queued') {
+                queued.push({ entityId: id, entity });
+            }
+        }
+        return queued;
+    }
+
     // Tool pattern: standard function calls like tool_name(param1, param2, param3)
     const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/gi;
     
@@ -468,13 +537,12 @@ function GameState(hook, text) {
         const hasEvents = turnData.events && turnData.events.length > 0;
         const hasTools = turnData.toolsExecuted && turnData.toolsExecuted.length > 0;
         const hasInput = turnData.hook === 'input' && (turnData.commandDetected || turnData.inputSummary?.startsWith('/'));
-        const hasEntityQueued = turnData.entityQueued;
-        const hasGenerationWizard = turnData.generationWizardActive;
+        const hasBlueprintManager = turnData.generationWizardActive;
         
         // Skip storing empty context hooks and output hooks with only "Loaded 1 runtime tools"
         const isEmptyContext = turnData.hook === 'context' && !hasEvents;
-        const isBoringOutput = turnData.hook === 'output' && 
-            !hasTools && !hasEntityQueued && !hasGenerationWizard &&
+        const isBoringOutput = turnData.hook === 'output' &&
+            !hasTools && !hasBlueprintManager &&
             (!hasEvents || (turnData.events.length === 1 && turnData.events[0].includes('Loaded 1 runtime tools')));
         
         if (!isEmptyContext && !isBoringOutput) {
@@ -518,9 +586,9 @@ function GameState(hook, text) {
             }
             
             // Skip output hooks that only loaded runtime tools and nothing else
-            if (turn.hook === 'output' && turn.events && turn.events.length === 1 && 
+            if (turn.hook === 'output' && turn.events && turn.events.length === 1 &&
                 turn.events[0].includes('Loaded 1 runtime tools') &&
-                !turn.entityQueued && !turn.generationWizardActive) {
+                !turn.generationWizardActive) {
                 return; // Skip this turn entirely
             }
             
@@ -541,8 +609,7 @@ function GameState(hook, text) {
                 if (turn.variablesReplaced) output += `Variables Replaced: ${turn.variablesReplaced}\n`;
             } else if (turn.hook === 'output') {
                 if (turn.toolsInOutput) output += `Tools in Output: ${turn.toolsInOutput.length}\n`;
-                if (turn.entityQueued) output += `Entity Queued: ${turn.entityQueued}\n`;
-                if (turn.generationWizardActive) output += `GenerationWizard Active: ${turn.generationWizardActive}\n`;
+                if (turn.generationWizardActive) output += `BlueprintManager Active: ${turn.generationWizardActive}\n`;
             }
             
             // Show processing events for this turn
@@ -888,7 +955,6 @@ function GameState(hook, text) {
                 if (entity) {
                     entity.id = entityId;  // Add the ID field
                     dataCache[entityId] = entity;
-                    checkMemoryUsage();
                     // Register all aliases
                     if (entity.aliases) {
                         for (const alias of entity.aliases) {
@@ -926,7 +992,6 @@ function GameState(hook, text) {
 
                         // Cache the entity
                         dataCache[entityId] = entity;
-                        checkMemoryUsage();
 
                         // Register aliases if present
                         if (entity.aliases) {
@@ -952,7 +1017,6 @@ function GameState(hook, text) {
 
                                 // Cache the entity by its primary ID
                                 dataCache[key] = entity;
-                                checkMemoryUsage();
 
                                 // Register all aliases
                                 if (entity.aliases) {
@@ -1061,8 +1125,8 @@ function GameState(hook, text) {
             Object.assign(entity, value);
         }
 
-        // Save the entity back (unless it's a temporary entity with gw_progress)
-        if (entity.components && entity.components.includes('gw_progress')) {
+        // Save the entity back (unless it's a temporary entity with generationwizard)
+        if (entity.components && entity.components.includes('generationwizard')) {
             // Don't save temporary entities - just update cache
             dataCache[entityName] = entity;
             return true;
@@ -1793,41 +1857,7 @@ function GameState(hook, text) {
     // ==========================
     // Template-based entity creation system with field mapping and inheritance
 
-    function loadBlueprint(blueprintId) {
-        // Validate blueprintId is a string
-        if (!blueprintId || typeof blueprintId !== 'string') {
-            console.log(`${MODULE_NAME}: loadBlueprint requires a string blueprintId, got type: ${typeof blueprintId}, value: ${JSON.stringify(blueprintId)}`);
-            console.trace('Stack trace for non-string blueprintId');
-            return null;
-        }
-
-        // Check cache first
-        if (dataCache[`blueprint.${blueprintId}`]) {
-            return dataCache[`blueprint.${blueprintId}`];
-        }
-
-        // Try to find a blueprint card containing this blueprint
-        const blueprintCards = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[SANE:BP]'),
-            true
-        ) || [];
-
-        for (const card of blueprintCards) {
-            try {
-                const blueprint = JSON.parse(card.description || '{}');
-                if (blueprint.id === blueprintId) {
-                    // Found it - cache in blueprint.* namespace
-                    dataCache[`blueprint.${blueprintId}`] = blueprint;
-                    return blueprint;
-                }
-            } catch (e) {
-                // Continue searching
-            }
-        }
-
-        // Blueprint not found
-        return null;
-    }
+    // REMOVED: loadBlueprint - blueprints are handled by BlueprintManager only
 
     function saveEntity(entityId, entity) {
         if (debug) console.log(`${MODULE_NAME}: saveEntity called for ${entityId}`);
@@ -2572,7 +2602,7 @@ function GameState(hook, text) {
 
         // Query entities using either a predicate function or tag expression
         // query: function(entity) => boolean OR string tag expression
-        // Returns: array of matching entities
+        // Returns: object of matching entities keyed by ID
         // Examples:
         //   queryTags('Character')                    // All characters
         //   queryTags('Character.NPC')                // All NPCs
@@ -2599,20 +2629,20 @@ function GameState(hook, text) {
         else {
             // Invalid query
             if (debug) console.log(`${MODULE_NAME}: Invalid query type: ${typeof query}`);
-            return [];
+            return {};
         }
 
-        const results = [];
+        const results = {};
         for (const [key, entity] of Object.entries(dataCache)) {
             if (!entity || typeof entity !== 'object') continue;
 
-            // Skip schema entries and other non-entity data
-            if (key.startsWith('schema.') || key.startsWith('_')) continue;
+            // Skip schema entries, library functions, and other non-entity data
+            if (key.startsWith('schema.') || key.startsWith('Library.') || key.startsWith('_')) continue;
 
             // Apply predicate
             try {
                 if (predicate(entity)) {
-                    results.push(entity);
+                    results[key] = entity;
                 }
             } catch (e) {
                 // Skip entities that cause errors in predicate
@@ -3140,7 +3170,6 @@ function GameState(hook, text) {
                     set: set,
                     queryTags: queryTags,
                     save: save,
-                    create: create,
                     getField: function(characterName, fieldPath) {
                         const character = get(characterName);
                         if (!character) return null;
@@ -3154,7 +3183,7 @@ function GameState(hook, text) {
                     },
                     Utilities: Utilities,
                     Calendar: typeof Calendar !== 'undefined' ? Calendar : null,
-                    GenerationWizard: typeof GenerationWizard !== 'undefined' ? GenerationWizard : null,
+                    BlueprintManager: typeof BlueprintManager !== 'undefined' ? BlueprintManager : null,
                     RewindSystem: RewindSystem,  // Add RewindSystem access
                     debug: debug,
                     // Debug-only functions
@@ -4238,9 +4267,9 @@ function GameState(hook, text) {
         Calendar('api', null);
     }
 
-    // Initialize GenerationWizard API if available
-    if (typeof GenerationWizard !== 'undefined' && typeof GenerationWizard === 'function') {
-        GenerationWizard('api', null);
+    // Initialize BlueprintManager API if available
+    if (typeof BlueprintManager !== 'undefined' && typeof BlueprintManager === 'function') {
+        BlueprintManager('api', null);
     }
     
     // ==========================
@@ -4775,87 +4804,8 @@ function GameState(hook, text) {
         return inventory;
     }
     
-    // ==========================
-    // Unified Entity Creation System
-    // ==========================
-    /**
-     * Create any entity type with initial data
-     * @param {string} entityType - Type of entity (Character, Location, Item, Faction, etc.)
-     * @param {object} data - Initial data for the entity (can use flat, component, or dot notation)
-     * @returns {object|null} The created entity or null if failed
-     */
-    function create(data = {}) {
-        // Get entity ID from data.id or generate one, then normalize case
-        let entityId = data.id || `Entity_${Date.now()}`;
-        entityId = normalizeEntityId(entityId);
-
-        // Check if entity already exists (case-insensitive)
-        const existingEntity = get(entityId);
-        if (existingEntity) {
-            if (debug) console.log(`${MODULE_NAME}: create(): Entity "${entityId}" already exists, returning existing entity`);
-            return existingEntity;
-        }
-
-        // Determine blueprint type from GameplayTags
-        const entityType = data.GameplayTags?.[0]?.split('.')[0] || 'Character';
-
-        // Load blueprint for this entity type
-        const blueprint = loadBlueprint(entityType);
-        if (!blueprint) {
-            console.log(`${MODULE_NAME}: No blueprint found for entity type ${entityType}`);
-            return null;
-        }
-
-        // Deep copy the blueprint to create the entity
-        const entity = JSON.parse(JSON.stringify(blueprint));
-
-        // Override with provided data
-        for (const [key, value] of Object.entries(data)) {
-            if (key.includes('.')) {
-                // Handle dot notation (e.g., "info.gender" or "stats.hp.current")
-                setNestedField(entity, key, value);
-            } else {
-                // Direct field assignment
-                entity[key] = value;
-            }
-        }
-
-        // Set the entity ID
-        entity.id = entityId;
-
-        // Validate aliases don't conflict with existing entities
-        if (entity.aliases && Array.isArray(entity.aliases)) {
-            for (const alias of entity.aliases) {
-                if (alias === entityId) continue; // Skip ID duplicates (will be cleaned up in save)
-
-                if (entityAliasMap[alias] && entityAliasMap[alias] !== entityId) {
-                    const owningEntity = entityAliasMap[alias];
-                    console.log(`${MODULE_NAME}: create(): ERROR - Alias "${alias}" is already used by entity "${owningEntity}"`);
-                    return null;
-                }
-            }
-        }
-
-        // Save the entity using universal system
-        if (save(entityId, entity)) {
-            // Add to cache for immediate access (using normalized ID)
-            dataCache[entityId] = entity;
-
-            // Update entityAliasMap for new entity (case-insensitive)
-            entityAliasMap[entityId] = entityId; // Already normalized, no need to toLowerCase again
-            if (entity.aliases && Array.isArray(entity.aliases)) {
-                for (const alias of entity.aliases) {
-                    entityAliasMap[normalizeEntityId(alias)] = entityId;
-                }
-            }
-
-            if (debug) console.log(`${MODULE_NAME}: Created entity '${entityId}' from blueprint ${entityType}`);
-            return entity;
-        }
-
-        if (debug) console.log(`${MODULE_NAME}: Failed to save entity '${entityId}'`);
-        return null;
-    }
+    // REMOVED: create() function was redundant with save()
+    // Use save() directly for all entity storage
     
     // ==========================
     // Player Command Processing
@@ -4865,9 +4815,9 @@ function GameState(hook, text) {
         
         // Handle /GW abort command
         if (command === '/gw abort' || command === '/gw cancel') {
-            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
-            if (typeof GenerationWizard !== 'undefined' && gwActive) {
-                GenerationWizard.cancelGeneration();
+            gwActive = hasActiveGeneration();
+            if (typeof BlueprintManager !== 'undefined' && gwActive) {
+                BlueprintManager.cancelGeneration();
                 if (debug) console.log(`${MODULE_NAME}: Generation aborted by player`);
                 // Show message to player but hide from LLM
                 return {
@@ -5436,10 +5386,10 @@ function GameState(hook, text) {
             }
         }
 
-        // Temporary entities with gw_progress should be saved to [SANE:D] cards
+        // Temporary entities with generationwizard should be saved to [SANE:D] cards
         // so they persist between hooks, but not to [SANE:E] cards
-        if (entity.gw_progress) {
-            if (debug) console.log(`${MODULE_NAME}: Saving temp entity ${entityId} to [SANE:D] card (has gw_progress)`);
+        if (entity.generationwizard) {
+            if (debug) console.log(`${MODULE_NAME}: Saving temp entity ${entityId} to [SANE:D] card (has generationwizard)`);
 
             // Load existing data entities
             const existingData = loadFromDataCards() || {};
@@ -5454,12 +5404,12 @@ function GameState(hook, text) {
             return true;
         }
 
-        // Clean up stale gw_progress from components array if needed
-        if (entity.components && entity.components.includes('gw_progress')) {
-            const index = entity.components.indexOf('gw_progress');
+        // Clean up stale generationwizard from components array if needed
+        if (entity.components && entity.components.includes('generationwizard')) {
+            const index = entity.components.indexOf('generationwizard');
             if (index !== -1) {
                 entity.components.splice(index, 1);
-                if (debug) console.log(`${MODULE_NAME}: Cleaned up stale gw_progress from components array for ${entityId}`);
+                if (debug) console.log(`${MODULE_NAME}: Cleaned up stale generationwizard from components array for ${entityId}`);
             }
         }
 
@@ -5536,975 +5486,10 @@ function GameState(hook, text) {
     // ==========================
     // Tool Processors
     // ==========================
-    const toolProcessors = {
-        advance_time: function(hours, minutes) {
-            hours = parseInt(hours) || 0;
-            minutes = parseInt(minutes) || 0;
-            
-            // Both being 0 is malformed
-            if (hours === 0 && minutes === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid advance_time (0h 0m) - removing`);
-                return 'malformed';
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: Advancing time by ${hours}h ${minutes}m`);
-            
-            if (typeof Calendar !== 'undefined' && Calendar.advanceTime) {
-                let timeStr = '';
-                if (hours > 0) timeStr += hours + 'h';
-                if (minutes > 0) timeStr += (timeStr ? ', ' : '') + minutes + 'm';
-                
-                const result = Calendar.advanceTime(timeStr);
-                return result ? 'executed' : 'malformed';
-            }
-            return 'executed';
-        },
-        
-        update_location: function(characterName, location) {
-            try {
-                if (!characterName || !location) return 'malformed';
-
-                    if (!isValidCharacterName(characterName)) {
-                    return 'malformed';
-                }
-            
-            characterName = String(characterName).toLowerCase();
-            location = String(location).toLowerCase().replace(/\s+/g, '_');
-            
-            // Check if character exists using universal system
-            const character = get(characterName);
-            if (character) {
-                // Character exists, update location using component structure
-                if (!character.info) {
-                    if (debug) console.log(`${MODULE_NAME}: Character ${characterName} missing info component`);
-                    return 'malformed';
-                }
-                character.info.currentLocation = location;
-                save(characterName, character);
-                if (debug) console.log(`${MODULE_NAME}: ${characterName} moved to ${location}`);
-                return 'executed';
-            }
-            
-            // Character not found - do a full check
-            const fullCheckCharacter = get(characterName);
-            
-            if (!fullCheckCharacter) {
-                // Character doesn't exist
-                trackUnknownEntity(characterName, 'update_location', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
-                }
-            } else {
-                // Found character - update location
-                if (fullCheckCharacter.info) {
-                    fullCheckCharacter.info.currentLocation = location;
-                } else {
-                    fullCheckCharacter.location = location;
-                }
-                save(characterName, fullCheckCharacter);
-                if (debug) console.log(`${MODULE_NAME}: ${characterName} moved to ${location}`);
-            }
-
-            return 'executed';
-            } catch (e) {
-                console.log(`${MODULE_NAME}: Error in update_location: ${e.message}`);
-                if (debug) console.log(`${MODULE_NAME}: Stack trace:`, e.stack);
-                return 'malformed';
-            }
-        },
-
-        add_item: function(characterName, itemName, quantity) {
-            try {
-            if (!characterName || !itemName) return 'malformed';
-            
-            
-            characterName = String(characterName).toLowerCase();
-            itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
-            const qtyStr = String(quantity).trim();
-            if (!/^-?\d+$/.test(qtyStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for add_item: ${quantity}`);
-                return 'malformed';
-            }
-            quantity = parseInt(qtyStr);
-            
-            // 0 or invalid quantity is malformed
-            if (isNaN(quantity) || quantity === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity for add_item: ${quantity}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = get(characterName);
-            
-            if (!character) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                }
-                return 'executed'; // Still executed, just no character
-            }
-            
-            // Access inventory through component or fallback to direct access
-            if (!character.inventory) character.inventory = {};
-            const inventory = character.inventory;
-            
-            // Always convert to object format
-            let currentQty = 0;
-            if (typeof inventory[itemName] === 'object') {
-                currentQty = inventory[itemName].quantity || 0;
-            } else if (typeof inventory[itemName] === 'number') {
-                currentQty = inventory[itemName];
-            }
-            
-            const newQty = Math.max(0, currentQty + quantity);
-            
-            // Remove item if quantity reaches 0, otherwise store as object
-            if (newQty === 0) {
-                delete inventory[itemName];
-            } else {
-                inventory[itemName] = { quantity: newQty };
-            }
-            
-            if (debug) {
-                console.log(`${MODULE_NAME}: ${characterName}'s ${itemName}: ${currentQty} → ${newQty}`);
-            }
-
-            save(characterName, character);
-            return 'executed';
-            } catch (e) {
-                console.log(`${MODULE_NAME}: Error in add_item: ${e.message}`);
-                if (debug) console.log(`${MODULE_NAME}: Stack trace:`, e.stack);
-                return 'malformed';
-            }
-        },
-
-        remove_item: function(characterName, itemName, quantity) {
-            if (!characterName || !itemName) return 'malformed';
-            
-            
-            // Allow negative numbers (which would add items)
-            const qtyStr = String(quantity).trim();
-            if (!/^-?\d+$/.test(qtyStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for remove_item: ${quantity}`);
-                return 'malformed';
-            }
-            quantity = parseInt(qtyStr);
-            
-            // 0 is malformed (use positive to remove, negative to add)
-            if (isNaN(quantity) || quantity === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity for remove_item: ${quantity}`);
-                return 'malformed';
-            }
-            
-            // Just call add_item with negative quantity
-            return toolProcessors.add_item(characterName, itemName, -quantity);
-        },
-        
-        use_consumable: function(characterName, itemName, quantity) {
-            // Identical validation to remove_item
-            return toolProcessors.remove_item(characterName, itemName, quantity);
-        },
-        
-        transfer_item: function(giverName, receiverName, itemName, quantity) {
-            if (!giverName || !receiverName || !itemName) return 'malformed';
-            
-            
-            giverName = String(giverName).toLowerCase();
-            receiverName = String(receiverName).toLowerCase();
-            itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
-            const qtyStr = String(quantity).trim();
-            if (!/^\d+$/.test(qtyStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for transfer_item: ${quantity}`);
-                return 'malformed';
-            }
-            const requestedQty = parseInt(qtyStr);
-            
-            // 0 or invalid quantity is malformed
-            if (isNaN(requestedQty) || requestedQty <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity for transfer_item: ${quantity}`);
-                return 'malformed';
-            }
-            
-            const characters = queryTags('Character');
-            const giver = characters[giverName];
-            const receiver = characters[receiverName];
-            
-            // Track unknown entities
-            if (!giver) {
-                trackUnknownEntity(giverName, 'transfer_item', info?.actionCount);
-                if (shouldTriggerGeneration(giverName)) {
-                    addToEntityQueue(giverName);
-                }
-            }
-            if (!receiver) {
-                trackUnknownEntity(receiverName, 'transfer_item', info?.actionCount);
-                if (shouldTriggerGeneration(receiverName)) {
-                    addToEntityQueue(receiverName);
-                }
-            }
-            
-            let anySuccess = false;
-            let transferQty = requestedQty;
-            
-            if (giver) {
-                
-                const availableQty = getItemQuantity(giver.inventory, itemName);
-                transferQty = Math.min(availableQty, requestedQty);
-                
-                if (transferQty > 0) {
-                    setItemQuantity(giver.inventory, itemName, availableQty - transferQty);
-                    
-                    save(giverName, giver);
-                    anySuccess = true;
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Removed ${transferQty} ${itemName} from ${giver.name}`);
-                } else {
-                    if (debug) console.log(`${MODULE_NAME}: ${giver.name} has no ${itemName} to transfer`);
-                    return 'executed'; // Valid attempt, just no items
-                }
-            }
-            
-            if (receiver) {
-                
-                const currentReceiverQty = getItemQuantity(receiver.inventory, itemName);
-                setItemQuantity(receiver.inventory, itemName, currentReceiverQty + transferQty);
-                
-                save(receiverName, receiver);
-                anySuccess = true;
-                
-                if (debug) console.log(`${MODULE_NAME}: Added ${transferQty} ${itemName} to ${receiver.name}`);
-            }
-            
-            return anySuccess ? 'executed' : 'executed';
-        },
-        
-        deal_damage: function(sourceName, targetName, damageAmount) {
-            if (!targetName) return 'malformed';
-            
-            // Validate target name syntax (but allow non-existent/hallucinated names)
-            if (!isValidCharacterName(targetName)) {
-                return 'malformed';
-            }
-            
-            sourceName = sourceName ? String(sourceName).toLowerCase() : 'unknown';
-            targetName = String(targetName).toLowerCase();
-            
-            // Strict number validation - must be a clean integer
-            const damageStr = String(damageAmount).trim();
-            if (!/^\d+$/.test(damageStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid damage amount format: ${damageAmount}`);
-                return 'malformed';
-            }
-            damageAmount = parseInt(damageStr);
-            
-            // 0 or negative damage is malformed
-            if (isNaN(damageAmount) || damageAmount <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid damage amount: ${damageAmount}`);
-                return 'malformed';
-            }
-            
-            // Load the target character directly
-            const target = get(targetName);
-            if (!target) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Target ${targetName} not found`);
-                }
-                return 'executed';
-            }
-            
-            // Only load source if needed and exists
-            const source = (sourceName !== 'unknown') 
-                ? get(sourceName) : null;
-            
-            const sourceDisplay = source ? source.name : sourceName;
-            
-            // Ensure stats component exists
-            if (!target.stats) {
-                target.stats = {};
-            }
-            if (!target.stats.hp) {
-                target.stats.hp = { current: 100, max: 100 };
-            }
-            
-            const oldHP = target.stats.hp.current;
-            const maxHP = target.stats.hp.max;
-            const newHP = Math.max(0, oldHP - damageAmount);
-            const actualDamage = oldHP - newHP;
-            
-            // Update HP in stats component
-            target.stats.hp.current = newHP;
-            
-            if (debug) {
-                console.log(`${MODULE_NAME}: ${sourceDisplay} dealt ${actualDamage} damage to ${target.name} (${oldHP} → ${newHP}/${maxHP})`);
-            }
-            
-            save(targetName, target);
-            return 'executed';
-        },
-        
-        add_levelxp: function(characterName, xpAmount) {
-            if (!characterName) return 'malformed';
-            
-            
-            characterName = String(characterName).toLowerCase();
-            
-            // Allow negative numbers for XP removal
-            const xpStr = String(xpAmount).trim();
-            if (!/^-?\d+$/.test(xpStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid XP format for add_levelxp: ${xpAmount}`);
-                return 'malformed';
-            }
-            xpAmount = parseInt(xpStr);
-            
-            // 0 is malformed (use positive/negative for actual changes)
-            if (isNaN(xpAmount) || xpAmount === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid XP amount: ${xpAmount}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = get(characterName);
-            
-            if (!character) {
-                trackUnknownEntity(characterName, 'add_levelxp', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                return 'executed';
-            }
-            
-            // Update XP using nested level.xp structure
-            if (!character.stats || !character.stats.level || !character.stats.level.xp) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} missing stats.level.xp component`);
-                return 'malformed';
-            }
-            character.stats.level.xp.current += xpAmount;
-            
-            // Handle negative XP (level down)
-            while (character.stats.level.xp.current < 0 && character.stats.level.value > 1) {
-                // Level down
-                character.stats.level.value--;
-                
-                // Get max XP for the new (lower) level
-                const newMaxXp = getMaxXpForLevel(character.stats.level.value);
-                
-                // Add the max XP to current (negative) XP
-                character.stats.level.xp.current += newMaxXp;
-                character.stats.level.xp.max = newMaxXp;
-                
-                // Adjust HP for level down
-                const newMaxHp = getMaxHpForLevel(character.stats.level.value);
-                if (character.stats.hp) {
-                    character.stats.hp.max = newMaxHp;
-                    // Keep current HP proportional if it exceeds new max
-                    if (character.stats.hp.current > newMaxHp) {
-                        character.stats.hp.current = newMaxHp;
-                    }
-                }
-                
-                if (debug) console.log(`${MODULE_NAME}: ${character.id} leveled DOWN to ${character.stats.level.value}`);
-            }
-            
-            // Ensure XP doesn't go below 0 at level 1
-            if (character.stats.level.xp.current < 0) {
-                character.stats.level.xp.current = 0;
-            }
-            
-            const action = xpAmount > 0 ? 'Added' : 'Removed';
-            if (debug) console.log(`${MODULE_NAME}: ${action} ${Math.abs(xpAmount)} XP ${xpAmount > 0 ? 'to' : 'from'} ${characterName} (${character.stats.level.xp.current}/${character.stats.level.xp.max})`);
-            
-            // Process level up if XP is positive
-            if (xpAmount > 0) {
-                processLevelUp(character);
-            }
-            save(characterName, character);
-            return 'executed';
-        },
-        
-        add_skillxp: function(characterName, skillName, xpAmount) {
-            if (!characterName || !skillName) return 'malformed';
-            
-            
-            characterName = String(characterName).toLowerCase();
-            skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
-            const xpStr = String(xpAmount).trim();
-            if (!/^\d+$/.test(xpStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid XP format for add_skillxp: ${xpAmount}`);
-                return 'malformed';
-            }
-            xpAmount = parseInt(xpStr);
-            
-            // 0 or invalid XP is malformed
-            if (isNaN(xpAmount) || xpAmount <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid skill XP amount: ${xpAmount}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = get(characterName);
-            
-            if (!character) {
-                trackUnknownEntity(characterName, 'add_skillxp', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                return 'executed';
-            }
-            
-            // Initialize skills component if needed
-            if (!character.skills) {
-                character.skills = {};
-            }
-            
-            if (!character.skills[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: Skill ${skillName} not found on ${character.id}`);
-                return 'malformed';
-            }
-            
-            const skill = character.skills[skillName];
-            skill.xp.current += xpAmount;
-            
-            // Handle negative skill XP (skill level down)
-            while (skill.xp.current < 0 && skill.level > 1) {
-                // Level down the skill
-                skill.level--;
-                
-                // Get max XP for the new (lower) skill level
-                const newMaxXp = getMaxXpForSkill(skillName, skill.level);
-                
-                // Add the max XP to current (negative) XP
-                skill.xp.current += newMaxXp;
-                skill.xp.max = newMaxXp;
-                
-                if (debug) console.log(`${MODULE_NAME}: ${character.id}'s ${skillName} leveled DOWN to ${skill.level}`);
-            }
-            
-            // Ensure XP doesn't go below 0 at skill level 1
-            if (skill.xp.current < 0) {
-                skill.xp.current = 0;
-            }
-            
-            const action = xpAmount > 0 ? 'Added' : 'Removed';
-            if (debug) console.log(`${MODULE_NAME}: ${action} ${Math.abs(xpAmount)} XP ${xpAmount > 0 ? 'to' : 'from'} ${character.id}'s ${skillName} (${skill.xp.current}/${skill.xp.max})`);
-            
-            // Process skill level up if XP is positive
-            if (xpAmount > 0) {
-                processSkillLevelUp(skill, skillName);
-            }
-            save(characterName, character);
-            return 'executed';
-        },
-        
-        unlock_newskill: function(characterName, skillName) {
-            if (!characterName || !skillName) return 'malformed';
-            
-            
-            characterName = String(characterName).toLowerCase();
-            skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Check if skill exists in registry
-            const skillRegistry = getSkillRegistry();
-            if (!skillRegistry[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: Unknown skill: ${skillName}. Valid skills: ${Object.keys(skillRegistry).join(', ')}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = get(characterName);
-            
-            if (!character) {
-                trackUnknownEntity(characterName, 'unlock_newskill', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                return 'executed';
-            }
-            
-            // Initialize skills component if needed
-            if (!character.skills) {
-                character.skills = {};
-            }
-            
-            // Check if character already has this skill
-            if (character.skills[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: ${character.id} already has ${skillName}`);
-                return 'malformed';
-            }
-            
-            const maxXP = calculateSkillXPRequirement(skillName, 2);
-            character.skills[skillName] = {
-                level: 1,
-                xp: {
-                    current: 0,
-                    max: maxXP
-                }
-            };
-            
-            if (debug) console.log(`${MODULE_NAME}: ${character.id} learned ${skillName}!`);
-            
-            save(characterName, character);
-            return 'executed';
-        },
-        
-        update_attribute: function(characterName, attrName, value) {
-            if (!characterName || !attrName) return 'malformed';
-            
-            
-            characterName = String(characterName).toLowerCase();
-            attrName = String(attrName).toLowerCase();
-            value = parseInt(value);
-            
-            if (isNaN(value) || value <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid attribute value: ${value}`);
-                return 'malformed';
-            }
-            
-            // Validate against field config
-            const attrConfig = null; // Attributes handled by component system
-            if (attrConfig && attrConfig.required) {
-                const requiredAttrs = attrConfig.required.split(',').map(a => a.trim().toLowerCase());
-                const optionalAttrs = attrConfig.optional ? attrConfig.optional.split(',').map(a => a.trim().toLowerCase()) : [];
-                const allAttrs = [...requiredAttrs, ...optionalAttrs];
-                
-                if (!allAttrs.includes(attrName)) {
-                    if (debug) console.log(`${MODULE_NAME}: Invalid attribute '${attrName}' - must be one of: ${allAttrs.join(', ')}`);
-                    return 'malformed';
-                }
-            }
-            
-            // Selectively load only the character needed
-            const character = get(characterName);
-            
-            if (!character) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found for update_attribute`);
-                return 'permitted'; // Allow hallucinated characters
-            }
-            
-            // Initialize attributes component if it doesn't exist
-            if (!character.attributes) {
-                character.attributes = {};
-            }
-            
-            // Set attribute using proper component structure
-            // Attributes use { attributeName: { value: X } } format
-            if (!character.attributes[attrName]) {
-                character.attributes[attrName] = {};
-            }
-            character.attributes[attrName].value = value;
-            
-            if (debug) console.log(`${MODULE_NAME}: Set ${character.id}'s ${attrName} to ${value}`);
-            
-            save(characterName, character);
-            return 'executed';
-        },
-        
-        update_relationship: function(name1, name2, changeAmount) {
-            if (!name1 || !name2) return 'malformed';
-            
-            
-            // Convert to consistent case for lookup (get() handles case-insensitive resolution)
-            name1 = String(name1);
-            name2 = String(name2);
-
-            // Strict number validation (can be negative)
-            const changeStr = String(changeAmount).trim();
-            if (!/^-?\d+$/.test(changeStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid change amount format: ${changeAmount}`);
-                return 'malformed';
-            }
-            changeAmount = parseInt(changeStr);
-
-            // 0 change is malformed (why call it?)
-            if (isNaN(changeAmount) || changeAmount === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid relationship change: ${changeAmount}`);
-                return 'malformed';
-            }
-
-            // Use get() for proper case-insensitive alias resolution
-            const char1 = get(name1);
-            const char2 = get(name2);
-            
-            // Track unknown entities
-            if (!char1) {
-                trackUnknownEntity(name1, 'update_relationship', info?.actionCount);
-                if (shouldTriggerGeneration(name1)) {
-                    addToEntityQueue(name1);
-                }
-            }
-            if (!char2) {
-                trackUnknownEntity(name2, 'update_relationship', info?.actionCount);
-                if (shouldTriggerGeneration(name2)) {
-                    addToEntityQueue(name2);
-                }
-            }
-
-            if (!char1 || !char2) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
-                }
-                return 'executed';
-            }
-            
-            // Ensure relationships is an object (not a string or undefined)
-            if (typeof char1.relationships !== 'object' || char1.relationships === null) {
-                char1.relationships = {};
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Fixed relationships for ${char1.name} - was type: ${typeof char1.relationships}`);
-                }
-            }
-            if (typeof char2.relationships !== 'object' || char2.relationships === null) {
-                char2.relationships = {};
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Fixed relationships for ${char2.name} - was type: ${typeof char2.relationships}`);
-                }
-            }
-            
-            // Update bidirectional relationships with proper object structure
-            if (!char1.relationships[name2]) {
-                char1.relationships[name2] = { value: 0 };
-            } else if (typeof char1.relationships[name2] === 'number') {
-                // Migrate old format
-                char1.relationships[name2] = { value: char1.relationships[name2] };
-            }
-            
-            if (!char2.relationships[name1]) {
-                char2.relationships[name1] = { value: 0 };
-            } else if (typeof char2.relationships[name1] === 'number') {
-                // Migrate old format
-                char2.relationships[name1] = { value: char2.relationships[name1] };
-            }
-            
-            char1.relationships[name2].value += changeAmount;
-            char2.relationships[name1].value += changeAmount;
-            
-            const flavorText1 = getRelationshipFlavor(char1.relationships[name2].value, name1, name2);
-            const flavorText2 = getRelationshipFlavor(char2.relationships[name1].value, name2, name1);
-
-            save(name1, char1);
-            save(name2, char2);
-
-            if (debug) {
-                console.log(`${MODULE_NAME}: ${name1}→${name2}: ${flavorText1}`);
-                console.log(`${MODULE_NAME}: ${name2}→${name1}: ${flavorText2}`);
-            }
-            
-            return 'executed';
-        },
-        
-        discover_location: function(characterName, locationName, direction) {
-            // Validate inputs
-            if (!characterName || !locationName || !direction) return 'malformed';
-            
-            
-            characterName = String(characterName).toLowerCase();
-            locationName = String(locationName).replace(/\s+/g, '_');
-            direction = String(direction).toLowerCase();
-            
-            // Validate direction (cardinal directions + inside/outside for nested locations)
-            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
-            if (!validDirections.includes(direction)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${direction}. Valid: ${validDirections.join(', ')}`);
-                return 'malformed';
-            }
-            
-            // Get character's current location
-            // Selectively load only the character needed
-            const character = get(characterName);
-            
-            if (!character) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                }
-                return 'malformed';
-            }
-            
-            const currentLocation = character.location;
-            
-            // Check if location already exists using universal data system
-            const existingLocation = get(locationName);
-            if (existingLocation && hasGameplayTag(existingLocation, 'Location')) {
-                if (debug) console.log(`${MODULE_NAME}: Location ${locationName} already exists - use connect_locations instead`);
-                return 'malformed';
-            }
-            
-            // Queue for generation if GenerationWizard is available
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startGeneration) {
-                const oppositeDir = getOppositeDirection(direction);
-                GenerationWizard.startGeneration('Location', {
-                    NAME: locationName,
-                    CONNECTED_FROM: currentLocation,
-                    DIRECTION_FROM: oppositeDir || 'unknown',
-                    DISCOVERED_BY: character.id
-                });
-            }
-            
-            
-            if (debug) console.log(`${MODULE_NAME}: ${character.id} discovered ${locationName} to the ${direction}`);
-            return 'executed';
-        },
-        
-        connect_locations: function(locationA, locationB, directionFromA, bidirectional) {
-            if (!locationA || !locationB || !directionFromA) return 'malformed';
-
-            locationA = String(locationA).replace(/\s+/g, '_');
-            locationB = String(locationB).replace(/\s+/g, '_');
-            directionFromA = String(directionFromA).toLowerCase();
-
-            // Parse bidirectional parameter - default to true if not specified
-            if (bidirectional === undefined || bidirectional === null || bidirectional === '') {
-                bidirectional = true;
-            } else if (typeof bidirectional === 'string') {
-                bidirectional = bidirectional.toLowerCase() === 'true' || bidirectional === '1' || bidirectional === 'yes' || bidirectional === "t";
-            } else {
-                bidirectional = Boolean(bidirectional);
-            }
-
-            // Don't validate direction - let scenarios define their own
-
-            // Check both locations exist using universal data system
-            const locA = get(locationA);
-            const locB = get(locationB);
-
-            if (!locA || !locB) {
-                if (debug) console.log(`${MODULE_NAME}: One or both locations not found`);
-                return 'malformed';
-            }
-
-            // Verify they have Location gameplay tag
-            if (!hasGameplayTag(locA, 'Location') || !hasGameplayTag(locB, 'Location')) {
-                if (debug) console.log(`${MODULE_NAME}: One or both entities are not locations`);
-                return 'malformed';
-            }
-
-            // Update pathway from A to B
-            updateLocationPathway(locationA, directionFromA, locationB, false); // false = don't auto-bidirectional
-
-            // Update reverse pathway if bidirectional
-            if (bidirectional) {
-                const oppositeDir = getOppositeDirection(directionFromA);
-                if (oppositeDir) {
-                    updateLocationPathway(locationB, oppositeDir, locationA, false);
-                    if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} <-${directionFromA}/${oppositeDir}-> ${locationB} (bidirectional)`);
-                } else {
-                    if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} -${directionFromA}-> ${locationB} (one-way, no opposite for '${directionFromA}')`);
-                }
-            } else {
-                if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} -${directionFromA}-> ${locationB} (one-way)`);
-            }
-
-            return 'executed';
-        },
-        
-        accept_quest: function(playerName, questName, questGiver, questType) {
-            // Must have all 4 parameters
-            if (!playerName || !questName || !questGiver || !questType) return 'malformed';
-            
-            // CRITICAL: Convert quest name and giver to snake_case to prevent system breakage
-            questName = String(questName).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            questGiver = String(questGiver).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            
-            // Normalize quest type to lowercase - handle both "story" and "story_quest" formats
-            let normalizedType = String(questType).toLowerCase();
-            
-            // Strip "_quest" suffix if present
-            if (normalizedType.endsWith('_quest')) {
-                normalizedType = normalizedType.substring(0, normalizedType.length - 6);
-            }
-            
-            // Load quest types from schema
-            const questSchema = null; // Quest types handled by scenario
-            let validTypes = ['story', 'side', 'hidden', 'raid']; // Default fallback
-            let stageRanges = {};
-            
-            if (questSchema && questSchema.value) {
-                try {
-                    const parsed = null; // Quest types handled by scenario
-                    if (parsed && typeof parsed === 'object') {
-                        validTypes = [];
-                        
-                        // Parse quest types and their stage counts
-                        for (const [type, stages] of Object.entries(parsed)) {
-                    const typeLower = type.toLowerCase();
-                    validTypes.push(typeLower);
-                    
-                    // Parse stage count - can be "min-max" or single number
-                    const stageStr = String(stages);
-                    if (stageStr.includes('-')) {
-                        const [min, max] = stageStr.split('-').map(s => parseInt(s.trim()));
-                        stageRanges[typeLower] = { min, max };
-                    } else {
-                        const exact = parseInt(stageStr);
-                        stageRanges[typeLower] = { min: exact, max: exact };
-                    }
-                }
-                    }
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Error parsing quest types schema: ${e.message}`);
-                    // Keep default fallback values
-                }
-            } else {
-                // Fallback to defaults if schema not found
-                stageRanges = {
-                    'story': { min: 3, max: 7 },
-                    'side': { min: 2, max: 5 },
-                    'hidden': { min: 3, max: 7 },
-                    'raid': { min: 3, max: 7 }
-                };
-            }
-            
-            if (!validTypes.includes(normalizedType)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType} (normalized: ${normalizedType}). Valid types: ${validTypes.join(', ')}`);
-                return 'malformed';
-            }
-            
-            // Check GenerationWizard availability
-            if (typeof GenerationWizard === 'undefined') {
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available`);
-                return 'executed';
-            }
-            
-            // Check if already generating
-            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
-            if (gwActive) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return 'executed';
-            }
-            
-            // Determine stage count based on type (using lowercase)
-            const range = stageRanges[normalizedType];
-            const stageCount = Math.floor(Math.random() * (range.max - range.min + 1)) + range.min;
-            
-            if (debug) console.log(`${MODULE_NAME}: Starting quest generation - Name: ${questName}, Type: ${normalizedType}, Stages: ${stageCount}`);
-            
-            // Start generation with normalized lowercase type
-            const started = GenerationWizard.startQuestGeneration(
-                questName,
-                questGiver,
-                normalizedType,  // Pass lowercase version
-                stageCount
-            );
-            
-            if (debug) console.log(`${MODULE_NAME}: Quest generation ${started ? 'started' : 'failed to start'}`);
-            
-            return started ? 'executed' : 'malformed';
-        },
-        
-        offer_quest: function(npcName, questName, questGiver, questType) {
-            // Dummy tool - does nothing but is recognized as valid
-            // NPC quest offering not yet implemented
-            if (!npcName || !questName) return 'malformed';
-            
-            if (debug) console.log(`${MODULE_NAME}: offer_quest not yet implemented: ${npcName} offers ${questName}`);
-            return 'executed';
-        },
-        
-        update_quest: function(playerName, questName, stage) {
-            if (!questName) return 'malformed';
-            
-            // If playerName is provided, validate it
-            if (playerName && !isValidCharacterName(playerName)) {
-                return 'malformed';
-            }
-            
-            questName = String(questName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Get the quest using universal data system
-            const quest = get(questName);
-            if (!quest || !hasGameplayTag(quest, 'Quest')) {
-                if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                return 'unknown';  // Return unknown so it gets removed
-            }
-            
-            // Parse the new stage number
-            const newStage = parseInt(stage) || 1;
-            
-            // Replace "Current Stage: X" with the new value
-            let entry = questCard.entry;
-            entry = entry.replace(/Current Stage:\s*\d+/i, `Current Stage: ${newStage}`);
-            
-            // Update the card
-            Utilities.storyCard.update(questCard.title, { entry: entry });
-            
-            if (debug) console.log(`${MODULE_NAME}: Updated ${questName} to stage ${newStage}`);
-            return 'executed';
-        },
-        
-        complete_quest: function(characterName, questName) {
-            if (!characterName || !questName) return 'malformed';
-            
-            try {
-                    if (!isValidCharacterName(characterName)) {
-                    return 'malformed';
-                }
-                
-                characterName = String(characterName).toLowerCase();
-                questName = String(questName).toLowerCase().replace(/\s+/g, '_');
-                
-                // Find the quest using universal data system
-                const quest = get(questName);
-                if (!quest || !hasGameplayTag(quest, 'Quest')) {
-                    if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                    return 'executed';
-                }
-
-                // Update quest status to completed
-                if (!quest.state) quest.state = {};
-                quest.state.status = 'completed';
-
-                // Save the updated quest
-                save(questName, quest);
-
-                if (debug) console.log(`${MODULE_NAME}: Completed quest: ${questName}`);
-                return 'executed';
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Error in complete_quest: ${e.message}`);
-                return 'malformed';
-            }
-        },
-
-        abandon_quest: function(characterName, questName) {
-            if (!characterName || !questName) return 'malformed';
-            
-            characterName = String(characterName).toLowerCase();
-            questName = String(questName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Find the quest using universal data system
-            const quest = get(questName);
-            if (!quest || !hasGameplayTag(quest, 'Quest')) {
-                if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                return 'executed';
-            }
-
-            // Update quest status to abandoned
-            if (!quest.state) quest.state = {};
-            quest.state.status = 'abandoned';
-
-            // Save the updated quest
-            save(questName, quest);
-
-            if (debug) console.log(`${MODULE_NAME}: Abandoned quest: ${questName}`);
-            return 'executed';
-        },
-        
-        death: function(characterName) {
-            if (!characterName) return 'malformed';
-            
-            
-            characterName = String(characterName).toLowerCase();
-            if (debug) console.log(`${MODULE_NAME}: Death recorded for: ${characterName}`);
-            return 'executed';
-        }
-    };
-    
-    // ==========================
+    // All tool processors have been moved to SANEDefaults module
+    // They are now accessed via builtInTools after being created from factory functions
+    // The old toolProcessors object (937 lines) has been removed.
+    // All tools are now defined in SANEDefaults.js
     // Entity Tracking System
     // ==========================
     function loadEntityTrackerConfig() {
@@ -6806,15 +5791,20 @@ function GameState(hook, text) {
             }
         }
         
-        // Instead of queuing, directly trigger GenerationWizard if available
-        if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startGeneration) {
-            if (debug) console.log(`${MODULE_NAME}: Triggering GenerationWizard for entity: ${entityName}`);
-            // Start NPC generation with just the name
-            GenerationWizard.startGeneration('NPC', { name: entityName });
+        // Instead of queuing, directly trigger BlueprintManager if available
+        if (typeof BlueprintManager !== 'undefined' && BlueprintManager.instantiateBlueprint) {
+            if (debug) console.log(`${MODULE_NAME}: Triggering BlueprintManager for entity: ${entityName}`);
+            // Create character using new unified API
+            const entityId = BlueprintManager.instantiateBlueprint('Character', {
+                info: {
+                    trigger_name: entityName
+                }
+            });
+            if (debug) console.log(`${MODULE_NAME}: Created character ${entityId} via instantiateBlueprint`);
             return;
         }
         
-        // Fallback to queue system if GenerationWizard not available
+        // Fallback to queue system if BlueprintManager not available
         const queueCard = Utilities.storyCard.get('[SANE:C] Entity Queue');
         let queue = [];
         if (queueCard) {
@@ -6898,21 +5888,132 @@ function GameState(hook, text) {
         
         if (debug) console.log(`${MODULE_NAME}: Completed generation for ${entityName}`);
         
-        // Process next in queue if any
-        queuePendingEntities();
     }
     
+    // ==========================
+    // Normalize Tools in Text
+    // ==========================
+    function normalizeToolsInText(text) {
+        // This function normalizes tool syntax BEFORE execution
+        // Returns modified text with corrected tool calls
+        if (!text) return text;
+
+        let modifiedText = text;
+        const modifications = [];
+
+        // Find all tool calls in the text
+        let match;
+        const toolPattern = /(\w+)\s*\(\s*([^)]*)\s*\)/g;
+
+        while ((match = toolPattern.exec(text)) !== null) {
+            const fullMatch = match[0];
+            const toolName = match[1];
+            const paramString = match[2];
+            const matchIndex = match.index;
+
+            // Skip getter functions
+            if (toolName.startsWith('get_')) {
+                continue;
+            }
+
+            // Parse parameters
+            const params = parseParameters(paramString);
+            if (!params || params.length === 0) continue;
+
+            let displayToolName = toolName;
+            let displayParams = [...params];
+            let needsModification = false;
+
+            // Handle add_item/remove_item conversion based on quantity sign
+            if (toolName.toLowerCase() === 'add_item' && params[2]) {
+                const qty = parseInt(params[2]);
+                if (!isNaN(qty) && qty < 0) {
+                    displayToolName = 'remove_item';
+                    displayParams[2] = String(Math.abs(qty));
+                    needsModification = true;
+                }
+            } else if (toolName.toLowerCase() === 'remove_item' && params[2]) {
+                const qty = parseInt(params[2]);
+                if (!isNaN(qty) && qty < 0) {
+                    displayToolName = 'add_item';
+                    displayParams[2] = String(Math.abs(qty));
+                    needsModification = true;
+                }
+            }
+
+            // Normalize accept_quest parameters
+            if (toolName === 'accept_quest') {
+                // Normalize quest name (param 1)
+                if (displayParams[1]) {
+                    const normalized = String(displayParams[1]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+                    if (normalized !== displayParams[1]) {
+                        displayParams[1] = normalized;
+                        needsModification = true;
+                    }
+                }
+
+                // Normalize quest giver (param 2)
+                if (displayParams[2]) {
+                    const normalized = String(displayParams[2]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+                    if (normalized !== displayParams[2]) {
+                        displayParams[2] = normalized;
+                        needsModification = true;
+                    }
+                }
+
+                // Normalize quest type (param 3)
+                if (displayParams[3]) {
+                    let questType = String(displayParams[3]).toLowerCase();
+                    // Remove _quest suffix if present
+                    if (questType.endsWith('_quest')) {
+                        questType = questType.substring(0, questType.length - 6);
+                    }
+                    if (questType !== displayParams[3]) {
+                        displayParams[3] = questType;
+                        needsModification = true;
+                    }
+                }
+            }
+
+            // Add more tool normalizations here as needed
+            // Example: heal/deal_damage conversion based on negative values
+            // Example: transfer_item parameter ordering
+
+            if (needsModification) {
+                const normalizedTool = `${displayToolName}(${displayParams.join(', ')})`;
+                modifications.push({
+                    original: fullMatch,
+                    replacement: normalizedTool,
+                    index: matchIndex,
+                    length: fullMatch.length
+                });
+                if (debug) console.log(`${MODULE_NAME}: Normalizing tool: ${fullMatch} -> ${normalizedTool}`);
+            }
+        }
+
+        // Apply modifications in reverse order to maintain indices
+        modifications.sort((a, b) => b.index - a.index);
+        for (const mod of modifications) {
+            const before = modifiedText.substring(0, mod.index);
+            const after = modifiedText.substring(mod.index + mod.length);
+            modifiedText = before + mod.replacement + after;
+        }
+
+        return modifiedText;
+    }
+
     // ==========================
     // Process Tools in Text
     // ==========================
     function processTools(text) {
         if (!text) return text;
-        
-        let modifiedText = text;
+
+        // First normalize all tools in the text
+        let modifiedText = normalizeToolsInText(text);
+
         let toolsToRemove = [];
-        let toolsToModify = [];
         let executedTools = [];  // Track for RewindSystem
-        
+
         // Only load characters if there are actually tools to process
         let charactersLoaded = false;
         
@@ -6972,7 +6073,10 @@ function GameState(hook, text) {
             
             // Log tool result
             if (debug) {
-                const toolCall = `${toolName}(${params.join(',')})`;
+                // Convert add_item with negative quantity to remove_item for display
+                let displayToolName = toolName;
+                let displayParams = [...params];
+                const toolCall = `${displayToolName}(${displayParams.join(',')})`;
                 if (result === 'executed') {
                     console.log(`${MODULE_NAME}: Tool EXECUTED: ${toolCall}`);
                 } else if (result === 'permitted') {
@@ -6994,56 +6098,6 @@ function GameState(hook, text) {
                 });
             }
             
-            // Check if this is accept_quest and needs parameter normalization
-            if (toolName === 'accept_quest' && result === 'executed') {
-                // Normalize ALL parameters in the visible text to teach the LLM proper format
-                const normalizedParams = [...params];
-                
-                // Normalize quest name (param 1)
-                if (normalizedParams[1]) {
-                    normalizedParams[1] = String(normalizedParams[1]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-                }
-                
-                // Normalize quest giver (param 2)
-                if (normalizedParams[2]) {
-                    normalizedParams[2] = String(normalizedParams[2]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-                }
-                
-                // Normalize quest type (param 3)
-                if (normalizedParams[3]) {
-                    let questType = String(normalizedParams[3]).toLowerCase();
-                    // Remove _quest suffix if present
-                    if (questType.endsWith('_quest')) {
-                        questType = questType.substring(0, questType.length - 6);
-                    }
-                    normalizedParams[3] = questType;
-                }
-                
-                // Check if add_item has negative quantity - convert to remove_item for display
-                let displayToolName = toolName;
-                let displayParams = [...normalizedParams];
-
-                if (toolName.toLowerCase() === 'add_item' && normalizedParams[2]) {
-                    const qty = parseInt(normalizedParams[2]);
-                    if (!isNaN(qty) && qty < 0) {
-                        displayToolName = 'remove_item';
-                        displayParams[2] = String(Math.abs(qty));
-                    }
-                }
-
-                // Build the normalized tool string
-                const normalizedTool = `${displayToolName}(${displayParams.join(', ')})`;
-
-                if (normalizedTool !== fullMatch) {
-                    toolsToModify.push({
-                        match: fullMatch,
-                        replacement: normalizedTool,
-                        index: matchIndex,
-                        length: fullMatch.length
-                    });
-                    if (debug) console.log(`${MODULE_NAME}: Normalizing: ${fullMatch} -> ${normalizedTool}`);
-                }
-            }
             
             // Only remove if malformed or unknown tool
             // Only remove malformed and unknown tools, keep permitted ones
@@ -7061,33 +6115,28 @@ function GameState(hook, text) {
             // Permitted tools stay in the text but aren't executed
         }
         
-        // Apply modifications and removals from end to beginning
-        const allChanges = [...toolsToModify, ...toolsToRemove].sort((a, b) => b.index - a.index);
-        
-        for (const change of allChanges) {
+        // Apply removals from end to beginning (modifications already done by normalizeToolsInText)
+        toolsToRemove.sort((a, b) => b.index - a.index);
+
+        for (const change of toolsToRemove) {
             const before = modifiedText.substring(0, change.index);
             const after = modifiedText.substring(change.index + change.length);
-            
-            if (change.replacement) {
-                // Modification (normalize parameters)
-                modifiedText = before + change.replacement + after;
-            } else {
-                // Removal (malformed/unknown)
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Removed ${change.reason} tool: ${change.match}`);
-                }
-                let cleanedBefore = before;
-                let cleanedAfter = after;
-                
-                // Handle spacing issues
-                if (before.endsWith(' ') && after.startsWith(' ')) {
-                    cleanedAfter = after.substring(1);
-                } else if (before.endsWith(' ') && after.startsWith('.')) {
-                    cleanedBefore = before.trimEnd();
-                }
-                
-                modifiedText = cleanedBefore + cleanedAfter;
+
+            // Removal (malformed/unknown)
+            if (debug) {
+                console.log(`${MODULE_NAME}: Removed ${change.reason} tool: ${change.match}`);
             }
+            let cleanedBefore = before;
+            let cleanedAfter = after;
+
+            // Handle spacing issues
+            if (before.endsWith(' ') && after.startsWith(' ')) {
+                cleanedAfter = after.substring(1);
+            } else if (before.endsWith(' ') && after.startsWith('.')) {
+                cleanedBefore = before.trimEnd();
+            }
+
+            modifiedText = cleanedBefore + cleanedAfter;
         }
         
         // Final cleanup: fix any double spaces or weird punctuation spacing
@@ -7136,10 +6185,6 @@ function GameState(hook, text) {
                 }
                 break;
                 
-            // These tools use inverse operations, no data storage needed:
-            // add_item, remove_item, transfer_item, deal_damage, 
-            // update_relationship, add_levelxp, add_skillxp
-                
             default:
                 // Check if this is an update_[stat] tool
                 if (toolName.startsWith('update_')) {
@@ -7160,24 +6205,38 @@ function GameState(hook, text) {
     function processToolCall(toolName, params, characters) {
         // Normalize tool name to lowercase for lookup
         const normalizedToolName = toolName.toLowerCase();
-        
+
         // Characters are already in entityCache, set by processTools
-        
-        // Check if it's a known tool
-        if (toolProcessors[normalizedToolName]) {
+
+        // Check runtime tools FIRST (highest priority - can override built-ins)
+        if (runtimeTools[normalizedToolName]) {
             try {
-                // Execute the tool (it will use the cached characters)
-                const result = toolProcessors[normalizedToolName](...params);
+                const result = runtimeTools[normalizedToolName](...params);
                 return result;
             } catch (e) {
                 if (debug) {
-                    console.log(`${MODULE_NAME}: Error in ${normalizedToolName}: ${e.message}`);
+                    console.log(`${MODULE_NAME}: Error in runtime tool ${normalizedToolName}: ${e.message}`);
+                }
+                return 'malformed';
+            }
+        }
+
+        // Check built-in tools from SANEDefaults
+        if (builtInTools[normalizedToolName]) {
+            try {
+                const result = builtInTools[normalizedToolName](...params);
+                return result;
+            } catch (e) {
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Error in built-in tool ${normalizedToolName}: ${e.message}`);
                 }
                 logError(e, `Tool execution: ${normalizedToolName}(${params.join(', ')})`);
                 return 'malformed';
             }
         }
-        
+
+        // Legacy toolProcessors removed - all tools now in built-in or runtime
+
         // Check for dynamic core stat tools (update_hp, update_mp, etc)
         if (normalizedToolName.startsWith('update_')) {
             // Just try to process it as a core stat tool
@@ -7191,20 +6250,7 @@ function GameState(hook, text) {
             // Other failures are malformed
             return 'malformed';
         }
-        
-        // Check runtime tools
-        if (runtimeTools[normalizedToolName]) {
-            try {
-                const result = runtimeTools[normalizedToolName](...params);
-                return result;
-            } catch (e) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Error in runtime tool ${normalizedToolName}: ${e.message}`);
-                }
-                return 'malformed';
-            }
-        }
-        
+
         // Unknown tool
         if (debug) console.log(`${MODULE_NAME}: Unknown tool: ${toolName}`);
         return 'unknown';
@@ -7321,29 +6367,33 @@ function GameState(hook, text) {
             }
 
             if (commandName === 'gw_activate') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard('activate', null);
-                return "\n<<<GenerationWizard activated for next turn>>>\n";
+                if (typeof BlueprintManager === 'undefined') return "<<<BlueprintManager not available>>>";
+                BlueprintManager('activate', null);
+                return "\n<<<BlueprintManager activated for next turn>>>\n";
             }
 
             if (commandName === 'gw_npc') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
+                if (typeof BlueprintManager === 'undefined') return "<<<BlueprintManager not available>>>";
                 const triggerName = `debug_trigger_${Math.floor(Math.random() * 10000)}`;
-                const result = GenerationWizard.startGeneration('Character', {
-                    'info.trigger_name': triggerName
+
+                // Use new instantiateBlueprint API
+                const entityId = BlueprintManager.instantiateBlueprint('Character', {
+                    info: {
+                        trigger_name: triggerName
+                    }
                 });
-                const progressCard = Utilities.storyCard.get('[GW_IN_PROGRESS]');
-                console.log(`[DEBUG] Started Character generation for trigger: ${triggerName}`);
-                return `\n<<<Started Character generation for trigger: ${triggerName}>>>\n`;
+
+                console.log(`[DEBUG] Created Character entity: ${entityId} from trigger: ${triggerName}`);
+                return `\n<<<Created Character entity: ${entityId} from trigger: ${triggerName}>>>\n`;
             }
 
             if (commandName === 'gw_status') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                const progressCard = Utilities.storyCard.get('[GW_IN_PROGRESS]');
-                const queueCard = Utilities.storyCard.get('[GW_STATE] Queue');
+                if (typeof BlueprintManager === 'undefined') return "<<<BlueprintManager not available>>>";
+                const activeGen = findActiveGeneration();
+                const queuedGens = findQueuedGenerations();
 
-                let status = "=== GenerationWizard Status ===\n";
-                status += `Active: ${Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null}\n`;
+                let status = "=== BlueprintManager Status ===\n";
+                status += `Active: ${activeGen !== null}\n`;
 
                 if (progressCard) {
                     try {
@@ -7451,435 +6501,116 @@ function GameState(hook, text) {
         if (debug) console.log(`${MODULE_NAME}: Created initial [SANE:D] Data card with Global entity`);
     }
 
-    // Test dynamic resolution functionality
-    
-    // Initialize SANE schemas if they don't exist
-    function createSANEBlueprints() {
-        // Create complete blueprint templates with all component data
-
-        // Character blueprint
-        if (!Utilities.storyCard.get('[SANE:BP] Character')) {
-            Utilities.storyCard.add({
-                title: '[SANE:BP] Character',
-                description: JSON.stringify({
-                    id: 'Character',
-                    GameplayTags: ['Character'],
-                    components: ['info', 'stats', 'skills', 'inventory', 'attributes', 'relationships', 'display'],
-                    aliases: [],
-
-                    info: {
-                        gender: null,
-                        race: null,
-                        class: null,
-                        currentLocation: null,
-                        username: null,
-                        realname: null,
-                        description: null,
-                        appearance: null,
-                        personality: null,
-                        background: null,
-                        display: [
-                            { line: "nameline", priority: 10, format: "## **{username || id}**" },
-                            { line: "nameline", priority: 11, format: " [{realname}]", condition: "{realname}" },
-                            { line: "infoline", priority: 10, format: "Gender: {gender}", condition: "{gender}" },
-                            { line: "infoline", priority: 20, format: "Class: {class}", condition: "{class}" },
-                            { line: "infoline", priority: 50, format: "Location: {currentLocation}", condition: "{currentLocation}" }
-                        ]
-                    },
-
-                    stats: {
-                        level: { value: 1, xp: { current: 0, max: 500 } },
-                        hp: { current: 100, max: 100 },
-                        display: [
-                            { line: "infoline", priority: 30, format: "Level {level.value} ({level.xp.current}/{level.xp.max})" },
-                            { line: "infoline", priority: 40, format: "HP: {hp.current}/{hp.max}" }
-                        ]
-                    },
-
-                    skills: {
-                        display: {
-                            line: "section",
-                            priority: 30,
-                            format: "**Skills**\n{*\\: • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}"
-                        }
-                    },
-
-                    inventory: {
-                        display: {
-                            line: "section",
-                            priority: 40,
-                            format: "**Inventory**\n{*\\: • {*} x{*.quantity}}"
-                        }
-                    },
-
-                    attributes: {
-                        display: {
-                            line: "section",
-                            priority: 20,
-                            format: "**Attributes**\n{*\\: • {*}: {*.value}}"
-                        }
-                    },
-
-                    relationships: {
-                        display: {
-                            line: "section",
-                            priority: 50,
-                            format: "**Relationships**\n{*\\: • {capitalize(*)}: {*.value} ({getRelationshipFlavor(*, id, *.value)})}",
-                        }
-                    },
-
-                    display: {
-                        prefixline: "<$# Character>",
-                        separators: {
-                            nameline: " ",
-                            infoline: " | ",
-                            section: "\n",
-                            footer: "\n"
-                        },
-                        order: ["prefixline", "nameline", "infoline", "section", "footer"],
-                        active: false  // Should be false in blueprint - set to true when generation completes
-                    }
-                }, null, 2),
-                type: 'blueprint'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:BP] Character');
-        }
-
-        // Location blueprint
-        if (!Utilities.storyCard.get('[SANE:BP] Location')) {
-            Utilities.storyCard.add({
-                title: '[SANE:BP] Location',
-                description: JSON.stringify({
-                    id: 'Location',
-                    GameplayTags: ['Location'],
-                    components: ['info', 'pathways', 'display'],
-                    aliases: [],
-
-                    info: {
-                        type: null,
-                        description: null,
-                        atmosphere: null,
-                        display: [
-                            { line: "nameline", priority: 10, format: "## **{id}**" },
-                            { line: "infoline", priority: 10, format: "{type}" },
-                            { line: "infoline", priority: 20, format: "{description}" }
-                        ]
-                    },
-
-                    pathways: {
-                        display: {
-                            line: "section",
-                            priority: 30,
-                            format: "**Exits**\n{*: • {*}: {*}}",
-                            condition: "{Object.keys(pathways).filter(k => k !== 'display').length > 0}"
-                        }
-                    },
-
-                    display: {
-                        prefixline: "<$# Location>",
-                        separators: {
-                            nameline: " ",
-                            infoline: " | ",
-                            section: "\n"
-                        },
-                        order: ["prefixline", "nameline", "infoline", "section"],
-                        active: false  // Should be false in blueprint - set to true when generation completes
-                    }
-                }, null, 2),
-                type: 'blueprint'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:BP] Location');
-        }
-    }
+    // Load defaults and built-in tools (will be initialized later)
+    let builtInTools;
+    let defaultCards;
 
     function createSANESchemas() {
-        // Create component schemas using [SANE:S] cards
-        // All schemas use embedded display rules within defaults
-
-        // Stats component
-        if (!Utilities.storyCard.get('[SANE:S] stats')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] stats',
-                description: JSON.stringify({
-                    defaults: {
-                        level: { value: 1, xp: { current: 0, max: 500 } },
-                        hp: { current: 100, max: 100 },
-                        display: [
-                            { line: "infoline", priority: 30, format: "Level {level.value} ({level.xp.current}/{level.xp.max})" },
-                            { line: "infoline", priority: 40, format: "HP: {hp.current}/{hp.max}" }
-                        ]
-                    },
-                    level_progression: {
-                        xp_formula: "level * (level - 1) * 500"
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] stats');
-        }
-
-        // Info component
-        if (!Utilities.storyCard.get('[SANE:S] info')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] info',
-                description: JSON.stringify({
-                    defaults: {
-                        gender: null,
-                        race: null,
-                        class: null,
-                        currentLocation: null,
-                        username: null,
-                        realname: null,
-                        description: null,
-                        appearance: null,
-                        display: [
-                            { line: "nameline", priority: 10, format: "## **{id}**" },
-                            { line: "nameline", priority: 11, format: " [{realname}]", condition: "{realname}" },
-                            { line: "infoline", priority: 10, format: "{gender}" },
-                            { line: "infoline", priority: 20, format: "{class}" },
-                            { line: "infoline", priority: 50, format: "Location: {currentLocation}" }
-                        ]
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] info');
-        }
-
-    // Removed createComponentSchemas - all schemas now in createSANESchemas with embedded display format
-
-        // Inventory component
-        if (!Utilities.storyCard.get('[SANE:S] inventory')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] inventory',
-                description: JSON.stringify({
-                    defaults: {
-                        display: {
-                            line: "section",
-                            priority: 40,
-                            format: "**Inventory**\n{*: • {*} x{*.quantity}}",
-                            condition: "{Object.keys(inventory).length > 0}"
-                        }
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] inventory');
-        }
-
-        // Skills component
-        if (!Utilities.storyCard.get('[SANE:S] skills')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] skills',
-                description: JSON.stringify({
-                    defaults: {
-                        display: {
-                            line: "section",
-                            priority: 30,
-                            format: "**Skills**\n{*: • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
-                            condition: "{Object.keys(skills).length > 0}"
-                        }
-                    },
-                    registry: ["One_Handed_Sword", "Two_Handed_Sword", "Rapier", "Shield", "Parry",
-                              "Battle_Healing", "Searching", "Tracking", "Hiding", "Night_Vision",
-                              "Sprint", "Acrobatics", "Cooking", "Fishing", "Blacksmithing",
-                              "Tailoring", "Alchemy", "Medicine_Mixing"]
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] skills');
-        }
-
-        // Attributes component
-        if (!Utilities.storyCard.get('[SANE:S] attributes')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] attributes',
-                description: JSON.stringify({
-                    defaults: {
-                        STRENGTH: { value: 10 },
-                        AGILITY: { value: 10 },
-                        VITALITY: { value: 10 },
-                        display: {
-                            line: "infoline",
-                            priority: 25,
-                            format: "STR: {STRENGTH.value} | AGI: {AGILITY.value} | VIT: {VITALITY.value}"
-                        }
-                    },
-                    registry: ["STRENGTH", "AGILITY", "VITALITY", "INTELLIGENCE", "WISDOM", "CHARISMA", "LUCK"]
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] attributes');
-        }
-
-        // Relationships component
-        if (!Utilities.storyCard.get('[SANE:S] relationships')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] relationships',
-                description: JSON.stringify({
-                    id: 'relationships',
-                    thresholds: [
-                        { min: -9999, max: -2000, flavor: "{from}'s hatred for {to} consumes their every thought" },
-                        { min: -1999, max: -1000, flavor: "{from} would sacrifice everything to see {to} destroyed" },
-                        { min: -999, max: -500, flavor: "{from} actively wishes harm upon {to}" },
-                        { min: -499, max: -200, flavor: "{from} feels genuine hostility toward {to}" },
-                        { min: -199, max: -100, flavor: "{from} strongly dislikes {to}" },
-                        { min: -99, max: -50, flavor: "{from} finds {to} irritating and unpleasant" },
-                        { min: -49, max: -25, flavor: "{from} feels mild annoyance toward {to}" },
-                        { min: -24, max: 24, flavor: "{from} feels neutral about {to}" },
-                        { min: 25, max: 49, flavor: "{from} has slightly positive feelings toward {to}" },
-                        { min: 50, max: 99, flavor: "{from} enjoys {to}'s company" },
-                        { min: 100, max: 199, flavor: "{from} considers {to} a friend" },
-                        { min: 200, max: 499, flavor: "{from} cares deeply about {to}'s wellbeing" },
-                        { min: 500, max: 999, flavor: "{from} trusts {to} completely" },
-                        { min: 1000, max: 1999, flavor: "{from} considers {to} family" },
-                        { min: 2000, max: 9999, flavor: "{from} would do absolutely anything for {to}" }
-                    ]
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] relationships');
-        }
-
-        // Pathways component
-        if (!Utilities.storyCard.get('[SANE:S] pathways')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] pathways',
-                description: JSON.stringify({
-                    defaults: {
-                        north: null,
-                        south: null,
-                        east: null,
-                        west: null,
-                        up: null,
-                        down: null,
-                        display: {
-                            line: "section",
-                            priority: 60,
-                            format: "**Exits**\n{*: • {*}: to {*}}",
-                            condition: "{Object.keys(pathways).length > 0}"
-                        }
-                    },
-                    // Direction opposites for bidirectional pathways
-                    // Scenarios can override/extend this in their own [SANE:S] pathways card
-                    opposites: {
-                        'north': 'south',
-                        'south': 'north',
-                        'east': 'west',
-                        'west': 'east',
-                        'inside': 'outside',
-                        'outside': 'inside',
-                        'above': 'below',
-                        'below': 'above'
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] pathways');
-        }
-
-        // Objectives component
-        if (!Utilities.storyCard.get('[SANE:S] objectives')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] objectives',
-                description: JSON.stringify({
-                    defaults: {
-                        type: null,
-                        status: "active",
-                        stages: {},
-                        display: {
-                            line: "section",
-                            priority: 35,
-                            format: "**Objectives** [{type}]\n{stages: • Stage {*}: {*}}",
-                            condition: "{status === 'active'}"
-                        }
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] objectives');
-        }
-
-        // Rewards component
-        if (!Utilities.storyCard.get('[SANE:S] rewards')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] rewards',
-                description: JSON.stringify({
-                    defaults: {
-                        xp: 0,
-                        col: 0,
-                        items: {},
-                        display: {
-                            line: "section",
-                            priority: 45,
-                            format: "**Rewards**\nXP: {xp} | Col: {col}\n{items: • {*} x{*.quantity}}",
-                            condition: "{xp > 0 || col > 0 || Object.keys(items).length > 0}"
-                        }
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] rewards');
-        }
-
-        // Display component
-        if (!Utilities.storyCard.get('[SANE:S] display')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] display',
-                description: JSON.stringify({
-                    defaults: {
-                        prefixline: null,
-                        footer: null,
-                        separators: {
-                            nameline: " ",
-                            infoline: " | ",
-                            section: "\n",
-                            footer: "\n"
-                        },
-                        order: ["prefixline", "nameline", "infoline", "section", "footer"],
-                        active: true
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] display');
-        }
-
-        // GenerationWizard progress component
-        if (!Utilities.storyCard.get('[SANE:S] gw_progress')) {
-            Utilities.storyCard.add({
-                title: '[SANE:S] gw_progress',
-                description: JSON.stringify({
-                    defaults: {
-                        status: "collecting",
-                        turnsElapsed: 0,
-                        currentField: null,
-                        retryCount: 0,
-                        lastActivity: 0,
-                        fieldsCollected: {},
-                        fieldsRemaining: [],
-                        display: null  // No display for progress tracking
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE:S] gw_progress');
+        // Simple function to create all default cards from SANEDefaults
+        for (const cardDef of defaultCards) {
+            if (!Utilities.storyCard.get(cardDef.title)) {
+                Utilities.storyCard.add(cardDef);
+                if (debug) console.log(`${MODULE_NAME}: Created ${cardDef.title}`);
+            }
         }
     }
-    
+
+    // Create GameState API for SANEDefaults to use
+    const GameStateAPI = {
+        get, set, del, resolve, save,
+        debug, MODULE_NAME,
+        trackUnknownEntity, shouldTriggerGeneration, addToEntityQueue,
+        getItemQuantity, setItemQuantity,
+        calculateLevelXPRequirement,
+        calculateMaxHP,
+        calculateSkillXPRequirement,
+        processLevelUp, processSkillLevelUp,
+        getSkillRegistry,
+        getRelationshipFlavor,
+        Utilities
+    };
+
+    // Initialize defaults from external SANEDefaults module
+    const defaults = SANEDefaults();
+    defaultCards = defaults.defaultCards;
+
+    // Create tools from factories
+    builtInTools = {};
+
+    // Create context object to pass to tool factories
+    const toolContext = {
+        // Logging variables
+        debug: debug,
+        MODULE_NAME: MODULE_NAME,
+
+        // Core data functions
+        get: get,
+        set: set,
+        del: del,
+        save: save,
+        resolve: resolve,
+
+        // Query and tag functions
+        queryTags: queryTags,
+        hasGameplayTag: hasGameplayTag,
+
+        // Entity tracking functions
+        trackUnknownEntity: trackUnknownEntity,
+        shouldTriggerGeneration: shouldTriggerGeneration,
+        addToEntityQueue: addToEntityQueue,
+
+        // Inventory helpers
+        getItemQuantity: getItemQuantity,
+        setItemQuantity: setItemQuantity,
+
+        // Level/skill progression functions
+        calculateLevelXPRequirement: calculateLevelXPRequirement,
+        calculateMaxHP: calculateMaxHP,
+        calculateSkillXPRequirement: calculateSkillXPRequirement,
+        processLevelUp: processLevelUp,
+        processSkillLevelUp: processSkillLevelUp,
+        getSkillRegistry: getSkillRegistry,
+
+        // Relationship functions
+        getRelationshipFlavor: getRelationshipFlavor,
+
+        // Location functions
+        getOppositeDirection: getOppositeDirection,
+        updateLocationPathway: updateLocationPathway,
+
+        // External modules
+        Utilities: Utilities,
+
+        // BlueprintManager check
+        BlueprintManager: typeof BlueprintManager !== 'undefined' ? BlueprintManager : undefined,
+        Calendar: typeof Calendar !== 'undefined' ? Calendar : undefined,
+
+        // Built-in tools reference (for tools that call other tools)
+        builtInTools: builtInTools,
+
+        // BlueprintManager active flag
+        gwActive: gwActive
+    };
+
+    // Create each tool by calling its factory with the context
+    for (const [name, factory] of Object.entries(defaults.toolFactories)) {
+        builtInTools[name] = factory(toolContext);
+    }
+
     // Auto-initialize SANE schemas on first run
-    createSANEBlueprints();
     createSANESchemas();
 
     // Initialize data cache after creating schemas
     initializeDataCache();
+
+    // Built-in tools are already created by SANEDefaults with the GameStateAPI
+    // No need for factory functions since we pass the API directly
 
     // Public API
 
     // Universal Data System - NEW PRIMARY API
     GameState.save = save;
     GameState.resolve = resolve;  // Dynamic path resolution
-    GameState.create = create;  // Unified entity creator
 
     // Query system
     GameState.queryTags = queryTags;  // Primary query interface
@@ -7891,15 +6622,15 @@ function GameState(hook, text) {
     // Display system
     GameState.buildEntityDisplay = buildEntityDisplay;  // Build display text for entity
 
-    // Blueprint system
-    GameState.loadBlueprint = loadBlueprint;  // Load blueprint by name
+    // Blueprints are handled entirely by BlueprintManager
+    // GameState is only responsible for data storage
 
     // Universal data access (replaces getGlobalValue/setGlobalValue)
     GameState.get = get;
     GameState.set = set;
     GameState.del = del;
 
-    // Entity management functions for GenerationWizard
+    // Entity management functions for BlueprintManager
     GameState.changeEntityId = changeEntityId;  // Change the actual entity ID
     GameState.removeComponent = removeComponent;
     GameState.addComponent = addComponent;
@@ -8063,10 +6794,10 @@ function GameState(hook, text) {
                 return result;
             }
             
-            // If GenerationWizard is active, delegate to it
-            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
-            if (typeof GenerationWizard !== 'undefined' && gwActive) {
-                const result = GenerationWizard.process('input', text);
+            // If BlueprintManager is active, delegate to it
+            gwActive = hasActiveGeneration();
+            if (typeof BlueprintManager !== 'undefined' && gwActive) {
+                const result = BlueprintManager.process('input', text);
                 const finalResult = result.active ? '\n' : text;
                 
                 // Log the input turn
@@ -8109,9 +6840,6 @@ function GameState(hook, text) {
                 state.lastContextLength = 0;
             }
             state.lastContextLength = text ? text.length : 0;
-            
-            // Cache cards are no longer needed with the universal data system
-            // All data is loaded on-demand through get() and loadAll() functions
             
             // Check for edits in history (RewindSystem)
             RewindSystem.handleContext();
@@ -8235,18 +6963,18 @@ function GameState(hook, text) {
                 });
             }
             
-            // Check if GenerationWizard needs to append prompts
-            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
-            if (typeof GenerationWizard !== 'undefined' && gwActive) {
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard is active`);
+            // Check if BlueprintManager needs to append prompts
+            gwActive = hasActiveGeneration();
+            if (typeof BlueprintManager !== 'undefined' && gwActive) {
+                if (debug) console.log(`${MODULE_NAME}: BlueprintManager is active`);
 
-                const result = GenerationWizard.process('context', modifiedText);
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard.process result: active=${result.active}, text length before=${modifiedText.length}, after=${result.text ? result.text.length : 'null'}`);
+                const result = BlueprintManager.process('context', modifiedText);
+                if (debug) console.log(`${MODULE_NAME}: BlueprintManager.process result: active=${result.active}, text length before=${modifiedText.length}, after=${result.text ? result.text.length : 'null'}`);
                 if (result.active) {
                     modifiedText = result.text;  // Use wizard's modified context (with prompts appended)
                 }
-            } else if (gwActive && typeof GenerationWizard === 'undefined') {
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available but generation is active`);
+            } else if (gwActive && typeof BlueprintManager === 'undefined') {
+                if (debug) console.log(`${MODULE_NAME}: BlueprintManager not available but generation is active`);
             }
             
             // Apply CONTEXT_MODIFIER if available
@@ -8298,10 +7026,10 @@ function GameState(hook, text) {
             // Load output modifier
             loadOutputModifier();
             
-            // Check if GenerationWizard is processing
-            gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
-            if (typeof GenerationWizard !== 'undefined' && gwActive) {
-                const result = GenerationWizard.process('output', text);
+            // Check if BlueprintManager is processing
+            gwActive = hasActiveGeneration();
+            if (typeof BlueprintManager !== 'undefined' && gwActive) {
+                const result = BlueprintManager.process('output', text);
                 if (result.active) {
                     // Log early return
                     logDebugTurn('output', null, null, {
@@ -8333,20 +7061,15 @@ function GameState(hook, text) {
                 const futurePosition = history ? Math.min(history.length, RewindSystem.MAX_HISTORY - 1) : 0;
                 RewindSystem.recordAction(text, executedTools, futurePosition);
                 
-                // Check if any entities need generation
-                const entityQueued = queuePendingEntities();
                 
-                // Check if GenerationWizard was triggered by any tool or entity generation
-                gwActive = Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null;
-                if (typeof GenerationWizard !== 'undefined' && gwActive) {
+                // Check if BlueprintManager was triggered by any tool or entity generation
+                gwActive = hasActiveGeneration();
+                if (typeof BlueprintManager !== 'undefined' && gwActive) {
                     // Set message via state instead of adding to text
                     state.message = 'The GM will use the next turn to think. Use `/GW abort` if undesired.';
                     // Add zero-width character to preserve text structure
                     modifiedText += '\u200B';
-                    if (debug) console.log(`${MODULE_NAME}: GenerationWizard activated, adding warning to output`);
-                } else if (entityQueued) {
-                    // Entity generation was triggered
-                    state.message = 'The GM will generate a new entity next turn. Use `/GW abort` if undesired.';
+                    if (debug) console.log(`${MODULE_NAME}: BlueprintManager activated, adding warning to output`);
                     modifiedText += '\u200B';
                     if (debug) console.log(`${MODULE_NAME}: Entity generation triggered, adding warning to output`);
                 }
@@ -8364,48 +7087,24 @@ function GameState(hook, text) {
                 // Log the output turn with tools executed
                 logDebugTurn('output', null, null, {
                     toolsExecuted: executedTools,
-                    entityQueued: entityQueued,
-                    generationWizardActive: Utilities.storyCard.get('[GW_IN_PROGRESS]') !== null
+                    generationWizardActive: hasActiveGeneration()
                 });
                 
-                // Clear entity cache after processing
-                // Clear the unified cache
+                // Clear cache after processing
                 dataCache = {};
-                
-                // Pin important cards to top for fast access
-                // [PLAYER] cards go at the very top
-                if (typeof storyCards !== 'undefined' && storyCards.length > 0) {
-                    const playerCards = [];
-
-                    // Extract all special cards in one pass (backwards to avoid index issues)
-                    for (let i = storyCards.length - 1; i >= 0; i--) {
-                        const card = storyCards[i];
-                        if (!card || !card.title) continue;
-
-                        if (card.title.startsWith('[PLAYER]')) {
-                            playerCards.unshift(storyCards.splice(i, 1)[0]);
-                        }
-                    }
-
-                    // Re-insert in optimal order at the top
-                    let insertPos = 0;
-
-                    // Insert player cards at the very top
-                    if (playerCards.length > 0) {
-                        storyCards.splice(insertPos, 0, ...playerCards);
-                        if (debug) console.log(`${MODULE_NAME}: Pinned ${playerCards.length} player card(s) to top`);
-                    }
-
-                }
                 
             }
 
             // Return the processed text (or empty string if text was null)
             logTime();
             return modifiedText;
-            break;
         }
     }
+
+    // Make GameState globally available
+    if (typeof global !== 'undefined') {
+        global.GameState = GameState;
+    } 
 
     // Log execution time before returning
     logTime();
