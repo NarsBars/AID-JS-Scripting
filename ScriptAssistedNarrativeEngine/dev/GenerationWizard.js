@@ -1,1747 +1,845 @@
-function GenerationWizard(hook, text) {
+function GenerationWizardModule() {
     'use strict';
-    
-    const debug = false;
+
+    // GenerationWizard orchestrates entity creation using unified data system
+    // Returns a module object that registers with GameState
+    //
+    // BLUEPRINT SYSTEM:
+    // - [SANE:BP] cards contain complete entity templates with embedded generation
+    // - generationwizard component embedded in blueprints (no separate prompt cards)
+    //
+    // GENERATION LIFECYCLE:
+    // 1. instantiateBlueprint() creates entity with generationwizard component
+    // 2. Component tracks state: queued → generating → dormant
+    // 3. Collect fields via LLM using embedded prompts
+    // 4. Finalize: component goes dormant (never removed), entity activated
+    // COMMANDS:
+    // - /gw_npc [name] [class] [location] - Generate NPC
+    // - /gw_location [name] - Generate location
+    // - /gw_quest [name] - Generate quest
+    // - /gw_abort - Cancel generation
+    // - /gw_status - Show generation progress
+
+    // ==========================
+    // GREEDY COMPONENT ARCHITECTURE
+    // ==========================
+    // The generationwizard component is PERSISTENT - never removed from entities
+    // Component states:
+    // - 'generating': Actively collecting fields (only ONE globally)
+    // - 'dormant': Complete, no active generation
+    // - 'queued': Has uncollected fields, waiting to activate
+    // - 'deactivated': Manually paused/disabled
+    //
+    // Component structure:
+    // {
+    //     state: 'dormant',              // Current state
+    //     activeGeneration: null,        // Current generation object name
+    //     generations: {}                // Temporary generation objects (deleted when done)
+    // }
+    // ==========================
+
     const MODULE_NAME = 'GenerationWizard';
-    
-    // ==========================
-    // Constants
-    // ==========================
-    const PROGRESS_CARD = '[GW] In Progress';
-    const TEMPLATE_PREFIX = '[GW Template]';
-    const CONFIG_AND_PROMPTS_CARD = '[GENERATION_CONFIG]';
-    const HIDDEN_OUTPUT = '\n<<<The GM is thinking, please hit continue... (Use `/GW abort` if needed, this prompting is still being worked on)>>>\n';
-    const COMPLETION_MESSAGE = '\n<<<Generation Completed, returning to story>>>\n';
-    
-    // Helper to wrap debug output in markers to hide from LLM
-    function wrapDebugOutput(text) {
-        return `\n<<<[DEBUG OUTPUT]\n${text}\n>>>\n`;
-    }
-    // ==========================
-    // Runtime Configuration
-    // ==========================
-    
-    function loadConfig() {
-        // Use centralized config with custom parser
-        return Utilities.config.load(
-            CONFIG_AND_PROMPTS_CARD,
-            parseConfigSection,  // Custom parser for config section only
-            createDefaultConfigAndPrompts,  // Auto-create if missing
-            true  // Cache the result
-        );
-    }
-    
-    function parseConfigSection(fullText) {
-        const config = {
-            debug: false
-        };
-        
-        // Parse config section from entry
-        const lines = fullText.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            
-            // Stop at first section header
-            if (trimmed.startsWith('##')) break;
-            
-            if (trimmed.startsWith('debug:')) {
-                config.debug = trimmed.substring(6).trim().toLowerCase() === 'true';
-            }
-        }
-        
-        return config;
-    }
-    
-    function createDefaultConfigAndPrompts() {
-        Utilities.storyCard.add({
-            title: CONFIG_AND_PROMPTS_CARD,
-            type: 'data',
-            entry: (
-                `# Generation Configuration & Prompts\n` +
-                `debug: false\n` +
-                `\n` +
-                `// Set debug to true to see AI responses during generation\n` +
-                `// Set debug to false to hide intermediate responses\n` +
-                `\n` +
-                `## About This Card\n` +
-                `Edit the description below to customize generation prompts.\n` +
-                `Each ## Section in the description is a different prompt template.\n` +
-                `Use {{VARIABLE}} syntax for replacements.`
-            ),
-            description: (
-                `## Entity Selection\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Generation Override\n\n` +
-                `**What type of entity would you like to create?**\n\n` +
-                `Valid options: NPC, Monster, Boss, Item, Location, Quest\n` +
-                `Respond with exactly one of the above options.\n` +
-                `Do not add any narrative. Only provide the entity type.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Field Collection\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Generation Override\n\n` +
-                `Creating new {{ENTITY_TYPE}}.\n\n` +
-                `==== REQUIRED INFORMATION ====\n` +
-                `{{FIELD_LIST}}\n\n` +
-                `Provide responses in the exact format shown. Do not add narrative.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Quest Combined\n` +
-                `<s>\nCARDINAL SYSTEM - Quest Generation Override\n\n` +
-                `Creating new Quest.\n\n` +
-                `{{CONTEXT_SECTION}}\n` +
-                `==== REQUIRED INFORMATION ====\n` +
-                `{{QUERY_SECTION}}\n` +
-                `Provide responses in the exact format shown. Do not add narrative.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Quest Stages\n` +
-                `<s>\nCARDINAL SYSTEM - Quest Generation Override\n\n` +
-                `**What are the objectives for this quest?**\n\n` +
-                `{{STAGE_LIST}}\n\n` +
-                `Provide clear quest objectives.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Quest Rewards\n` +
-                `<s>\nCARDINAL SYSTEM - Quest Generation Override\n\n` +
-                `**What are the rewards for completing this {{QUEST_TYPE}} quest?**\n\n` +
-                `Experience: [XP amount]\n` +
-                `Col: [currency amount]\n` +
-                `Items: [item rewards or "None"]\n\n` +
-                `Provide appropriate rewards for a {{QUEST_TYPE}} quest.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Entity Classification\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Classification Override\n\n` +
-                `{{CLASSIFICATION_QUERY}}\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Entity Details\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Details Override\n\n` +
-                `{{DETAILS_QUERY}}\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## NPC Batch\n` +
-                `<s>\nCARDINAL SYSTEM - NPC Generation Override\n\n` +
-                `The entity "{{NAME}}" was referenced and needs to be created as an NPC.\n\n` +
-                `{{CONTEXT}}` +
-                `==== REQUIRED INFORMATION ====\n` +
-                `Provide the following details:\n\n` +
-                `{{FIELD_LIST}}\n\n` +
-                `Format: KEY: value\n` +
-                `One field per line. Be creative and consistent with the game world.\n` +
-                `Respond ONLY with the requested fields. No narrative or additional text.\n</s>\n\n` +
-                `CARDINAL RESPONSE:`
-            )
-        });
-        
-        if (debug) console.log(`${MODULE_NAME}: Created default configuration and prompts card`);
-    }
-    
-    const config = loadConfig();
-    
-    // ==========================
-    // Template Field Types
-    // ==========================
-    const FieldTypes = {
-        TEXT: 'text',
-        CHOICE: 'choice',
-        RANGE: 'range',
-        NUMBER: 'number',
-        BOOLEAN: 'boolean',
-        LIST: 'list',
-        FORMULA: 'formula',
-        GAMESTATE: 'gamestate'
+    const debug = true;
+    const ZERO_WIDTH_CHAR = '\u200B'; // Prevents AI Dungeon from treating empty output as error
+
+    // Store GameState API reference
+    let GameState = null;
+
+    // Status messages displayed to user via state.message
+    const THINKING_MESSAGE = 'The GM will use the next turn to think. Use `/GW abort` if undesired.';
+    const PROCESSING_MESSAGE = 'The GM is processing entity generation... Use `/GW abort` if needed.';
+    const COMPLETION_MESSAGE = 'Generation completed, returning to story.';
+
+    // Card prefixes for Story Cards
+    const CARD_PREFIXES = {
+        blueprint: '[SANE:BP]',
+        entity: '[SANE:E]',
+        data: '[SANE:D]',
+        inProgress: '[GW:InProgress]'  // Card tracking generation in progress
     };
-    
+
     // ==========================
-    // Generation Control
+    // Configuration
     // ==========================
-    
-    function isGenerationActive() {
-        const progressCard = Utilities.storyCard.get(PROGRESS_CARD);
-        return progressCard !== null;
-    }
-    
-    function shouldTakeControl() {
-        if (!isGenerationActive()) return false;
-        
-        const progress = loadProgress();
-        return progress && !progress.completed;
-    }
-    
+
+    // Response parsing configuration
+    const PARSER_CONFIG = {
+        // Different parsing strategies
+        strategies: ['keyValue', 'json', 'fuzzy'],
+        // Key-value parsing patterns
+        keyValuePatterns: [
+            /^([A-Z_]+):\s*(.+)$/m,  // Standard KEY: value
+            /^([A-Za-z_]+)\s*=\s*(.+)$/m,  // Alternative key = value
+            /^\*\*([A-Z_]+)\*\*:\s*(.+)$/m  // Markdown **KEY**: value
+        ],
+        // Maximum retries for field collection
+        maxRetries: 3,
+        // Maximum turns before considering generation abandoned
+        maxTurnsBeforeAbandoned: 10
+    };
+
     // ==========================
-    // Prompt Template Management
+    // Data-Driven Handler System
     // ==========================
-    
-    function loadPromptTemplate(section) {
-        const card = Utilities.storyCard.get(CONFIG_AND_PROMPTS_CARD);
-        if (!card) {
-            createDefaultConfigAndPrompts();
-            return Utilities.storyCard.get(CONFIG_AND_PROMPTS_CARD)?.description || '';
+
+    // Field Processing System
+    // =============================================================================
+    // PURPOSE: Process fields according to [SANE:BP] definitions
+    //
+    // FIELD DEFINITION PROPERTIES:
+    // - source: "tool" (provided) or "llm" (AI generates)
+    // - type: "text", "select:Male,Female", "wildcard"
+    // - maps_to: Path template like "*.info.currentLocation" (* = entity)
+    // - parser: How to parse LLM response (inventory, skill, text)
+    // - transformer: How to transform parsed value to final structure
+    //
+    // WILDCARD FIELDS (objectives.stage_*, rewards.*):
+    // {
+    //   "type": "wildcard",
+    //   "expand": "numeric" or "item",
+    //   "limit": {
+    //     "condition": "$(TYPE)",  // Reference other field
+    //     "Story": 5,              // Conditional limits
+    //     "Side": 3,
+    //     "Daily": 1
+    //   },
+    //   "parser": "text" or "inventory",
+    //   "maps_to": "*.objectives.stages[]"
+    // }
+    //
+    // VALUE PARSERS:
+    // - inventory: "Col x50" → {item: "Col", quantity: 50}
+    // - skill: "Linear:890" → {name: "Linear", level: 890}
+    // - relationship: "Kirito:85" → {character: "Kirito", value: 85}
+    // - text: Direct passthrough with trim
+    //
+    // PATH TRANSFORMERS:
+    // - Apply maps_to pattern: "*.info.class" with * replaced by entity ID
+    // - Handle array notation: "*.skills.{name}" uses parsed name
+    // - Support nested paths: "*.stats.level.value"
+    //
+    // IMPLEMENTATION:
+    // 1. evaluateConditionalLimit(limit, context) - Calculate dynamic limits
+    // 2. expandWildcardField(fieldDef, limit) - Generate field instances
+    // 3. parseFieldValue(value, parser) - Parse LLM response
+    // 4. applyMapsTo(entityId, mapsTo, value) - Apply to entity path
+    // =============================================================================
+
+    // Value parsing strategies
+    const valueParsers = {
+        // Parse "Item x5" format for inventory
+        inventory: function(value) {
+            const match = value.match(/^(.+?)\s*x\s*(\d+)$/);
+            if (match) {
+                return {
+                    item: match[1].trim(),
+                    quantity: parseInt(match[2], 10)
+                };
+            }
+            // Single item without quantity
+            return {
+                item: value.trim(),
+                quantity: 1
+            };
+        },
+        // Parse text (default)
+        text: function(value) {
+            return value.trim();
+        },
+        // Parse number
+        number: function(value) {
+            return parseInt(value, 10);
+        },
+        // Parse select (validate against options)
+        select: function(value, options) {
+            const normalized = value.trim();
+            if (options && options.includes(normalized)) {
+                return normalized;
+            }
+            // Try case-insensitive match
+            const found = options.find(opt =>
+                opt.toLowerCase() === normalized.toLowerCase()
+            );
+            return found || normalized;
         }
-        
-        // Extract the specific section from description
-        const description = card.description || '';
-        const sectionRegex = new RegExp(`## ${section}\\s*\\n([^#]+)`, 's');
-        const match = description.match(sectionRegex);
-        
-        return match ? match[1].trim() : '';
-    }
-    
-    function generatePrompt(section, replacements = {}) {
-        let prompt = loadPromptTemplate(section);
-        
-        // Replace all {{VARIABLE}} placeholders
-        for (const [key, value] of Object.entries(replacements)) {
-            const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
-            prompt = prompt.replace(regex, value);
-        }
-        
-        return prompt;
-    }
-    
+    };
+
     // ==========================
-    // Location Data Transformation
+    // Blueprint Management
     // ==========================
-    function createLocationFromData(collectedData, metadata) {
-        const name = collectedData.NAME || 'Unknown_Location';
-        const formattedName = name.replace(/\s+/g, '_');
-        
-        // Create location data with component structure
-        const locationData = {
-            name: formattedName,
-            
-            // Info component
-            info: {
-                type: collectedData.LOCATION_TYPE || 'Unknown',
-                terrain: collectedData.TERRAIN || null,
-                description: collectedData.DESCRIPTION || 'An unexplored location.',
-                features: collectedData.FEATURES || null,
-                floor: collectedData.FLOOR || 1,
-                district: collectedData.DISTRICT || null
-            },
-            
-            // Pathways for connections
-            pathways: {}
-        };
-        
-        // Add return path if we know where we came from
-        if (metadata && metadata.from && metadata.direction) {
-            const oppositeDir = getOppositeDirection(metadata.direction).toLowerCase();
-            locationData.pathways[oppositeDir] = metadata.from;
-        }
-        
-        // Add unexplored paths for other directions
-        const allDirections = ['north', 'south', 'east', 'west'];
-        for (const dir of allDirections) {
-            if (!locationData.pathways[dir]) {
-                locationData.pathways[dir] = '(unexplored)';
-            }
-        }
-        
-        // Dynamically determine location header based on player's floor
-        let locationHeaders = '<$# Locations>';
-        if (typeof GameState !== 'undefined' && GameState.getPlayerName && GameState.loadCharacter) {
-            const playerName = GameState.getPlayerName();
-            if (playerName) {
-                const player = GameState.loadCharacter(playerName);
-                if (player && player.location) {
-                    // Try to extract floor from player's location (e.g., "Floor_2_Town" or check runtime)
-                    const currentFloor = GameState.getRuntimeValue ? 
-                        (GameState.getRuntimeValue('current_floor') || 1) : 1;
-                    
-                    // Convert floor number to words for header
-                    const floorWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
-                    let floorName;
-                    if (currentFloor >= 0 && currentFloor < floorWords.length) {
-                        floorName = 'Floor ' + floorWords[currentFloor];
-                    } else {
-                        floorName = 'Floor ' + currentFloor;
-                    }
-                    locationHeaders = '<$# Locations>\n<$## ' + floorName + '>';
-                }
-            }
-            
-            // Allow override via runtime variable if set
-            const customHeader = GameState.getRuntimeValue ? GameState.getRuntimeValue('location_header') : null;
-            if (customHeader) {
-                locationHeaders = customHeader; // User override takes precedence
-            }
-        }
-        
-        // Use GameState to save the location if available
-        if (typeof GameState !== 'undefined' && GameState.save) {
-            if (GameState.save('Location', locationData)) {
-                if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName} using GameState`);
-                
-                // Update the connecting location's pathways if needed
-                if (metadata && metadata.from && metadata.direction) {
-                    updateLocationPathway(metadata.from, metadata.direction, formattedName);
-                }
-                
-                // Signal completion if GameState has a handler
-                if (GameState.completeLocationGeneration) {
-                    GameState.completeLocationGeneration(formattedName);
-                }
-                return;
-            }
-        }
-        
-        // Fallback to manual creation if GameState not available
-        // Build display value
-        let displayValue = `<$# Locations>\n## **${name}**\n`;
-        displayValue += `Floor: ${locationData.info.floor || 'Floor One'} | Type: ${locationData.info.type || 'Unknown'}\n`;
-        if (locationData.info.safe_zone) {
-            displayValue += `**Safe Zone** - No damage can occur\n`;
-        }
-        displayValue += `**Description**\n${locationData.info.description}`;
-        
-        // Add connections if any
-        if (locationData.pathways && Object.keys(locationData.pathways).length > 0) {
-            displayValue += '\n**Connections**';
-            for (const [dir, dest] of Object.entries(locationData.pathways)) {
-                if (dest && dest !== '(unexplored)') {
-                    displayValue += `\n• ${dir.charAt(0).toUpperCase() + dir.slice(1)}: ${dest.replace(/_/g, ' ')}`;
-                }
-            }
-        }
-        
-        // Build proper JSON data structure
-        const jsonData = {
-            name: formattedName,
-            type: 'Location',
-            info: locationData.info,
-            pathways: locationData.pathways || {},
-            features: []
-        };
-        
-        const card = {
-            title: `[LOCATION] ${formattedName}`,
-            type: 'location',
-            value: displayValue,
-            description: `<== REAL DATA ==>\n${JSON.stringify(jsonData, null, 2)}\n<== END DATA ==>`
-        };
-        
-        Utilities.storyCard.add(card);
-        
-        if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName} (fallback method)`);
-        
-        // Signal completion if GameState has a handler
-        if (typeof GameState !== 'undefined' && GameState.completeLocationGeneration) {
-            GameState.completeLocationGeneration(formattedName, metadata);
-        }
-    }
-    
-    function getOppositeDirection(direction) {
-        const opposites = {
-            'north': 'South',
-            'south': 'North',
-            'east': 'West',
-            'west': 'East'
-        };
-        return opposites[direction.toLowerCase()] || direction;
-    }
-    
-    function updateLocationPathway(locationName, direction, destinationName) {
-        // Try to update using GameState first
-        if (typeof GameState !== 'undefined' && GameState.load && GameState.save) {
-            const location = GameState.load('Location', locationName);
-            if (location) {
-                // Update pathways (not connections - matching the JSON structure)
-                if (!location.pathways) location.pathways = {};
-                location.pathways[direction.toLowerCase()] = destinationName;
-                
-                // Save the updated location
-                if (GameState.save('Location', location)) {
-                    if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
-                    return;
-                }
-            }
-        }
-        
-        // Fallback to manual update
-        const card = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
-        if (!card) return;
-        
-        // Update the REAL DATA in description field
-        if (card.description && card.description.includes('<== REAL DATA ==>')) {
-            try {
-                const data = parseEntityData(card.description);
-                if (data) {
-                    if (!data.pathways) data.pathways = {};
-                    data.pathways[direction.toLowerCase()] = destinationName;
-                    
-                    // Rebuild the description with updated data
-                    const newDescription = buildEntityData('Location', data);
-                    Utilities.storyCard.update(card.title, { description: newDescription });
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName} (fallback)`);
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to update pathway: ${e}`);
-            }
-        }
-    }
-    
-    // Helper function to parse entity data from description
-    function parseEntityData(description) {
-        if (!description) return null;
-        
-        const startMarker = '<== REAL DATA ==>';
-        const endMarker = '<== END DATA ==>';
-        
-        const startIdx = description.indexOf(startMarker);
-        const endIdx = description.indexOf(endMarker);
-        
-        if (startIdx === -1 || endIdx === -1) return null;
-        
-        const dataSection = description.substring(startIdx + startMarker.length, endIdx).trim();
-        
-        // Try to parse as JSON first (new format)
-        try {
-            return JSON.parse(dataSection);
-        } catch (e) {
-            // Fallback to old format parsing if JSON fails
-            const data = {};
-            let currentSection = null;
-            
-            const lines = dataSection.split('\n');
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-                
-                if (trimmed.startsWith('## ')) {
-                    currentSection = trimmed.substring(3).toLowerCase();
-                    if (currentSection === 'identifier') {
-                        currentSection = null; // Parse identifier fields at root level
-                    }
-                } else if (trimmed.includes(':')) {
-                    const colonIdx = trimmed.indexOf(':');
-                    const key = trimmed.substring(0, colonIdx).trim();
-                    const value = trimmed.substring(colonIdx + 1).trim();
-                    
-                    if (currentSection) {
-                        if (!data[currentSection]) data[currentSection] = {};
-                        // Try to parse JSON for objects
-                        if (value.startsWith('{') || value.startsWith('[')) {
-                            try {
-                                data[currentSection] = JSON.parse(value);
-                            } catch {
-                                data[currentSection][key] = value.replace(/^"|"$/g, '');
-                            }
-                        } else {
-                            data[currentSection][key] = value.replace(/^"|"$/g, '');
-                        }
-                    } else {
-                        data[key] = value.replace(/^"|"$/g, '');
-                    }
-                }
-            }
-            
-            return data;
-        }
-    }
-    
-    // Helper function to build entity data for description
-    function buildEntityData(type, data) {
-        // Use JSON format for all new data
-        const jsonData = {
-            name: data.name,
-            type: type,
-            ...data
-        };
-        return `<== REAL DATA ==>\n${JSON.stringify(jsonData, null, 2)}\n<== END DATA ==>`;
-    }
-    
-    // ==========================
-    // Character Data Transformation
-    // ==========================
-    function transformToCharacterData(collectedData, triggerName) {
-        // Create character data with proper component structure
-        const characterData = {
-            name: collectedData.NAME,
-            
-            // Stats component with nested level/xp structure
-            stats: {
-                level: {
-                    value: parseInt(collectedData.LEVEL) || 1,
-                    xp: {
-                        current: 0,
-                        max: parseInt(collectedData.XP_MAX) || 1000
-                    }
-                },
-                hp: {
-                    current: parseInt(collectedData.HP) || parseInt(collectedData.MAX_HP) || 100,
-                    max: parseInt(collectedData.MAX_HP) || parseInt(collectedData.HP) || 100
-                }
-            },
-            
-            // Info component
-            info: {
-                full_name: collectedData.FULL_NAME || null,
-                gender: collectedData.GENDER || '???',
-                race: collectedData.RACE || null,
-                class: collectedData.CLASS || null,
-                location: collectedData.DEFAULT_LOCATION || collectedData.LOCATION || getPlayerLocation() || 'unknown',
-                faction: collectedData.FACTION || null
-            },
-            
-            // Other components (empty by default)
-            attributes: {},
-            skills: {},
-            inventory: {},
-            relationships: {}
-        };
-        
-        // Store trigger name and generation turn in info component if provided
-        if (triggerName) {
-            characterData.info.trigger_name = triggerName;
-            characterData.info.generation_turn = info?.actionCount || 0;
-        }
-        
-        // Combine appearance fields into single field in info component
-        if (collectedData.HAIR || collectedData.EYES || collectedData.BUILD) {
-            const appearanceParts = [];
-            if (collectedData.HAIR) appearanceParts.push(`Hair: ${collectedData.HAIR}`);
-            if (collectedData.EYES) appearanceParts.push(`Eyes: ${collectedData.EYES}`);
-            if (collectedData.BUILD) appearanceParts.push(`Build: ${collectedData.BUILD}`);
-            characterData.info.appearance = appearanceParts.join(' | ');
-        } else if (collectedData.APPEARANCE) {
-            // Fallback to old APPEARANCE field if present
-            characterData.info.appearance = collectedData.APPEARANCE;
-        }
-        
-        // Map personality and background to info component
-        if (collectedData.PERSONALITY) {
-            characterData.info.personality = collectedData.PERSONALITY;
-        }
-        if (collectedData.BACKGROUND || collectedData.BACKSTORY) {
-            characterData.info.background = collectedData.BACKGROUND || collectedData.BACKSTORY;
-        }
-        
-        // HP is now handled via stats.hp.current and stats.hp.max above
-        // No separate hp object needed
-        
-        // Map attributes
-        const attributeNames = ['VITALITY', 'STRENGTH', 'DEXTERITY', 'AGILITY', 'INTELLIGENCE', 'WISDOM', 'CHARISMA', 'LUCK'];
-        for (const attr of attributeNames) {
-            if (collectedData[attr]) {
-                // Use uppercase keys for attributes with proper value structure
-                characterData.attributes[attr] = { value: parseInt(collectedData[attr]) || 10 };
-            }
-        }
-        
-        // If no attributes were provided, set defaults
-        if (Object.keys(characterData.attributes).length === 0) {
-            characterData.attributes = {
-                VITALITY: { value: 10 },
-                STRENGTH: { value: 10 },
-                DEXTERITY: { value: 10 },
-                AGILITY: { value: 10 }
+
+    // Blueprint Loading System
+    // =============================================================================
+    // UNIFIED BLUEPRINT SYSTEM:
+    //
+    // [SANE:BP] cards contain EVERYTHING:
+    // - Complete entity template with all components
+    // - Embedded generationwizard component with:
+    //   - generations.initial object containing fields and promptTemplate
+    //   - Field definitions with paths, types, validation
+    //   - Prompt sections for dynamic compilation
+    // - Display configuration
+    // - Component defaults
+    //
+    // NO SEPARATE PROMPT CARDS - everything is self-contained in the blueprint
+    // =============================================================================
+
+
+    // Add skill parser to valueParsers
+    valueParsers.skill = function(value) {
+        // Handle "SkillName:Level" format
+        const colonMatch = value.match(/^(.+?):(\d+)$/);
+        if (colonMatch) {
+            return {
+                name: colonMatch[1].trim(),
+                level: parseInt(colonMatch[2], 10)
             };
         }
-        
-        // Parse skills if provided (format: "skill_name: Level X")
-        if (collectedData.SKILLS) {
-            const skillLines = collectedData.SKILLS.split('\n');
-            for (const line of skillLines) {
-                const match = line.match(/(.+?):\s*Level\s+(\d+)/i);
-                if (match) {
-                    const skillName = match[1].trim().toLowerCase().replace(/\s+/g, '_');
-                    // Skills need level and xp structure
-                    characterData.skills[skillName] = {
-                        level: parseInt(match[2]) || 1,
-                        xp: { current: 0, max: 100 }
+
+        // Handle "SkillName Level X" format
+        const levelMatch = value.match(/^(.+?)\s+[Ll]evel\s+(\d+)$/);
+        if (levelMatch) {
+            return {
+                name: levelMatch[1].trim(),
+                level: parseInt(levelMatch[2], 10)
+            };
+        }
+
+        // Just skill name
+        return {
+            name: value.trim(),
+            level: 1
+        };
+    };
+
+    // Add relationship parser
+    valueParsers.relationship = function(value) {
+        // Handle "CharacterName:Value" format
+        const match = value.match(/^(.+?):(\d+)$/);
+        if (match) {
+            return {
+                character: match[1].trim(),
+                value: parseInt(match[2], 10)
+            };
+        }
+
+        // Just character name
+        return {
+            character: value.trim(),
+            value: 50  // Default relationship value
+        };
+    };
+
+    // Apply field value to entity using maps_to pattern
+    function applyMapsTo(entityId, mapsTo, parsedValue) {
+        if (!mapsTo || parsedValue === undefined || parsedValue === null) return false;
+
+        // Replace * with entityId directly (no type prefix in unified system)
+        let path = mapsTo.replace('*', entityId);
+
+        // Handle array notation like aliases[0]
+        const arrayMatch = path.match(/^(.+)\[(\d+)\]$/);
+        if (arrayMatch) {
+            const arrayPath = arrayMatch[1];
+            const index = parseInt(arrayMatch[2]);
+
+            // Get or create the array
+            let array = GameState.get(arrayPath);
+            if (!array || !Array.isArray(array)) {
+                array = [];
+            }
+
+            // Ensure array has enough elements
+            while (array.length <= index) {
+                array.push(null);
+            }
+
+            // Set the value at the index
+            array[index] = parsedValue;
+
+            // Save the entire array
+            return GameState.set(arrayPath, array);
+        }
+
+        // Handle dynamic substitutions like {name} or {item}
+        if (typeof parsedValue === 'object') {
+            // Replace {name} with parsed name value
+            if (parsedValue.name) {
+                path = path.replace('{name}', parsedValue.name);
+            }
+            // Replace {item} with parsed item value
+            if (parsedValue.item) {
+                path = path.replace('{item}', parsedValue.item);
+            }
+            // Replace {character} with parsed character value
+            if (parsedValue.character) {
+                path = path.replace('{character}', parsedValue.character);
+            }
+        }
+
+        // Determine final value to set
+        let finalValue = parsedValue;
+
+        // Special handling for different types
+        if (path.includes('.skills.') && parsedValue.name) {
+            // Skills need special structure
+            finalValue = {
+                level: parsedValue.level || 1,
+                xp: {
+                    current: 0,
+                    max: 100 * (parsedValue.level || 1)
+                }
+            };
+        } else if (path.includes('.inventory.') && parsedValue.item) {
+            // Inventory items just need quantity
+            finalValue = {
+                quantity: parsedValue.quantity || 1
+            };
+        } else if (path.includes('.relationships.') && parsedValue.character) {
+            // Relationships just need the value
+            finalValue = parsedValue.value || 50;
+        } else if (typeof parsedValue === 'object' && Object.keys(parsedValue).length === 1) {
+            // If parsed value is an object with a single property, might just need the value
+            // Keep objects as is for structured data
+        }
+
+        // Apply the value using GameState.set
+        try {
+            if (debug) console.log(`${MODULE_NAME}: Setting ${path} = ${JSON.stringify(finalValue)}`);
+            return GameState.set(path, finalValue);
+        } catch (e) {
+            console.log(`${MODULE_NAME}: Failed to apply maps_to: ${e.message}`);
+            return false;
+        }
+    }
+
+    // Finalize entity creation (set component to dormant, rename, add display)
+    // GREEDY COMPONENT: Never remove generationwizard, just set to dormant
+    function finalizeEntityCreation(tempId, finalName) {
+        if (!tempId || !finalName) return false;
+
+        try {
+            const entity = GameState.get(tempId);
+            const triggerName = entity?.generationwizard?.trigger;
+
+            // GREEDY COMPONENT: Set to dormant state instead of removing
+            if (entity?.generationwizard) {
+                const activeGen = entity.generationwizard.activeGeneration;
+                if (activeGen && entity.generationwizard.generations) {
+                    // Delete the completed generation object to save memory
+                    GameState.del(`${tempId}.generationwizard.generations.${activeGen}`);
+                }
+                // Set component to dormant state (component persists!)
+                GameState.set(`${tempId}.generationwizard.state`, 'dormant');
+                GameState.set(`${tempId}.generationwizard.activeGeneration`, null);
+                // Don't clear generations - it contains the configuration
+                // GameState.set(`${tempId}.generationwizard.generations`, {});
+
+                // Clean up temporary data that's no longer needed
+                if (entity.generationwizard.fields_collected) {
+                    GameState.del(`${tempId}.generationwizard.fields_collected`);
+                }
+                if (entity.generationwizard.trigger) {
+                    GameState.del(`${tempId}.generationwizard.trigger`);
+                }
+
+                if (debug) console.log(`${MODULE_NAME}: Set generationwizard to dormant state and cleaned up temporary data`);
+            }
+
+            // Store trigger name in info component if it exists
+            if (triggerName) {
+                GameState.set(`${tempId}.info.trigger_name`, triggerName);
+            }
+
+            // Try to rename BEFORE activating display
+            // This ensures the entity is renamed while still in [SANE:D] storage
+            let finalId = tempId;
+            try {
+                if (!GameState.changeEntityId) {
+                    console.log(`${MODULE_NAME}: changeEntityId function not available`);
+                } else {
+                    const renameResult = GameState.changeEntityId(tempId, finalName);
+                    if (debug) console.log(`${MODULE_NAME}: changeEntityId(${tempId}, ${finalName}) returned: ${renameResult}`);
+                    if (renameResult) {
+                        console.log(`${MODULE_NAME}: Successfully renamed entity from ${tempId} to ${finalName}`);
+                        finalId = finalName;
+                    } else {
+                        // Rename failed - keep the temporary ID
+                        // This could happen if an entity with finalName already exists
+                        console.log(`${MODULE_NAME}: Could not rename to '${finalName}', keeping temporary ID: ${tempId}`);
+                        // Since rename failed, ensure the entity.id matches the actual ID
+                        GameState.set(`${tempId}.id`, tempId);
+                    }
+                }
+            } catch (renameError) {
+                console.log(`${MODULE_NAME}: Error during rename: ${renameError.message}`);
+                // Keep the temporary ID if rename failed
+                finalId = tempId;
+            }
+
+            // ALWAYS activate the display component (after rename attempt)
+            try {
+                GameState.set(`${finalId}.display.active`, true);
+                console.log(`${MODULE_NAME}: Activated display for ${finalId}`);
+            } catch (displayError) {
+                console.log(`${MODULE_NAME}: ERROR activating display: ${displayError.message}`);
+            }
+
+            return finalId;
+
+        } catch (e) {
+            console.log(`${MODULE_NAME}: Error finalizing entity: ${e.message}`);
+        }
+
+        return false;
+    }
+
+    // Unified Model Functions
+    // ====================================================
+    //
+    // BLUEPRINT LOADING:
+    // function loadStructureBlueprint(blueprintName) {
+    //     // STEP-BY-STEP:
+    //     // 1. Load [SANE:BP] Blueprints card via Utilities.storyCard.get()
+    //     // 2. Parse JSON from card.description
+    //     // 3. Extract blueprint by name: blueprints[blueprintName]
+    //     // 4. Validate required properties exist:
+    //     //    - fields: Object with field definitions
+    //     //    - template: Object with entity structure
+    //     // 5. For each field in fields object:
+    //     //    - Ensure has 'source' (tool/llm)
+    //     //    - Ensure has 'type' (text/select/wildcard)
+    //     //    - If wildcard, ensure has 'expand' and 'limit'
+    //     //    - If has maps_to, validate pattern
+    //     // 6. Cache parsed blueprint for reuse
+    //     // 7. Returns: { fields: {...}, template: {...} }
+    //     // EXAMPLE RETURN:
+    //     // {
+    //     //   fields: {
+    //     //     NAME: { source: "llm", type: "text", maps_to: "*.aliases[0]" },
+    //     //     SKILL_*: { type: "wildcard", expand: "numeric", limit: 3 }
+    //     //   },
+    //     //   template: {
+
+    // Compile generation prompt from entity and generation object
+    function compileGenerationPrompt(entity, generation) {
+        if (!generation || !generation.promptTemplate) {
+            if (debug) console.log(`${MODULE_NAME}: No generation or promptTemplate`);
+            return '';
+        }
+
+        const template = generation.promptTemplate;
+        const sections = {};
+
+        // Initialize sections from template
+        for (const sectionName of template.sectionOrder || []) {
+            sections[sectionName] = [];
+        }
+
+        // Check actual entity values and categorize fields
+        const knownFields = [];
+        const neededFields = [];
+        const rejectedValues = {};
+
+        if (generation.fields) {
+            if (debug) console.log(`${MODULE_NAME}: Processing ${Object.keys(generation.fields).length} fields`);
+            for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                // Check if value is already collected in fields_collected
+                const collectedValue = entity.generationwizard?.fields_collected?.[fieldName];
+
+                // Get actual value from entity using field's path
+                const actualValue = fieldDef.path ? GameState.get(`${entity.id}.${fieldDef.path}`) : null;
+
+                // Special check for empty objects (like rewards.items)
+                let isEmptyObject = false;
+                if (actualValue && typeof actualValue === 'object' && !Array.isArray(actualValue)) {
+                    isEmptyObject = Object.keys(actualValue).length === 0;
+                }
+
+                // Use collected value if available, otherwise actual value
+                // Treat empty objects as having no value for collection purposes
+                const value = collectedValue !== undefined ? collectedValue :
+                             (isEmptyObject ? null : actualValue);
+
+                if (debug) console.log(`${MODULE_NAME}: Field ${fieldName}: path=${fieldDef.path}, actualValue=${actualValue}, collectedValue=${collectedValue}, hasPrompt=${!!fieldDef.prompt}`);
+
+                if (value !== null && value !== undefined) {
+                    // Field already has value
+                    fieldDef.collected = true;
+                    fieldDef.value = value;
+
+                    // Add to known section if template exists
+                    if (fieldDef.prompt?.known) {
+                        knownFields.push({
+                            priority: fieldDef.prompt.priority || 50,
+                            text: fieldDef.prompt.known.replace('$(value)', value)
+                        });
+                    }
+                } else {
+                    // Field needs collection
+                    fieldDef.collected = false;
+
+                    // Add to fields section if template exists
+                    if (fieldDef.prompt?.uncollected) {
+                        if (debug) console.log(`${MODULE_NAME}: Adding field ${fieldName} to needed fields`);
+                        neededFields.push({
+                            priority: fieldDef.prompt.priority || 50,
+                            text: fieldDef.prompt.uncollected
+                        });
+                    }
+                }
+            }
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Known fields: ${knownFields.length}, Needed fields: ${neededFields.length}`);
+
+        // Check for rejected values
+        if (entity.generationwizard?.rejected_names) {
+            rejectedValues.USERNAME = entity.generationwizard.rejected_names;
+        }
+
+        // Add context section for pre-provided values (for quests, etc)
+        const contextItems = [];
+
+        // Add quest-specific context if available
+        if (entity.info?.displayname) {
+            contextItems.push({
+                priority: 5,
+                text: `Quest Name: ${entity.info.displayname}`
+            });
+        }
+        if (entity.quest?.giver) {
+            contextItems.push({
+                priority: 6,
+                text: `Quest Giver: ${entity.quest.giver}`
+            });
+        }
+        if (entity.quest?.type) {
+            contextItems.push({
+                priority: 7,
+                text: `Quest Type: ${entity.quest.type}`
+            });
+        }
+
+        // Add sections to the compiled prompt
+        if (contextItems.length > 0) {
+            sections.context = sections.context || [];
+            sections.context.push(...contextItems);
+        }
+        if (knownFields.length > 0) {
+            sections.known = sections.known || [];
+            sections.known.push(...knownFields);
+        }
+        if (neededFields.length > 0) {
+            sections.fields = sections.fields || [];
+            sections.fields.push(...neededFields);
+        }
+
+        // Build context for condition evaluation
+        const context = {
+            trigger_name: entity.generationwizard?.trigger || entity.info?.trigger_name,
+            currentLocation: entity.info?.currentLocation,
+            hasKnown: knownFields.length > 0,
+            hasFields: neededFields.length > 0,
+            hasRejected: Object.keys(rejectedValues).length > 0,
+            rejectedValues: Object.entries(rejectedValues)
+                .map(([field, values]) => `${field}: ${values.join(', ')}`)
+                .join('\n')
+        };
+
+        // Add static template items to sections
+        if (template.sections) {
+            for (const [sectionName, templateItems] of Object.entries(template.sections)) {
+                if (!sections[sectionName]) sections[sectionName] = [];
+
+                for (const item of templateItems || []) {
+                    // Check condition
+                    if (item.condition) {
+                        // Simple condition evaluation
+                        let condition = item.condition;
+                        let shouldNegate = false;
+
+                        // Handle !$(variable) or !variable
+                        if (condition.startsWith('!')) {
+                            shouldNegate = true;
+                            condition = condition.substring(1);
+                        }
+
+                        // Remove $() wrapper if present
+                        condition = condition.replace(/\$\(([^)]+)\)/, '$1');
+
+                        const condValue = context[condition];
+                        const evalResult = shouldNegate ? !condValue : !!condValue;
+
+                        if (!evalResult) continue;
+                    }
+
+                    // Process text with simple variable substitution
+                    let text = item.text || '';
+                    // Support both {variable} and $(variable) syntax
+                    text = text.replace(/\{([^}]+)\}/g, (match, key) => {
+                        return context[key] || '';
+                    });
+                    text = text.replace(/\$\(([^)]+)\)/g, (match, key) => {
+                        return context[key] || '';
+                    });
+
+                    sections[sectionName].push({
+                        priority: item.priority || 0,
+                        text: text
+                    });
+                }
+            }
+        }
+
+        // Build final prompt by section order
+        const finalPrompt = [];
+
+        if (debug) console.log(`${MODULE_NAME}: Building prompt from sections. Order: ${template.sectionOrder}`);
+
+        for (const sectionName of template.sectionOrder || []) {
+            if (!sections[sectionName] || sections[sectionName].length === 0) {
+                if (debug) console.log(`${MODULE_NAME}: Skipping empty section: ${sectionName}`);
+                continue;
+            }
+
+            if (debug) console.log(`${MODULE_NAME}: Processing section ${sectionName} with ${sections[sectionName].length} items`);
+
+            // Sort items within section by priority
+            sections[sectionName].sort((a, b) => (a.priority || 0) - (b.priority || 0));
+
+            // Add all items from this section
+            finalPrompt.push(...sections[sectionName].map(item => item.text));
+        }
+
+        const result = finalPrompt.join('\n');
+        if (debug) console.log(`${MODULE_NAME}: Final prompt length: ${result.length}`);
+
+        return result;
+    }
+
+    // ==========================
+    // GREEDY COMPONENT SYSTEM 
+    // ==========================
+    // Core functions for the new persistent component system
+
+    // Find the currently active generator (state="generating")
+    function findActiveGenerator() {
+        // Scan all entities for generationwizard components with state="generating"
+        const allEntities = GameState.queryTags('*'); // Get all entities (returns array)
+        if (debug) console.log(`${MODULE_NAME}: findActiveGenerator checking ${allEntities.length} entities`);
+
+        // Debug: Log first few entity IDs to see what's loaded
+        if (debug && allEntities.length > 0) {
+            const sampleIds = allEntities.slice(0, 5).map(e => e.id || 'no-id');
+            console.log(`${MODULE_NAME}: Sample entity IDs: ${sampleIds.join(', ')}`);
+        }
+
+        for (const entity of allEntities) {
+            if (entity.generationwizard) {
+                if (debug) console.log(`${MODULE_NAME}: Entity ${entity.id} has generationwizard with state: ${entity.generationwizard.state}`);
+                if (entity.generationwizard.state === 'generating') {
+                    return {
+                        entityId: entity.id,
+                        entity: entity,
+                        component: entity.generationwizard
                     };
                 }
             }
         }
-        
-        // Parse inventory if provided
-        if (collectedData.INVENTORY) {
-            // Handle both {item:qty} format and plain list
-            const invText = collectedData.INVENTORY.replace(/[{}]/g, '').trim();
-            if (invText) {
-                const items = invText.split(',').map(i => i.trim());
-                for (const item of items) {
-                    const parts = item.split(':');
-                    if (parts.length === 2) {
-                        const itemName = parts[0].trim().toLowerCase().replace(/\s+/g, '_');
-                        const qty = parseInt(parts[1]) || 1;
-                        // Use proper {quantity: n} format
-                        characterData.inventory[itemName] = { quantity: qty };
-                    }
-                }
-            }
-        }
-        
-        // Add narrative sections
-        if (collectedData.APPEARANCE) {
-            characterData.appearance = collectedData.APPEARANCE;
-        }
-        if (collectedData.PERSONALITY) {
-            characterData.personality = collectedData.PERSONALITY;
-        }
-        if (collectedData.BACKGROUND) {
-            characterData.background = collectedData.BACKGROUND;
-        }
-        
-        // Add any shop inventory as a custom section
-        if (collectedData.SHOP_INVENTORY) {
-            characterData.shop_inventory = collectedData.SHOP_INVENTORY;
-        }
-        
-        // Add quest giver info as a custom section
-        if (collectedData.QUEST_GIVER) {
-            characterData.available_quests = collectedData.QUEST_GIVER;
-        }
-        
-        return characterData;
+        return null;
     }
-    
-    // ==========================
-    // Template Management
-    // ==========================
-    
-    function loadTemplate(entityType) {
-        const cardTitle = `${TEMPLATE_PREFIX} ${entityType}`;
-        const templateCard = Utilities.storyCard.get(cardTitle);
-        
-        if (!templateCard) {
-            if (debug) console.log(`${MODULE_NAME}: Template not found: ${cardTitle}`);
-            createDefaultTemplates();
-            return Utilities.storyCard.get(cardTitle);
-        }
-        
-        return templateCard;
-    }
-    
-    function parseTemplateFields(description) {
-        const fields = [];
-        const lines = description.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            
-            // Skip comments and empty lines
-            if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
-            
-            // Parse: FIELD_NAME: requirement, type[params], prompt
-            const match = trimmed.match(/^([A-Z_]+):\s*([^,]+),\s*([^,]+)(?:,\s*(.+))?$/);
-            if (!match) continue;
-            
-            const field = {
-                name: match[1],
-                requirement: match[2].trim(),
-                type: null,
-                params: null,
-                prompt: match[4] ? match[4].trim() : null
-            };
-            
-            // Parse type and params
-            const typeMatch = match[3].trim().match(/^([a-z]+)(?:\[([^\]]+)\])?$/);
-            if (typeMatch) {
-                field.type = typeMatch[1];
-                field.params = typeMatch[2] || null;
+
+    // Find all queued generators
+    function findQueuedGenerators() {
+
+        const queued = [];
+        const allEntities = GameState.queryTags('*');
+
+        if (debug) console.log(`${MODULE_NAME}: findQueuedGenerators checking ${allEntities.length} entities`);
+
+        for (const entity of allEntities) {
+            if (entity.generationwizard) {
+                if (debug) console.log(`${MODULE_NAME}: Entity ${entity.id} has generationwizard with state: ${entity.generationwizard.state}`);
             }
-            
-            // Skip formula and gamestate fields from queries
-            if (field.type === FieldTypes.FORMULA || field.type === FieldTypes.GAMESTATE) {
-                continue;
-            }
-            
-            fields.push(field);
-        }
-        
-        return fields;
-    }
-    
-    // ==========================
-    // Generation State Management
-    // ==========================
-    
-    function loadProgress() {
-        const progressCard = Utilities.storyCard.get(PROGRESS_CARD);
-        if (!progressCard) return null;
-        
-        try {
-            const progress = JSON.parse(progressCard.description || '{}');
-            
-            // Load template fields if not cached
-            if (!progress.templateFields && progress.entityType) {
-                const template = loadTemplate(progress.entityType);
-                if (template) {
-                    progress.templateFields = parseTemplateFields(template.description);
-                }
-            }
-            
-            return progress;
-        } catch (e) {
-            if (debug) console.log(`${MODULE_NAME}: Error loading progress: ${e}`);
-            return null;
-        }
-    }
-    
-    function saveProgress(progress) {
-        // Build a preview in the entry
-        let entry = `# Generating ${progress.entityType}\n\n`;
-        
-        const activeFields = progress.templateFields || [];
-        
-        // For quests, we need to count differently since some fields are predefined
-        let completedCount;
-        let totalFields;
-        
-        if (progress.entityType === 'Quest') {
-            // Count only the non-predefined fields that we actually ask for
-            const fieldsToCount = ['DESCRIPTION', 'STAGES', 'REWARDS'];
-            completedCount = fieldsToCount.filter(field => progress.collectedData[field]).length;
-            totalFields = fieldsToCount.length;
-        } else {
-            // For other entities, count all fields except internal ones
-            completedCount = Object.keys(progress.collectedData).filter(key => 
-                key !== 'name' && key !== 'REWARDS_PARSED'
-            ).length;
-            totalFields = activeFields.length;
-        }
-        
-        entry += `**Progress:** ${completedCount} of ${totalFields} fields collected\n\n`;
-        
-        // Show collected data
-        if (completedCount > 0) {
-            entry += `## Collected Data\n`;
-            for (const [key, value] of Object.entries(progress.collectedData)) {
-                if (key === 'STAGES' || key === 'REWARDS') {
-                    entry += `**${key}:**\n${value}\n\n`;
-                } else if (key !== 'REWARDS_PARSED') {
-                    entry += `**${key}:** ${value}\n`;
-                }
-            }
-        }
-        
-        // Show what we're waiting for
-        if (progress.currentBatch && progress.currentBatch.length > 0) {
-            entry += `\n## Waiting For\n`;
-            entry += progress.currentBatch.join(', ');
-        }
-        
-        Utilities.storyCard.upsert({
-            title: PROGRESS_CARD,
-            entry: entry,
-            description: JSON.stringify(progress)
-        });
-    }
-    
-    function clearProgress() {
-        Utilities.storyCard.remove(PROGRESS_CARD);
-        if (debug) console.log(`${MODULE_NAME}: Progress cleared`);
-    }
-    
-    // ==========================
-    // Quest Batch Collection
-    // ==========================
-    
-    function generateQuestBatchPrompt(fields, stageCount, existingStages, questType, collectedData, validationErrors) {
-        // Build the CONTEXT section - what we already know
-        let contextSection = '==== CONTEXT (Already Provided) ====\n';
-        contextSection += '**Quest Information:**\n';
-        contextSection += `Name: ${collectedData.NAME || 'Not specified'}\n`;
-        contextSection += `Giver: ${collectedData.QUEST_GIVER || 'Not specified'}\n`;
-        contextSection += `Type: ${questType || 'Not specified'}\n`;
-        contextSection += `Stages: ${stageCount || 'Not specified'}\n`;
-        
-        // Add collected fields to context
-        if (collectedData.DESCRIPTION) {
-            contextSection += `\nDescription: ${collectedData.DESCRIPTION}\n`;
-        }
-        
-        // Show completed stages in context if any
-        const completedStages = Object.keys(existingStages);
-        if (completedStages.length > 0) {
-            contextSection += '\n**Completed Stages:**\n';
-            for (let i = 1; i <= stageCount; i++) {
-                if (existingStages[i]) {
-                    contextSection += `Stage ${i}: ${existingStages[i]}\n`;
-                }
-            }
-        }
-        
-        // Show rewards in context if collected
-        if (collectedData.REWARDS_PARSED) {
-            const rewards = collectedData.REWARDS_PARSED;
-            contextSection += '\n**Rewards:**\n';
-            contextSection += `Experience: ${rewards.xp} XP\n`;
-            contextSection += `Col: ${rewards.col}\n`;
-            if (rewards.items) {
-                contextSection += `Items: ${rewards.items}\n`;
-            }
-        }
-        
-        // Build the QUERY section - what we still need (ALWAYS at bottom)
-        let querySection = '**Please provide the following information:**\n\n';
-        let queryItems = [];
-        
-        // Collect all uncompleted items
-        for (const field of fields) {
-            if (!collectedData.hasOwnProperty(field.name)) {
-                const fieldPrompt = field.prompt || field.name.replace(/_/g, ' ').toLowerCase();
-                
-                // Check if there's a validation error for this field
-                const validationError = validationErrors && validationErrors[field.name];
-                
-                let typeHint = '';
-                switch(field.type) {
-                    case FieldTypes.CHOICE:
-                        typeHint = field.params ? ` (${field.params.replace(/\|/g, '/')})` : '';
-                        break;
-                    case FieldTypes.RANGE:
-                        if (field.params) {
-                            const [min, max] = field.params.split('-');
-                            typeHint = ` (${min}-${max})`;
-                        }
-                        break;
-                    case FieldTypes.NUMBER:
-                        typeHint = ' (number)';
-                        break;
-                    case FieldTypes.BOOLEAN:
-                        typeHint = ' (yes/no)';
-                        break;
-                    case FieldTypes.LIST:
-                        typeHint = ' (comma-separated)';
-                        break;
-                }
-                
-                let fieldText = `${field.name}: [${fieldPrompt}${typeHint}]`;
-                if (validationError) {
-                    fieldText += `\n  ⚠️ ${validationError}`;
-                }
-                
-                queryItems.push({
-                    type: 'field',
-                    text: fieldText
+            if (entity.generationwizard && entity.generationwizard.state === 'queued') {
+                const activeGen = entity.generationwizard.generations[entity.generationwizard.activeGeneration];
+                queued.push({
+                    entityId: entity.id,
+                    entity: entity,
+                    component: entity.generationwizard,
+                    priority: activeGen?.priority || 0
                 });
             }
         }
-        
-        // Check if we need stages
-        const allStagesCollected = Object.keys(existingStages).length === stageCount;
-        if (!allStagesCollected) {
-            for (let i = 1; i <= stageCount; i++) {
-                if (!existingStages[i]) {
-                    queryItems.push({
-                        type: 'stage',
-                        text: `Stage ${i}: [objective]`
-                    });
-                }
-            }
-        }
-        
-        // Check if we need rewards
-        if (!collectedData.REWARDS_PARSED) {
-            queryItems.push({
-                type: 'rewards',
-                text: 'Experience: [XP amount]\nCol: [currency amount]\nItems: [item rewards or "None"]'
-            });
-        }
-        
-        // Build query section with proper grouping
-        let lastType = null;
-        for (const item of queryItems) {
-            // Add spacing between different types
-            if (lastType && lastType !== item.type) {
-                querySection += '\n';
-            }
-            querySection += item.text + '\n';
-            lastType = item.type;
-        }
-        
-        // Use the template from config card
-        return generatePrompt('Quest Combined', {
-            CONTEXT_SECTION: contextSection,
-            QUERY_SECTION: querySection
-        });
+
+        return queued;
     }
-    
-    // ==========================
-    // Batched Field Collection
-    // ==========================
-    
-    function parseBatchedResponse(response, fields) {
-        const collected = {};
-        const lines = response.split('\n');
-        
-        if (debug) {
-            log(`${MODULE_NAME}: parseBatchedResponse called with ${lines.length} lines`);
-            log(`${MODULE_NAME}: Raw response: "${response}"`);
-            log(`${MODULE_NAME}: Fields to parse: ${fields.map(f => f.name).join(', ')}`);
-        }
-        
-        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-            const line = lines[lineIndex];
-            
-            if (debug && line.trim()) {
-                log(`${MODULE_NAME}: Line ${lineIndex}: "${line}"`);
-                log(`${MODULE_NAME}: Line length: ${line.length}, trimmed length: ${line.trim().length}`);
-            }
-            
-            // Trim the line before matching to handle leading/trailing spaces
-            const trimmedLine = line.trim();
-            
-            for (const field of fields) {
-                // Look for "FIELD_NAME: value" pattern
-                const regex = new RegExp(`^${field.name}:\\s*(.+)`, 'i');
-                
-                if (debug) {
-                    log(`${MODULE_NAME}: Testing regex /${regex.source}/${regex.flags} against trimmed line`);
+
+    // Activate the next generator in queue
+    function activateNextGenerator() {
+        // 1. Check if any component is currently generating
+        const activeGen = findActiveGenerator();
+        if (activeGen) return activeGen;
+
+        // 2. Find all queued components
+        const queued = findQueuedGenerators();
+        if (queued.length === 0) return null;
+
+        // 3. Activate highest priority queued component
+        const next = queued.sort((a, b) => b.priority - a.priority)[0];
+        setGeneratorState(next.entityId, 'generating');
+
+        if (debug) console.log(`${MODULE_NAME}: Activated generator for ${next.entityId}`);
+        return next;
+    }
+
+    // Set generator state with single active generation constraint
+    function setGeneratorState(entityId, newState) {
+        if (newState === 'generating') {
+            // Force all other generating components to queued
+            const allEntities = GameState.queryTags('*');
+            for (const entity of allEntities) {
+                if (entity.id !== entityId && entity.generationwizard && entity.generationwizard.state === 'generating') {
+                    GameState.set(`${entity.id}.generationwizard.state`, 'queued');
+                    if (debug) console.log(`${MODULE_NAME}: Forced ${entity.id} from generating to queued`);
                 }
-                
-                const match = trimmedLine.match(regex);
-                
-                if (match) {
-                    collected[field.name] = match[1].trim();
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: MATCHED ${field.name} = "${match[1].trim()}"`);
+            }
+        }
+
+        // Set the new state
+        GameState.set(`${entityId}.generationwizard.state`, newState);
+
+        // Update timestamp if starting generation
+        if (newState === 'generating') {
+            GameState.set(`${entityId}.generationwizard.generations.${GameState.get(entityId + '.generationwizard.activeGeneration')}.startedAt`, new Date().toISOString());
+        }
+    }
+
+    // DEPRECATED: Old prompts registry system - no longer used
+    // Prompts are now embedded in blueprints
+    /*
+    function createPromptsRegistry() {
+        if (Utilities.storyCard.get('[SANE:D] Prompts Registry')) {
+            return; // Already exists
+        }
+
+        const promptsRegistry = {
+            prompts: {
+                // Character development/updating
+                personality_update: {
+                    fields: {
+                        PERSONALITY: {
+                            key: "PERSONALITY",
+                            path: "info.personality",
+                            type: "text",
+                            collected: false,
+                            value: null,
+                            prompt: {
+                                uncollected: "PERSONALITY: [Updated personality reflecting recent events]",
+                                known: "Current: $(value)",
+                                priority: 10
+                            }
+                        },
+                        BACKGROUND: {
+                            key: "BACKGROUND",
+                            path: "info.background",
+                            type: "text",
+                            collected: false,
+                            value: null,
+                            prompt: {
+                                uncollected: "BACKGROUND: [Updated backstory including this achievement]",
+                                known: "Current: $(value)",
+                                priority: 20
+                            }
+                        }
+                    },
+                    promptTemplate: {
+                        sectionOrder: ["header", "context", "fields", "footer"],
+                        sections: {
+                            header: [
+                                { text: "=== Character Development ===", priority: 0 }
+                            ],
+                            context: [],  // Filled dynamically by tool
+                            fields: [],   // Field contributions added automatically
+                            footer: [
+                                { text: "\\nShow growth while maintaining core identity.", priority: 0 }
+                            ]
+                        }
                     }
-                    break;
-                } else if (debug && field.name === 'DESCRIPTION') {
-                    // Extra debugging for DESCRIPTION specifically
-                    console.log(`${MODULE_NAME}: DESCRIPTION regex failed. Trimmed line starts with: "${trimmedLine.substring(0, 20)}"`);
-                    console.log(`${MODULE_NAME}: Original line had leading space: ${line[0] === ' '}`);
-                }
-            }
-        }
-        
-        if (debug) {
-            console.log(`${MODULE_NAME}: Collected fields: ${JSON.stringify(collected)}`);
-        }
-        
-        return collected;
-    }
-    
-    // ==========================
-    // Field Validation
-    // ==========================
-    
-    function validateField(field, value) {
-        if (!value || value.trim() === '') {
-            return { valid: false, error: 'Empty response' };
-        }
-        
-        const trimmedValue = value.trim();
-        
-        // Special handling for specific fields
-        if (field.name === 'NAME') {
-            // CRITICAL: Enforce snake_case for all names to prevent system breakage
-            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            
-            if (snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
-                if (debug) console.log(`${MODULE_NAME}: Converting NAME to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
-            }
-            
-            // Check for duplicate usernames using GameState
-            if (typeof GameState !== 'undefined' && GameState.load) {
-                const existingCharacter = GameState.load('Character', snakeCased);
-                if (existingCharacter) {
-                    if (debug) console.log(`${MODULE_NAME}: Name "${snakeCased}" already exists, silently rejecting`);
-                    // Return invalid without error message - AI will just retry
-                    return { 
-                        valid: false
-                    };
-                }
-            } else {
-                // Fallback: check story cards directly
-                const existingCard = Utilities.storyCard.get(`[CHARACTER] ${snakeCased}`) || 
-                                     Utilities.storyCard.get(`[PLAYER] ${snakeCased}`);
-                if (existingCard) {
-                    if (debug) console.log(`${MODULE_NAME}: Name "${snakeCased}" already exists, silently rejecting`);
-                    // Return invalid without error message - AI will just retry
-                    return { 
-                        valid: false
-                    };
-                }
-            }
-            
-            // Return the snake_cased version
-            return { valid: true, value: snakeCased };
-        }
-        
-        // Enforce snake_case for quest givers too
-        if (field.name === 'QUEST_GIVER') {
-            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            if (debug && snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
-                console.log(`${MODULE_NAME}: Converting QUEST_GIVER to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
-            }
-            return { valid: true, value: snakeCased };
-        }
-        
-        // Validate DESCRIPTION has meaningful content (more than 2 words)
-        if (field.name === 'DESCRIPTION') {
-            const wordCount = trimmedValue.split(/\s+/).filter(word => word.length > 0).length;
-            if (wordCount < 3) {
-                return { valid: false, error: 'Description must be at least 3 words (got "' + trimmedValue + '")' };
-            }
-            return { valid: true, value: trimmedValue };
-        }
-        
-        // Validate STAGES is not just a number or too short
-        if (field.name === 'STAGES') {
-            // Check if it's just a number
-            if (/^\d+$/.test(trimmedValue)) {
-                return { valid: false, error: 'STAGES cannot be just a number (got "' + trimmedValue + '")' };
-            }
-            // Check if it has actual stage content (should have numbered items)
-            const hasStageContent = /\d+[\.\:\-\)]\s*.+/i.test(trimmedValue);
-            if (!hasStageContent) {
-                return { valid: false, error: 'STAGES must contain numbered objectives (got "' + trimmedValue + '")' };
-            }
-            return { valid: true, value: trimmedValue };
-        }
-        
-        if (field.name === 'GENDER') {
-            const normalized = trimmedValue.toLowerCase();
-            // Accept various gender formats
-            if (normalized === 'm' || normalized === 'male' || normalized === 'man' || normalized === 'boy') {
-                return { valid: true, value: 'Male' };
-            }
-            if (normalized === 'f' || normalized === 'female' || normalized === 'woman' || normalized === 'girl') {
-                return { valid: true, value: 'Female' };
-            }
-            if (normalized === 'other' || normalized === 'non-binary' || normalized === 'nb') {
-                return { valid: true, value: 'Other' };
-            }
-            return { valid: false, error: 'Must be Male, Female, or Other' };
-        }
-        
-        if (field.name === 'DOB') {
-            // Accept various date formats and normalize to YYYY-MM-DD
-            // Try to parse common formats
-            const datePatterns = [
-                /^(\d{4})-(\d{1,2})-(\d{1,2})$/,  // YYYY-MM-DD
-                /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/,  // MM/DD/YYYY
-                /^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/,  // Month DD, YYYY
-                /^(\d{1,2})\s+(\w+)\s+(\d{4})$/,  // DD Month YYYY
-            ];
-            
-            for (const pattern of datePatterns) {
-                if (pattern.test(trimmedValue)) {
-                    // For now, just accept the value as-is if it matches a pattern
-                    // Could add more sophisticated date parsing if needed
-                    return { valid: true, value: trimmedValue };
-                }
-            }
-            
-            // If no pattern matches, still accept it if it contains numbers
-            if (/\d/.test(trimmedValue)) {
-                return { valid: true, value: trimmedValue };
-            }
-            return { valid: false, error: 'Invalid date format' };
-        }
-        
-        switch(field.type) {
-            case FieldTypes.CHOICE:
-                if (field.params) {
-                    const options = field.params.split('|').map(o => o.trim().toLowerCase());
-                    const normalized = trimmedValue.toLowerCase();
-                    
-                    if (options.includes(normalized)) {
-                        // Return the properly cased version
-                        const index = options.indexOf(normalized);
-                        const properCase = field.params.split('|')[index].trim();
-                        return { valid: true, value: properCase };
+                },
+
+                // Single field regeneration
+                regenerate_field: {
+                    fields: {},  // Populated dynamically by tool
+                    promptTemplate: {
+                        sectionOrder: ["header", "known", "rejected", "fields"],
+                        sections: {
+                            header: [
+                                { text: "=== Field Regeneration ===", priority: 0 }
+                            ],
+                            known: [],
+                            rejected: [],
+                            fields: []
+                        }
                     }
-                    return { valid: false, error: 'Not a valid option' };
-                }
-                break;
-                
-            case FieldTypes.RANGE:
-                if (field.params) {
-                    const [min, max] = field.params.split('-').map(n => parseInt(n.trim()));
-                    const num = parseInt(trimmedValue);
-                    
-                    if (isNaN(num)) {
-                        return { valid: false, error: 'Not a number' };
-                    }
-                    if (num < min || num > max) {
-                        return { valid: false, error: `Out of range ${min}-${max}` };
-                    }
-                    return { valid: true, value: num };
-                }
-                break;
-                
-            case FieldTypes.NUMBER:
-                const num = parseFloat(trimmedValue);
-                if (isNaN(num)) {
-                    return { valid: false, error: 'Not a number' };
-                }
-                return { valid: true, value: num };
-                
-            case FieldTypes.BOOLEAN:
-                const lower = trimmedValue.toLowerCase();
-                if (lower === 'true' || lower === 'yes') {
-                    return { valid: true, value: true };
-                }
-                if (lower === 'false' || lower === 'no') {
-                    return { valid: true, value: false };
-                }
-                return { valid: false, error: 'Must be yes or no' };
-                
-            case FieldTypes.LIST:
-                const items = trimmedValue.split(',')
-                    .map(item => item.trim())
-                    .filter(item => item.length > 0);
-                
-                if (items.length === 0) {
-                    return { valid: false, error: 'Empty list' };
-                }
-                return { valid: true, value: items.join(', ') };
-                
-            case FieldTypes.TEXT:
-            default:
-                return { valid: true, value: trimmedValue };
-        }
-        
-        return { valid: true, value: trimmedValue };
-    }
-    
-    // ==========================
-    // Quest Stage Collection
-    // ==========================
-    
-    function parseStageResponse(response, stageCount, existingStages = {}) {
-        const stages = { ...existingStages };
-        const lines = response.split('\n');
-        
-        for (const line of lines) {
-            const match = line.match(/Stage\s+(\d+):\s*(.+)/i);
-            if (match) {
-                const stageNum = parseInt(match[1]);
-                const objective = match[2].trim();
-                
-                if (stageNum >= 1 && stageNum <= stageCount && !stages[stageNum]) {
-                    stages[stageNum] = objective;
                 }
             }
-        }
-        
-        return stages;
-    }
-    
-    function validateStages(stages, stageCount) {
-        // Check which stages are missing or too short
-        const missingStages = [];
-        
-        for (let i = 1; i <= stageCount; i++) {
-            if (!stages[i] || stages[i].split(' ').length < 2) {  // Changed to 2 words minimum
-                missingStages.push(i);
-                // Remove this stage and all subsequent ones
-                for (let j = i; j <= stageCount; j++) {
-                    delete stages[j];
-                }
-                break;
-            }
-        }
-        
-        return missingStages.length === 0;
-    }
-    
-    function formatStagesForCard(stages, stageCount) {
-        let formatted = '';
-        for (let i = 1; i <= stageCount; i++) {
-            if (stages[i]) {
-                formatted += `${i}. ${stages[i]}\n`;
-            }
-        }
-        return formatted.trim();
-    }
-    
-    // ==========================
-    // Quest Rewards Collection
-    // ==========================
-    
-    function parseRewardsResponse(response) {
-        const rewards = {
-            xp: null,
-            col: null,
-            items: null
         };
-        
-        const lines = response.split('\n');
-        
-        for (const line of lines) {
-            // Match Experience/XP
-            let match = line.match(/(?:Experience|XP):\s*(\d+)/i);
-            if (match) {
-                rewards.xp = parseInt(match[1]);
-                continue;
-            }
-            
-            // Match Col/Currency
-            match = line.match(/(?:Col|Currency):\s*(\d+)/i);
-            if (match) {
-                rewards.col = parseInt(match[1]);
-                continue;
-            }
-            
-            // Match Items
-            match = line.match(/Items?:\s*(.+)/i);
-            if (match) {
-                const itemText = match[1].trim();
-                if (itemText.toLowerCase() !== 'none' && itemText.length > 0) {
-                    rewards.items = itemText;
-                }
-            }
-        }
-        
-        return rewards;
-    }
-    
-    function formatRewardsForCard(rewards) {
-        let formatted = '';
-        
-        if (rewards.xp) {
-            formatted += `- Experience: ${rewards.xp} XP\n`;
-        }
-        if (rewards.col) {
-            formatted += `- Col: ${rewards.col}\n`;
-        }
-        if (rewards.items) {
-            formatted += `- Items: ${rewards.items}`;
-        }
-        
-        return formatted.trim();
-    }
-    
-    // ==========================
-    // Main Processing
-    // ==========================
-    
-    function processGeneration(hook, text) {
-        const progress = loadProgress();
-        if (!progress) return { active: false };
-        
-        switch(hook) {
-            case 'context':
-                // First check if all fields are already collected but not marked complete
-                if (!progress.completed && progress.templateFields) {
-                    const activeFields = progress.templateFields.filter(field => 
-                        !progress.collectedData.hasOwnProperty(field.name)
-                    );
-                    if (activeFields.length === 0) {
-                        // All fields collected - mark as complete
-                        progress.completed = true;
-                        saveProgress(progress);
-                        if (debug) console.log(`${MODULE_NAME}: Context: All fields collected - marked as complete`);
-                    }
-                }
-                
-                if (progress.completed) {
-                    return { active: true, text: text };
-                }
-                
-                // For quests, NPCs, and Locations, use batched collection
-                if (progress.entityType === 'Quest' || progress.entityType === 'NPC' || progress.entityType === 'Location') {
-                    // Get fields that need to be collected
-                    const activeFields = progress.templateFields.filter(field => 
-                        !progress.collectedData.hasOwnProperty(field.name)
-                    );
-                    
-                    // If no more fields to collect, mark as completed
-                    if (activeFields.length === 0) {
-                        progress.completed = true;
-                        saveProgress(progress);
-                        return { active: true, text: text };
-                    }
-                    
-                    let batchPrompt;
-                    if (progress.entityType === 'NPC') {
-                        // Build field list for NPC with descriptions
-                        let fieldList = '';
-                        for (const field of activeFields) {
-                            // Include the field name and its prompt/description
-                            if (field.prompt) {
-                                fieldList += `${field.name}: [${field.prompt}]\n`;
-                            } else {
-                                // Fallback to just field name if no prompt
-                                fieldList += `${field.name}:\n`;
-                            }
-                        }
-                        
-                        // Build context of already collected data
-                        let context = '';
-                        if (Object.keys(progress.collectedData).length > 0) {
-                            context = '==== CONTEXT (Already Provided) ====\n';
-                            for (const [key, value] of Object.entries(progress.collectedData)) {
-                                context += `${key}: ${value}\n`;
-                            }
-                            context += '\n';
-                        }
-                        
-                        batchPrompt = generatePrompt('NPC Batch', {
-                            NAME: progress.triggerName || progress.collectedData.NAME || 'Unknown',
-                            FIELD_LIST: fieldList.trim(),
-                            CONTEXT: context
-                        });
-                        
-                        progress.expectingBatch = true;
-                    } else if (progress.entityType === 'Quest') {
-                        // Quest logic - ensure stageCollection is initialized
-                        if (!progress.stageCollection) {
-                            progress.stageCollection = {
-                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
-                                stages: {}
-                            };
-                        }
-                        batchPrompt = generateQuestBatchPrompt(
-                            activeFields,
-                            progress.stageCollection.stageCount,
-                            progress.stageCollection.stages,
-                            progress.collectedData.QUEST_TYPE,
-                            progress.collectedData,
-                            progress.validationErrors
-                        );
-                        progress.expectingQuestBatch = true;
-                    } else {
-                        // Other entity types (like Location) - just use field list
-                        let fieldList = '';
-                        for (const field of activeFields) {
-                            let fieldDescription = field.prompt || field.type;
-                            
-                            // If it's a choice field, show the options
-                            if (field.type === 'choice' && field.params) {
-                                fieldDescription = `(${field.params})`;
-                            }
-                            
-                            fieldList += `${field.name}: ${fieldDescription}\n`;
-                        }
-                        
-                        batchPrompt = generatePrompt('Field Collection', {
-                            ENTITY_TYPE: progress.entityType,
-                            FIELD_LIST: fieldList
-                        });
-                        progress.expectingBatch = true;
-                    }
-                    
-                    // Store which fields we're asking about
-                    progress.currentBatch = activeFields.map(f => f.name);
-                    saveProgress(progress);
-                    
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: Adding batch prompt to context for fields: ${activeFields.map(f => f.name).join(', ')}`);
-                        console.log(`${MODULE_NAME}: Full prompt injection:\n${batchPrompt}`);
-                    }
-                    
-                    return {
-                        active: true,
-                        text: text + batchPrompt
-                    };
-                }
-                
-                // Entity classification logic
-                if (progress.entityType === 'EntityClassification') {
-                    const classificationPrompt = generateEntityClassificationPrompt(progress);
-                    return {
-                        active: true,
-                        text: text + classificationPrompt
-                    };
-                }
-                
-                // Handle 'Entity' type - needs to select what kind of entity to create
-                if (progress.entityType === 'Entity' && !progress.branchResolved) {
-                    const entitySelectionPrompt = generatePrompt('Entity Selection', {});
-                    return {
-                        active: true,
-                        text: text + entitySelectionPrompt
-                    };
-                }
-                
-                // Non-quest entities - generate prompts for missing fields
-                const activeFields = getActiveFields(progress.templateFields, progress.collectedData);
-                
-                if (activeFields.length > 0) {
-                    // Build field list for the prompt template
-                    let fieldList = '';
-                    for (const field of activeFields) {
-                        fieldList += `**${field.name}**: ${field.description || `Please provide the ${field.name.toLowerCase().replace(/_/g, ' ')} for this ${progress.entityType}`}\n`;
-                    }
-                    
-                    // Use the Field Collection template
-                    const prompt = generatePrompt('Field Collection', {
-                        ENTITY_TYPE: progress.entityType,
-                        FIELD_LIST: fieldList.trim()
-                    });
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Adding prompt for ${activeFields.length} fields`);
-                    return { active: true, text: text + '\n\n' + prompt };
-                }
-                
-                // All fields collected, mark as completed
-                progress.completed = true;
-                saveProgress(progress);
-                return { active: true, text: text };
-                
-            case 'output':
-                // Check if already completed
-                if (progress.completed) {
-                    clearProgress();
-                    return { active: false };
-                }
-                
-                // Handle batch response for Quest, NPC, or Location
-                if ((progress.entityType === 'Quest' && progress.expectingQuestBatch) || 
-                    (progress.entityType === 'NPC' && progress.expectingBatch) ||
-                    (progress.entityType === 'Location' && progress.expectingBatch)) {
-                    let allFieldsCollected = true;
-                    
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: Processing Quest batch response`);
-                        console.log(`${MODULE_NAME}: Output text: "${text}"`);
-                        console.log(`${MODULE_NAME}: currentBatch: ${JSON.stringify(progress.currentBatch)}`);
-                    }
-                    
-                    // Parse regular fields - use ALL template fields, not just currentBatch
-                    const responses = parseBatchedResponse(text, progress.templateFields);
-                    
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: Parsed responses: ${JSON.stringify(responses)}`);
-                    }
-                    
-                    // Process each field
-                    for (const field of progress.templateFields) {
-                        if (!progress.collectedData.hasOwnProperty(field.name)) {
-                            const response = responses[field.name];
-                            if (response) {
-                                const validation = validateField(field, response);
-                                if (validation.valid) {
-                                    progress.collectedData[field.name] = validation.value;
-                                    // Clear any previous validation errors for this field
-                                    if (progress.validationErrors && progress.validationErrors[field.name]) {
-                                        delete progress.validationErrors[field.name];
-                                    }
-                                    if (debug) console.log(`${MODULE_NAME}: Collected ${field.name}: ${validation.value}`);
-                                } else {
-                                    if (debug) console.log(`${MODULE_NAME}: Validation failed for ${field.name}: ${validation.error}`);
-                                    // Store validation error for display in next prompt
-                                    if (!progress.validationErrors) progress.validationErrors = {};
-                                    progress.validationErrors[field.name] = validation.error;
-                                    if (field.requirement === 'required') {
-                                        allFieldsCollected = false;
-                                    }
-                                }
-                            } else {
-                                if (debug) console.log(`${MODULE_NAME}: No response found for ${field.name}`);
-                                if (field.requirement === 'required') {
-                                    allFieldsCollected = false;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Parse stages (Quest only) - Special handling to avoid false matches
-                    if (progress.entityType === 'Quest' && !progress.collectedData.STAGES) {
-                        // Ensure stageCollection is initialized
-                        if (!progress.stageCollection) {
-                            progress.stageCollection = {
-                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
-                                stages: {}
-                            };
-                        }
-                        
-                        // Look for the actual STAGES section, not summary lines
-                        // Find where "STAGES:" appears on its own line (not "Stages: 3")
-                        const stagesIndex = text.search(/^STAGES:\s*$/m);
-                        let stageText = text;
-                        
-                        if (stagesIndex !== -1) {
-                            // Extract everything after "STAGES:" line
-                            stageText = text.substring(stagesIndex);
-                            // Stop at "REWARDS:" if present
-                            const rewardsIndex = stageText.search(/^REWARDS:\s*$/m);
-                            if (rewardsIndex > 0) {
-                                stageText = stageText.substring(0, rewardsIndex);
-                            }
-                            if (debug) console.log(`${MODULE_NAME}: Extracted stage section for parsing`);
-                        }
-                        
-                        const stages = parseStageResponse(
-                            stageText,
-                            progress.stageCollection.stageCount,
-                            progress.stageCollection.stages
-                        );
-                        
-                        // Validate stages
-                        const allValid = validateStages(stages, progress.stageCollection.stageCount);
-                        
-                        progress.stageCollection.stages = stages;
-                        
-                        if (allValid) {
-                            const formattedStages = formatStagesForCard(
-                                stages,
-                                progress.stageCollection.stageCount
-                            );
-                            progress.collectedData.STAGES = formattedStages;
-                            if (debug) {
-                                console.log(`${MODULE_NAME}: All ${progress.stageCollection.stageCount} stages collected`);
-                                console.log(`${MODULE_NAME}: Formatted stages:\n${formattedStages}`);
-                            }
-                        } else {
-                            allFieldsCollected = false;
-                            if (debug) console.log(`${MODULE_NAME}: Stage validation failed, will retry`);
-                        }
-                    }
-                    
-                    // Parse rewards (Quest only)
-                    if (progress.entityType === 'Quest' && !progress.collectedData.REWARDS) {
-                        const rewards = parseRewardsResponse(text);
-                        
-                        if (rewards.xp && rewards.col) {
-                            progress.collectedData.REWARDS = formatRewardsForCard(rewards);
-                            progress.collectedData.REWARDS_PARSED = rewards;
-                            if (debug) console.log(`${MODULE_NAME}: Rewards collected: ${rewards.xp} XP, ${rewards.col} Col`);
-                        } else {
-                            allFieldsCollected = false;
-                            if (debug) console.log(`${MODULE_NAME}: Rewards incomplete`);
-                        }
-                    }
-                    
-                    // Check if we have everything
-                    const requiredFields = progress.templateFields.filter(f => f.requirement === 'required');
-                    for (const field of requiredFields) {
-                        if (!progress.collectedData.hasOwnProperty(field.name)) {
-                            allFieldsCollected = false;
-                            if (debug) console.log(`${MODULE_NAME}: Missing required field: ${field.name}`);
-                        }
-                    }
-                    
-                    // Check for stages and rewards specifically
-                    if (!progress.collectedData.STAGES) {
-                        allFieldsCollected = false;
-                        if (debug) console.log(`${MODULE_NAME}: Missing STAGES`);
-                    }
-                    if (!progress.collectedData.REWARDS) {
-                        allFieldsCollected = false;
-                        if (debug) console.log(`${MODULE_NAME}: Missing REWARDS`);
-                    }
-                    
-                    // Check if ALL fields are now collected (not just from this response)
-                    // For quests, we need to check DESCRIPTION, STAGES, and REWARDS specifically
-                    let remainingFields = [];
-                    let remainingFieldNames = '';
-                    
-                    if (progress.entityType === 'Quest') {
-                        // Check the three required quest fields
-                        const requiredQuestFields = ['DESCRIPTION', 'STAGES', 'REWARDS'];
-                        const missingQuestFields = requiredQuestFields.filter(f => !progress.collectedData[f]);
-                        remainingFields = missingQuestFields.map(name => ({ name }));
-                        remainingFieldNames = missingQuestFields.join(', ');
-                    } else {
-                        remainingFields = getActiveFields(progress.templateFields, progress.collectedData);
-                        remainingFieldNames = remainingFields.map(f => f.name).join(', ');
-                    }
-                    
-                    console.log(`${MODULE_NAME}: After batch processing - Remaining fields: ${remainingFields.length}${remainingFields.length > 0 ? ` (${remainingFieldNames})` : ''}`);
-                    console.log(`${MODULE_NAME}: Collected so far: ${JSON.stringify(Object.keys(progress.collectedData))}`);
-                    
-                    if (remainingFields.length === 0) {
-                        progress.completed = true;
-                        progress.expectingQuestBatch = false;
-                        progress.expectingBatch = false;
-                        if (debug) console.log(`${MODULE_NAME}: Quest generation completed!`);
-                        
-                        // Create the entity card immediately
-                        const template = loadTemplate(progress.entityType);
-                        if (template) {
-                            const finalText = processTemplate(template, progress.collectedData);
-                            const dataWithTrigger = { ...progress.collectedData };
-                            if (progress.triggerName) {
-                                dataWithTrigger.triggerName = progress.triggerName;
-                            }
-                            if (progress.metadata) {
-                                dataWithTrigger.metadata = progress.metadata;
-                            }
-                            createEntityCard(progress.entityType, finalText, dataWithTrigger);
-                        }
-                        
-                        // Clear and return completion message
-                        clearProgress();
-                        return { active: true, text: config.debug ? wrapDebugOutput(text) : COMPLETION_MESSAGE };
-                    }
-                    
-                    progress.currentBatch = null;
-                    saveProgress(progress);
-                    return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-                }
-                
-                // Handle entity classification response
-                if (progress.entityType === 'EntityClassification') {
-                    return handleEntityClassification(progress, text, config);
-                }
-                
-                // Handle Entity type selection response
-                if (progress.entityType === 'Entity' && !progress.branchResolved) {
-                    const branchTo = handleEntityBranching(text);
-                    if (branchTo) {
-                        if (debug) console.log(`${MODULE_NAME}: Entity branched to ${branchTo}`);
-                        
-                        // Load the template for the new entity type
-                        const template = loadTemplate(branchTo);
-                        if (!template) {
-                            if (debug) console.log(`${MODULE_NAME}: No template for ${branchTo}`);
-                            clearProgress();
-                            return { active: true, text: 'Failed to find template for ' + branchTo };
-                        }
-                        
-                        // Parse template fields
-                        const templateFields = parseTemplateFields(template.description);
-                        
-                        // Update progress with the actual entity type
-                        progress.entityType = branchTo;
-                        progress.templateFields = templateFields;
-                        progress.branchResolved = true;
-                        
-                        // Initialize Quest-specific fields if branching to Quest
-                        if (branchTo === 'Quest') {
-                            progress.stageCollection = {
-                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
-                                stages: {}
-                            };
-                            progress.expectingQuestBatch = true;
-                        } else if (branchTo === 'NPC' || branchTo === 'Location') {
-                            progress.expectingBatch = true;
-                        }
-                        
-                        saveProgress(progress);
-                        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-                    } else {
-                        if (debug) console.log(`${MODULE_NAME}: Invalid entity type in response: ${text}`);
-                        // Stay in Entity state and will re-prompt on next context
-                        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-                    }
-                }
-                
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-        }
-        
-        return { active: false };
-    }
-    
-    // ==========================
-    // Field Management
-    // ==========================
-    function getActiveFields(templateFields, collectedData) {
-        // Return all fields that aren't already collected
-        if (!templateFields) return [];
-        
-        return templateFields.filter(field => {
-            // Skip if already collected
-            if (collectedData.hasOwnProperty(field.name)) {
-                return false;
-            }
-            
-            // Include all non-conditional fields
-            return field.requirement === 'required' || field.requirement === 'optional';
+
+        Utilities.storyCard.add({
+            title: '[SANE:D] Prompts Registry',
+            description: JSON.stringify(promptsRegistry, null, 2),
+            type: 'data'
         });
+
+        if (debug) console.log(`${MODULE_NAME}: Created prompts registry`);
     }
-    
+    */
+
     // ==========================
-    // Entity Branching (for 'Entity' type)
+    // Generation Flow
     // ==========================
-    function handleEntityBranching(response) {
-        // Valid entity types for branching
-        const validTypes = ['npc', 'monster', 'boss', 'item', 'location', 'quest'];
-        const normalized = response.trim().toLowerCase();
-        
-        if (validTypes.includes(normalized)) {
-            // Capitalize first letter for proper entity type
-            const properCase = normalized.charAt(0).toUpperCase() + normalized.slice(1);
-            
-            // Special case: NPC should be all caps
-            if (normalized === 'npc') {
-                return 'NPC';
-            }
-            
-            return properCase;
-        }
-        
-        return null;
+
+    function normalizeGender(genderStr) {
+        if (!genderStr) return 'Unknown';
+
+        const normalized = genderStr.toLowerCase().trim();
+
+        // Common variations
+        const male = ['male', 'm', 'man', 'boy', 'he', 'him', 'masculine'];
+        const female = ['female', 'f', 'woman', 'girl', 'she', 'her', 'feminine'];
+        const other = ['other', 'non-binary', 'nonbinary', 'nb', 'they', 'them', 'neutral', 'unknown'];
+
+        if (male.includes(normalized)) return 'Male';
+        if (female.includes(normalized)) return 'Female';
+        if (other.includes(normalized)) return 'Other';
+
+        // Default to capitalizing first letter if not recognized
+        return genderStr.charAt(0).toUpperCase() + genderStr.slice(1).toLowerCase();
     }
-    
-    // ==========================
-    // Skill Generation
-    // ==========================
-    function generateRandomSkills(level = 1) {
-        // Parse skill sections from [RPG_SCHEMA] Skills card
-        const skillsCard = Utilities.storyCard.get('[RPG_SCHEMA] Skills');
-        if (!skillsCard || !skillsCard.entry) return '';
-        
-        const skillsBySection = {};
-        let currentSection = null;
-        
-        const lines = skillsCard.entry.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            
-            // Check for section headers
-            if (trimmed.startsWith('## ')) {
-                currentSection = trimmed.substring(3);
-                skillsBySection[currentSection] = [];
-                continue;
-            }
-            
-            // Parse skill definitions
-            if (trimmed.startsWith('* ') && currentSection) {
-                const skillMatch = trimmed.match(/^\* ([a-z_]+):/);
-                if (skillMatch) {
-                    skillsBySection[currentSection].push(skillMatch[1]);
-                }
-            }
-        }
-        
-        // Select 2 random skills (max 1 from Combat)
-        const selectedSkills = [];
-        const sections = Object.keys(skillsBySection);
-        
-        // First, decide if we're picking from Combat
-        const combatSkills = skillsBySection['Combat'] || [];
-        const nonCombatSections = sections.filter(s => s !== 'Combat' && s !== 'XP Categories');
-        
-        if (combatSkills.length > 0 && Math.random() < 0.5) {
-            // Pick one combat skill
-            const randomCombat = combatSkills[Math.floor(Math.random() * combatSkills.length)];
-            selectedSkills.push(randomCombat);
-        }
-        
-        // Fill remaining slots with non-combat skills
-        while (selectedSkills.length < 2 && nonCombatSections.length > 0) {
-            const randomSection = nonCombatSections[Math.floor(Math.random() * nonCombatSections.length)];
-            const sectionSkills = skillsBySection[randomSection] || [];
-            
-            if (sectionSkills.length > 0) {
-                const randomSkill = sectionSkills[Math.floor(Math.random() * sectionSkills.length)];
-                selectedSkills.push(randomSkill);
-            }
-        }
-        
-        // Format skills with XP values (always start at Level 1)
-        const formattedSkills = selectedSkills.map(skill => {
-            const xpMax = 100; // Level 1 XP requirement
-            const currentXp = Math.floor(Math.random() * 30); // Random progress up to 30 XP
-            return `${skill}: Level 1 (${currentXp}/${xpMax} XP)`;
-        });
-        
-        return formattedSkills.join('\n');
+
+    function toSnakeCase(str) {
+        if (!str) return '';
+
+        // Replace spaces and special chars with underscores
+        // Convert to lowercase
+        return str
+            .trim()
+            .replace(/[^a-zA-Z0-9_]/g, '_')  // Replace non-alphanumeric with _
+            .replace(/_+/g, '_')              // Collapse multiple underscores
+            .replace(/^_|_$/g, '')            // Remove leading/trailing underscores
+            .toLowerCase();
     }
-    
-    // ==========================
-    // Helper Functions
-    // ==========================
+
     function normalizeDateFormat(dateStr) {
         if (!dateStr) return '';
-        
+
         // If already in YYYY-MM-DD format, return as is
         if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
             return dateStr;
         }
-        
+
         // Try to parse various date formats
         const months = {
             'january': '01', 'jan': '01',
@@ -1757,7 +855,7 @@ function GenerationWizard(hook, text) {
             'november': '11', 'nov': '11',
             'december': '12', 'dec': '12'
         };
-        
+
         // Try "Month DD, YYYY" or "Month DD YYYY"
         const match1 = dateStr.match(/^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/i);
         if (match1) {
@@ -1767,7 +865,7 @@ function GenerationWizard(hook, text) {
                 return `${match1[3]}-${month}-${day}`;
             }
         }
-        
+
         // Try "DD Month YYYY"
         const match2 = dateStr.match(/^(\d{1,2})\s+(\w+)\s+(\d{4})$/i);
         if (match2) {
@@ -1777,7 +875,7 @@ function GenerationWizard(hook, text) {
                 return `${match2[3]}-${month}-${day}`;
             }
         }
-        
+
         // Try MM/DD/YYYY or MM-DD-YYYY
         const match3 = dateStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
         if (match3) {
@@ -1785,7 +883,7 @@ function GenerationWizard(hook, text) {
             const day = match3[2].padStart(2, '0');
             return `${match3[3]}-${month}-${day}`;
         }
-        
+
         // Try DD/MM/YYYY (assume day first if day > 12)
         const match4 = dateStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
         if (match4) {
@@ -1798,879 +896,1518 @@ function GenerationWizard(hook, text) {
                 return `${match4[3]}-${month}-${day}`;
             }
         }
-        
-        // Return original if we can't parse it
+
+        // If we can't parse it, return the original
         return dateStr;
     }
-    
+
     // ==========================
-    // Final Template Processing
+    // Expression Evaluation
     // ==========================
-    function processTemplate(template, collectedData) {
-        let finalText = template.entry;
-        
-        // Flatten nested properties for template processing
-        const flatData = {...collectedData};
-        
-        if (debug && flatData.STAGES !== undefined) {
-            console.log(`${MODULE_NAME}: processTemplate - STAGES value: "${flatData.STAGES}"`);
-            console.log(`${MODULE_NAME}: processTemplate - STAGES type: ${typeof flatData.STAGES}`);
-        }
-        
-        // Handle hp object specially
-        if (collectedData.hp && typeof collectedData.hp === 'object') {
-            flatData['hp.current'] = collectedData.hp.current || 100;
-            flatData['hp.max'] = collectedData.hp.max || 100;
-            // Remove the nested object to avoid confusion
-            delete flatData.hp;
-        } else if (collectedData.HP || collectedData.MAX_HP) {
-            // Fallback if HP/MAX_HP are provided as flat fields
-            flatData['hp.current'] = collectedData.HP || collectedData.MAX_HP || 100;
-            flatData['hp.max'] = collectedData.MAX_HP || collectedData.HP || 100;
-        } else {
-            // Default HP values for NPCs
-            flatData['hp.current'] = 100;
-            flatData['hp.max'] = 100;
-        }
-        
-        // Normalize DOB to YYYY-MM-DD format
-        if (flatData.DOB) {
-            flatData.DOB = normalizeDateFormat(flatData.DOB);
-        }
-        
-        // Generate random skills for NPCs if not provided
-        if (!flatData.SKILLS) {
-            flatData.SKILLS = generateRandomSkills(1); // Always level 1
-        }
-        
-        // Get location from first [PLAYER] if not provided
-        if (!flatData.LOCATION) {
-            const players = Utilities.storyCard.find(c => c.title && c.title.startsWith('[PLAYER]'), true);
-            if (players && players.length > 0) {
-                const match = players[0].entry.match(/Current Location:\s*([^\n]+)/);
-                if (match) {
-                    flatData.LOCATION = match[1].trim();
-                }
-            }
-            // Default if no player found
-            if (!flatData.LOCATION) {
-                flatData.LOCATION = 'Town_Of_Beginnings';
-            }
-        }
-        
-        // Replace all {{FIELD_NAME}} placeholders that exist in flatData
-        for (const [field, value] of Object.entries(flatData)) {
-            // Escape dots in field names for regex
-            const escapedField = field.replace(/\./g, '\\.');
-            const placeholder = new RegExp(`\\{\\{${escapedField}\\}\\}`, 'gi');
-            finalText = finalText.replace(placeholder, value || '');
-        }
-        
-        // Process formulas from the description
-        const descFields = parseTemplateDescription(template.description);
-        for (const field of descFields) {
-            if (field.type === FieldTypes.FORMULA && field.params) {
-                const placeholder = new RegExp(`\\{\\{${field.name}\\}\\}`, 'gi');
-                const result = calculateFormula(field.params, collectedData);
-                finalText = finalText.replace(placeholder, result);
-            }
-            else if (field.type === FieldTypes.GAMESTATE && field.params) {
-                const placeholder = new RegExp(`\\{\\{${field.name}\\}\\}`, 'gi');
-                // This will be processed by GameState's processGetters
-                finalText = finalText.replace(placeholder, `get_${field.params}`);
-            }
-        }
-        
-        // Handle optional sections {{#FIELD}}...{{/FIELD}}
-        const optionalPattern = /\{\{#([A-Z_]+)\}\}([\s\S]*?)\{\{\/\1\}\}/g;
-        finalText = finalText.replace(optionalPattern, (match, fieldName, content) => {
-            if (collectedData[fieldName]) {
-                return content;
-            }
-            return '';
-        });
-        
-        // Clean up any remaining placeholders for optional fields
-        finalText = finalText.replace(/\{\{[A-Z_]+\}\}/g, '');
-        
-        return finalText;
-    }
-    
-    function parseTemplateDescription(description) {
-        // Parse ALL fields including formulas and gamestate
-        const fields = [];
-        const lines = description.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
-            
-            const match = trimmed.match(/^([A-Z_]+):\s*([^,]+),\s*([^,]+)(?:,\s*(.+))?$/);
-            if (!match) continue;
-            
-            const field = {
-                name: match[1],
-                requirement: match[2].trim(),
-                type: null,
-                params: null
-            };
-            
-            const typeMatch = match[3].trim().match(/^([a-z]+)(?:\[([^\]]+)\])?$/);
-            if (typeMatch) {
-                field.type = typeMatch[1];
-                field.params = typeMatch[2] || null;
-            }
-            
-            fields.push(field);
-        }
-        
-        return fields;
-    }
-    
-    function calculateFormula(formula, data) {
-        try {
-            let calcFormula = formula;
-            
-            // Replace field references
-            for (const [field, value] of Object.entries(data)) {
-                const pattern = new RegExp(`\\b${field}\\b`, 'gi');
-                calcFormula = calcFormula.replace(pattern, value);
-            }
-            
-            // Safely evaluate
-            const result = eval(calcFormula);
-            return Math.round(result);
-        } catch (e) {
-            if (debug) console.log(`${MODULE_NAME}: Formula error: ${e}`);
-            return 0;
-        }
-    }
-    
-    function createEntityCard(entityType, finalText, collectedData) {
-        // Determine card title based on entity type
-        let cardTitle = '';
-        let cardType = '';
-        const name = collectedData.NAME || 'Unknown';
-        
-        // Special handling for NPCs - use GameState's character creation
-        if (entityType.toUpperCase() === 'NPC') {
-            // Get trigger name from collectedData if it was passed
-            const triggerName = collectedData.triggerName || null;
-            
-            // Transform collected data to character format
-            const characterData = transformToCharacterData(collectedData, triggerName);
-            
-            // Use GameState to create the character if available
-            if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                const character = GameState.createCharacter(characterData);
-                if (character) {
-                    if (debug) console.log(`${MODULE_NAME}: Created NPC ${name} using GameState`);
-                    return; // Character was created successfully
-                }
-            }
-            
-            // Fallback to manual creation if GameState not available
-            cardTitle = `[CHARACTER] ${name}`;
-            cardType = 'character';
-        }
-        
-        switch(entityType.toUpperCase()) {
-            case 'NPC':
-                // Already handled above
-                break;
-            case 'MONSTER':
-                cardTitle = `[MONSTER] ${name}`;
-                cardType = 'monster';
-                break;
-            case 'BOSS':
-                cardTitle = `[BOSS] ${name}`;
-                cardType = 'boss';
-                break;
-            case 'LOCATION':
-                // Create location card using collectedData (not progress which isn't available here)
-                return createLocationFromData(collectedData, collectedData.metadata);
-                break;
-            case 'ITEM':
-                cardTitle = `[ITEM] ${name}`;
-                cardType = 'item';
-                break;
-            case 'QUEST':
-                cardTitle = `[QUEST] ${name}`;
-                cardType = 'quest';
-                break;
-            default:
-                cardTitle = `[${entityType.toUpperCase()}] ${name}`;
-                cardType = entityType.toLowerCase();
-        }
-        
-        // Create keys - username, real name, and trigger name if available
-        let keysList = [name];
-        if (collectedData.FULL_NAME && collectedData.FULL_NAME !== name) {
-            keysList.push(collectedData.FULL_NAME);
-        }
-        // Ensure triggerName is a string before adding to keys
-        const triggerNameStr = typeof collectedData.triggerName === 'string' 
-            ? collectedData.triggerName 
-            : (collectedData.triggerName?.name || null);
-        if (triggerNameStr && triggerNameStr !== name) {
-            keysList.push(' ' + triggerNameStr);
-            keysList.push('(' + triggerNameStr);
-        }
-        const keys = keysList.join(', ');
-        
-        // Create the story card
-        let description = `Generated by GenerationWizard on turn ${info?.actionCount || 0}`;
-        if (triggerNameStr && triggerNameStr !== name) {
-            description += `\nTrigger Name: ${triggerNameStr}`;
-        }
-        
-        Utilities.storyCard.add({
-            title: cardTitle,
-            entry: finalText,
-            type: cardType,
-            keys: keys,
-            description: description
-        });
-        
-        if (debug) console.log(`${MODULE_NAME}: Created entity card: ${cardTitle} with type: ${cardType}, keys: ${keys}`);
-        return cardTitle;
-    }
-    
-    // ==========================
-    // Default Template Creation
-    // ==========================
-    function createDefaultTemplates() {
-        // NPC Template (creates [CHARACTER] cards)
-        Utilities.storyCard.add({
-            title: '[GW Template] NPC',
-            type: 'data',
-            entry: (
-                `## **{{NAME}}** {{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
-                `DOB: {{DOB}} | Gender: {{GENDER}} | HP: {{hp.current}}/{{hp.max}} | Level {{LEVEL}} (0/{{XP_MAX}} XP) | Current Location: {{LOCATION}}\n` +
-                `**Appearance**\n` +
-                `Hair: {{HAIR}} | Eyes: {{EYES}} | Build: {{BUILD}}\n` +
-                `**Personality**\n` +
-                `{{PERSONALITY}}\n` +
-                `**Background**\n` +
-                `{{BACKGROUND}}\n` +
-                `**Attributes**\n` +
-                `VITALITY: {{VITALITY}} | STRENGTH: {{STRENGTH}} | DEXTERITY: {{DEXTERITY}} | AGILITY: {{AGILITY}}\n` +
-                `**Skills**\n` +
-                `{{SKILLS}}\n` +
-                `**Inventory**\n` +
-                `{}\n` +
-                `**Relationships**\n`
-            ),
-            description: (
-                `// NPC Generation\n` +
-                `NAME: required, text, Username/Gamertag (e.g. Nixara, LewdLeah, xXNyaXx, Pixel_Prowl; snake_case)\n` +
-                `FULL_NAME: optional, text, Real name (if known)\n` +
-                `GENDER: required, text, Gender (Male/Female/Other)\n` +
-                `DOB: required, text, Birth date\n` +
-                `HAIR: required, text, Hair color and style\n` +
-                `EYES: required, text, Eye color\n` +
-                `BUILD: required, text, Body build/physique\n` +
-                `PERSONALITY: required, text, Core traits and behavior patterns\n` +
-                `BACKGROUND: required, text, Their history and who they are\n` +
-                `// Auto-calculated fields (Level 1)\n` +
-                `LEVEL: formula, formula[1], Character level\n` +
-                `HP: formula, formula[100], Current health\n` +
-                `MAX_HP: formula, formula[100], Maximum health\n` +
-                `XP_MAX: formula, formula[400], Experience required for Level 2\n` +
-                `VITALITY: formula, formula[8+Math.floor(Math.random()*6)], Vitality\n` +
-                `STRENGTH: formula, formula[8+Math.floor(Math.random()*6)], Strength\n` +
-                `DEXTERITY: formula, formula[8+Math.floor(Math.random()*6)], Dexterity\n` +
-                `AGILITY: formula, formula[8+Math.floor(Math.random()*6)], Agility`
-            ),
-        });
-        
-        // Location Template
-        Utilities.storyCard.add({
-            title: '[GW Template] Location',
-            type: 'data',
-            entry: (
-                `<$# Locations>\n` +
-                `## **{{NAME}}**\n` +
-                `Type: {{LOCATION_TYPE}} | Terrain: {{TERRAIN}}\n` +
-                `**Description**\n` +
-                `{{DESCRIPTION}}\n` +
-                `**Pathways**\n` +
-                `{{PATHWAYS}}`
-            ),
-            description: (
-                `// Location Generation\n` +
-                `NAME: required, text, Location name (e.g., Dark_Forest, Mountain_Pass)\n` +
-                `LOCATION_TYPE: required, choice[Settlement|Safezone|Wilderness|Dungeon|Landmark|Ruins], Primary location type\n` +
-                `TERRAIN: required, text, Terrain type (e.g., Plains, Forest, Cobblestone Plaza, etc.)\n` +
-                `ATMOSPHERE: required, text, 2-3 words for inherent mood/vibe (e.g., "dark and ominous", "bustling and lively" - NOT current events/scene)\n` +
-                `DESCRIPTION: required, text, 2-3 sentences about the location's permanent characteristics (NOT current scene/events/people present)`
-            )
-        });
-        
-        // Quest Template
-        Utilities.storyCard.add({
-            title: '[GW Template] Quest',
-            type: 'data',
-            entry: (
-                `<\$# Quests><\$## Active Quests>\n` +
-                `## **{{NAME}}**\n` +
-                `Type: {{QUEST_TYPE}} | Giver: {{QUEST_GIVER}} | Current Stage: 0\n` +
-                `**Description**\n` +
-                `{{DESCRIPTION}}\n` +
-                `**Stages**\n` +
-                `{{STAGES}}\n` +
-                `**Rewards**\n` +
-                `{{REWARDS}}`
-            ),
-            description: (
-                `// Quest Generation\n` +
-                `NAME: predefined, text, Quest name from accept_quest\n` +
-                `QUEST_TYPE: predefined, text, Quest type from accept_quest\n` +
-                `QUEST_GIVER: predefined, text, Quest giver from accept_quest\n` +
-                `STAGE_COUNT: predefined, number, Number of stages from accept_quest\n` +
-                `DESCRIPTION: required, text, Quest story and context\n` +
-                `STAGES: batched, text, Quest objectives (collected separately)\n` +
-                `REWARDS: batched, text, Quest rewards (XP, Col, Items - collected together)`
-            )
-        });
-        
-        // Add other templates as needed...
-        
-        if (debug) console.log(`${MODULE_NAME}: Created default templates`);
-    }
-    
-    // ==========================
-    // Entity Classification Functions
-    // ==========================
-    
-    function generateEntityClassificationPrompt(progress) {
-        // Load entity tracker templates
-        const templatesCard = Utilities.storyCard.get('[RPG_RUNTIME] Entity Templates');
-        if (!templatesCard) {
-            return ''; // No templates configured
-        }
-        
-        // Get the appropriate query based on stage
-        const templates = parseEntityTemplates(templatesCard.entry);
-        const prompts = loadPrompts();
-        
-        if (progress.stage === 'classification') {
-            // First stage - classify the entity
-            const query = templates.CLASSIFICATION_QUERY || 
-                `Classify the entity "${progress.entityName}" that was just referenced:\n` +
-                `ENTITY_TYPE: [CHARACTER/MONSTER/BOSS/GROUP]\n` +
-                `FULL_NAME: [Complete name if different from "${progress.entityName}"]\n` +
-                `GENDER: [Male/Female/Other/Unknown]\n` +
-                `DESCRIPTION: [2-3 sentences about who/what this is]`;
-            
-            const prompt = prompts['Entity Classification'] || '';
-            return prompt.replace('{{CLASSIFICATION_QUERY}}', query.replace('{name}', progress.entityName));
-        } else if (progress.stage === 'details') {
-            // Second stage - get type-specific details
-            const entityType = progress.collectedData.ENTITY_TYPE;
-            const queryKey = `${entityType}_QUERY`;
-            const query = templates[queryKey] || '';
-            
-            const prompt = prompts['Entity Details'] || '';
-            return prompt.replace('{{DETAILS_QUERY}}', query.replace('{name}', progress.entityName));
-        } else if (progress.stage === 'player_specifics') {
-            // Third stage - for NPC_PLAYER only
-            const query = templates.PLAYER_SPECIFICS_QUERY || '';
-            const prompt = prompts['Entity Details'] || '';
-            return prompt.replace('{{DETAILS_QUERY}}', query.replace('{name}', progress.entityName));
-        }
-        
-        return '';
-    }
-    
-    function parseEntityTemplates(text) {
-        const templates = {};
-        const sections = text.split(/^#\s+/m).filter(s => s.trim());
-        
-        for (const section of sections) {
-            const lines = section.split('\n');
-            const key = lines[0].trim().replace(/\s+/g, '_').toUpperCase();
-            const content = lines.slice(1).join('\n').trim();
-            templates[key] = content;
-        }
-        
-        return templates;
-    }
-    
-    function handleEntityClassification(progress, text, config) {
-        const debug = config.debug;
-        
-        if (progress.stage === 'classification') {
-            // Parse classification response
-            const parsed = parseEntityClassificationResponse(text);
-            
-            if (parsed.ENTITY_TYPE) {
-                progress.collectedData = parsed;
-                progress.stage = 'details';
-                saveProgress(progress);
-                
-                if (debug) console.log(`${MODULE_NAME}: Entity classified as ${parsed.ENTITY_TYPE}`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-            } else {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse entity classification`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-            }
-        } else if (progress.stage === 'details') {
-            // Parse type-specific details
-            const entityType = progress.collectedData.ENTITY_TYPE;
-            const parsed = parseEntityDetailsResponse(text, entityType);
-            
-            // Merge with existing data
-            Object.assign(progress.collectedData, parsed);
-            
-            // Check if we need player specifics (for NPC_PLAYER)
-            if (entityType === 'CHARACTER' && parsed.TYPE === 'NPC_PLAYER') {
-                progress.stage = 'player_specifics';
-                saveProgress(progress);
-                
-                if (debug) console.log(`${MODULE_NAME}: Character is NPC_PLAYER, getting additional details`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-            } else {
-                // We have everything, create the entity
-                progress.completed = true;
-                saveProgress(progress);
-                
-                // Create the character using GameState
-                if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                    const characterData = transformEntityToCharacter(progress.collectedData, progress.triggerName || progress.entityName);
-                    GameState.createCharacter(characterData);
-                    
-                    // Signal completion to GameState
-                    if (GameState.completeEntityGeneration) {
-                        GameState.completeEntityGeneration(progress.entityName);
-                    }
-                }
-                
-                if (debug) console.log(`${MODULE_NAME}: Entity generation completed for ${progress.entityName}`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : COMPLETION_MESSAGE };
-            }
-        } else if (progress.stage === 'player_specifics') {
-            // Parse player-specific details
-            const parsed = parsePlayerSpecificsResponse(text);
-            
-            // Merge with existing data
-            Object.assign(progress.collectedData, parsed);
-            
-            // Create the entity
-            progress.completed = true;
-            saveProgress(progress);
-            
-            // Create the character using GameState
-            if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                const characterData = transformEntityToCharacter(progress.collectedData, progress.triggerName || progress.entityName);
-                GameState.createCharacter(characterData);
-                
-                // Signal completion to GameState
-                if (GameState.completeEntityGeneration) {
-                    GameState.completeEntityGeneration(progress.entityName);
-                }
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: Player character generation completed for ${progress.entityName}`);
-            return { active: true, text: config.debug ? wrapDebugOutput(text) : COMPLETION_MESSAGE };
-        }
-        
-        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-    }
-    
-    function parseEntityClassificationResponse(text) {
-        const result = {};
-        
-        // Parse each expected field
-        const typeMatch = text.match(/ENTITY_TYPE:\s*([A-Z_]+)/i);
-        if (typeMatch) result.ENTITY_TYPE = typeMatch[1].toUpperCase();
-        
-        const nameMatch = text.match(/FULL_NAME:\s*([^\n]+)/i);
-        if (nameMatch) result.FULL_NAME = nameMatch[1].trim();
-        
-        const genderMatch = text.match(/GENDER:\s*([^\n]+)/i);
-        if (genderMatch) result.GENDER = genderMatch[1].trim();
-        
-        const descMatch = text.match(/DESCRIPTION:\s*([^\n]+(?:\n[^\n]+)?)/i);
-        if (descMatch) result.DESCRIPTION = descMatch[1].trim();
-        
-        return result;
-    }
-    
-    function parseEntityDetailsResponse(text, entityType) {
-        const result = {};
-        
-        // Common fields
-        const levelMatch = text.match(/LEVEL:\s*(\d+)/i);
-        if (levelMatch) result.LEVEL = parseInt(levelMatch[1]);
-        
-        const locationMatch = text.match(/LOCATION:\s*([^\n]+)/i);
-        if (locationMatch) result.LOCATION = locationMatch[1].trim();
-        
-        const appearanceMatch = text.match(/APPEARANCE:\s*([^\n]+(?:\n[^\n]+)?)/i);
-        if (appearanceMatch) result.APPEARANCE = appearanceMatch[1].trim();
-        
-        // Type-specific parsing
-        if (entityType === 'CHARACTER') {
-            const typeMatch = text.match(/TYPE:\s*(NPC|NPC_PLAYER)/i);
-            if (typeMatch) result.TYPE = typeMatch[1].toUpperCase();
-            
-            const personalityMatch = text.match(/PERSONALITY:\s*([^\n]+(?:\n[^\n]+)?)/i);
-            if (personalityMatch) result.PERSONALITY = personalityMatch[1].trim();
-            
-            const backgroundMatch = text.match(/BACKGROUND:\s*([^\n]+(?:\n[^\n]+)?)/i);
-            if (backgroundMatch) result.BACKGROUND = backgroundMatch[1].trim();
-            
-            const skillsMatch = text.match(/PRIMARY_SKILLS:\s*([^\n]+)/i);
-            if (skillsMatch) result.PRIMARY_SKILLS = skillsMatch[1].trim();
-            
-            const itemsMatch = text.match(/STARTING_ITEMS:\s*([^\n]+)/i);
-            if (itemsMatch) result.STARTING_ITEMS = itemsMatch[1].trim();
-            
-            const relMatch = text.match(/RELATIONSHIPS:\s*([^\n]+)/i);
-            if (relMatch) result.RELATIONSHIPS = relMatch[1].trim();
-        } else if (entityType === 'MONSTER' || entityType === 'BOSS') {
-            const abilitiesMatch = text.match(/ABILITIES:\s*([^\n]+(?:\n[^\n]+)?)/i);
-            if (abilitiesMatch) result.ABILITIES = abilitiesMatch[1].trim();
-            
-            const lootMatch = text.match(/LOOT:\s*([^\n]+)/i);
-            if (lootMatch) result.LOOT = lootMatch[1].trim();
-            
-            const weakMatch = text.match(/WEAKNESSES:\s*([^\n]+)/i);
-            if (weakMatch) result.WEAKNESSES = weakMatch[1].trim();
-            
-            if (entityType === 'BOSS') {
-                const phasesMatch = text.match(/PHASES:\s*(\d+)/i);
-                if (phasesMatch) result.PHASES = parseInt(phasesMatch[1]);
-                
-                const legendaryMatch = text.match(/LEGENDARY_ACTIONS:\s*([^\n]+)/i);
-                if (legendaryMatch) result.LEGENDARY_ACTIONS = legendaryMatch[1].trim();
-            }
-        }
-        
-        return result;
-    }
-    
-    function parsePlayerSpecificsResponse(text) {
-        const result = {};
-        
-        const dobMatch = text.match(/DOB:\s*(\d{4}-\d{2}-\d{2})/i);
-        if (dobMatch) result.DOB = dobMatch[1];
-        
-        const classMatch = text.match(/STARTING_CLASS:\s*([^\n]+)/i);
-        if (classMatch) result.STARTING_CLASS = classMatch[1].trim();
-        
-        const attrMatch = text.match(/ATTRIBUTE_FOCUS:\s*([^\n]+)/i);
-        if (attrMatch) result.ATTRIBUTE_FOCUS = attrMatch[1].trim();
-        
-        const skillMatch = text.match(/SKILL_SPECIALIZATION:\s*([^\n]+)/i);
-        if (skillMatch) result.SKILL_SPECIALIZATION = skillMatch[1].trim();
-        
-        const hooksMatch = text.match(/BACKSTORY_HOOKS:\s*([^\n]+(?:\n[^\n]+)?)/i);
-        if (hooksMatch) result.BACKSTORY_HOOKS = hooksMatch[1].trim();
-        
-        return result;
-    }
-    
-    function getPlayerLocation() {
-        // Use GameState's existing functions to get player location
-        if (typeof GameState !== 'undefined' && GameState.getPlayerName && GameState.get) {
-            const playerName = GameState.getPlayerName();
-            if (playerName) {
-                const location = GameState.get(`Character.${playerName}.info.location`);
-                return location || null;
-            }
-        }
-        return null;
-    }
-    
-    function transformEntityToCharacter(entityData, entityName) {
-        // Transform collected entity data into ECS component format for GameState
-        const characterData = {
-            name: entityData.FULL_NAME || entityName,
-            
-            // Display fields
-            gender: entityData.GENDER || 'Unknown',
-            appearance: entityData.APPEARANCE || '',
-            personality: entityData.PERSONALITY || '',
-            backstory: entityData.BACKGROUND || entityData.BACKSTORY || '',
-            
-            // Stats component with dot notation
-            'stats.level': parseInt(entityData.LEVEL) || 1,
-            'stats.hp.current': 100,
-            'stats.hp.max': 100,
-            'stats.xp.current': 0,
-            'stats.xp.max': 1000,
-            
-            // Info component
-            'info.location': entityData.LOCATION || getPlayerLocation() || 'unknown',
-            'info.faction': entityData.FACTION || null,
-            'info.trigger_name': entityName,  // Store the trigger name that caused generation
-            'info.generation_turn': info?.actionCount || 0,
-            
-            // Attributes component - set defaults with proper structure
-            attributes: {
-                VITALITY: { value: 10 },
-                STRENGTH: { value: 10 },
-                DEXTERITY: { value: 10 },
-                AGILITY: { value: 10 }
+
+    function evaluateEntityExpressions(entity) {
+        // Recursively evaluate all $() expressions in entity
+        // This runs BEFORE generation to compute initial values
+
+        if (!entity || typeof entity !== 'object') return;
+
+        // Create evaluation context with helper functions
+        const context = {
+            // Entity self-reference
+            ...entity,
+
+            // Helper functions from GameState
+            randomInt: function(min, max) {
+                return Math.floor(Math.random() * (max - min + 1)) + min;
             },
-            
-            // Initialize empty components
-            skills: {},
-            inventory: {},
-            relationships: {}
+            calculateXPRequired: function(level) {
+                return level * (level - 1) * 500;
+            },
+            calculateMaxHP: function(level) {
+                return 100 + (level - 1) * 10;
+            },
+            selectRandomSkills: function(count) {
+                // Select random skills from the registry if available
+                const registry = ["One_Handed_Sword", "Two_Handed_Sword", "Rapier", "Shield", "Parry",
+                                 "Battle_Healing", "Searching", "Tracking", "Hiding", "Night_Vision"];
+                const selected = {};
+                for (let i = 0; i < count && i < registry.length; i++) {
+                    const idx = Math.floor(Math.random() * registry.length);
+                    const skill = registry.splice(idx, 1)[0];
+                    selected[skill] = { level: 1, xp: { current: 0, max: 100 } };
+                }
+                return selected;
+            }
         };
-        
-        // Add DOB and class for player characters
-        if (entityData.TYPE === 'NPC_PLAYER') {
-            if (entityData.DOB) characterData.dob = entityData.DOB;
-            if (entityData.STARTING_CLASS) characterData.class = entityData.STARTING_CLASS;
-            characterData.isPlayer = true;
+
+        // First, handle $init expressions to merge initial data into components
+        for (const key in entity) {
+            if (entity.hasOwnProperty(key) && typeof entity[key] === 'object' && entity[key]['$init']) {
+                const initExpr = entity[key]['$init'];
+                if (typeof initExpr === 'string' && initExpr.includes('$(')) {
+                    const value = initExpr;
+                    if (value.startsWith('$(') && value.endsWith(')')) {
+                        try {
+                            const expression = value.slice(2, -1);
+                            const evalInContext = function(expr) {
+                                const { randomInt, selectRandomSkills } = context;
+                                return eval(expr);
+                            };
+
+                            const result = evalInContext(expression);
+                            if (result && typeof result === 'object') {
+                                // Merge the result into the component, preserving display and other metadata
+                                Object.assign(entity[key], result);
+                            }
+                            // Remove $init after processing
+                            delete entity[key]['$init'];
+
+                            if (debug) console.log(`${MODULE_NAME}: Initialized ${key} with ${initExpr}`);
+                        } catch (e) {
+                            if (debug) console.log(`${MODULE_NAME}: Failed to evaluate $init for ${key}: ${e.message}`);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Recursive evaluation until all expressions are resolved
+        let maxIterations = 10; // Safety limit to prevent infinite loops
+        let iteration = 0;
+        let lastEvaluatedCount = -1;
+
+        while (iteration < maxIterations) {
+            iteration++;
+
+            // Count expressions before evaluation
+            const beforeCount = countExpressions(entity);
+
+            if (beforeCount === 0) {
+                // No more expressions to evaluate
+                if (debug) console.log(`${MODULE_NAME}: All expressions evaluated after ${iteration - 1} iterations`);
+                break;
+            }
+
+            // Evaluate what we can
+            const evaluatedCount = evaluateObjectExpressions(entity, context);
+
+            if (debug) console.log(`${MODULE_NAME}: Iteration ${iteration}: Evaluated ${evaluatedCount} of ${beforeCount} expressions`);
+
+            // Update context with newly computed values
+            for (const key in entity) {
+                if (entity.hasOwnProperty(key)) {
+                    context[key] = entity[key];
+                }
+            }
+
+            // Check if we made progress
+            if (evaluatedCount === 0) {
+                // No progress made - remaining expressions have unresolvable dependencies
+                if (debug) {
+                    const remaining = countExpressions(entity);
+                    if (remaining > 0) {
+                        console.log(`${MODULE_NAME}: ${remaining} expressions could not be evaluated (missing dependencies)`);
+                    }
+                }
+                break;
+            }
+
+            lastEvaluatedCount = evaluatedCount;
+        }
+
+        if (iteration >= maxIterations) {
+            if (debug) console.log(`${MODULE_NAME}: Hit maximum iteration limit (${maxIterations})`);
+        }
+    }
+
+    // Count how many $() expressions exist in an object
+    function countExpressions(obj, skipMeta = true) {
+        if (!obj || typeof obj !== 'object') return 0;
+
+        let count = 0;
+
+        for (const key in obj) {
+            if (!obj.hasOwnProperty(key)) continue;
+
+            // Skip metadata
+            if (skipMeta && (key === 'display' || key === 'promptTemplate' || key === 'generationwizard')) continue;
+
+            const value = obj[key];
+
+            if (typeof value === 'string' && value.includes('$(') && value.startsWith('$(') && value.endsWith(')')) {
+                count++;
+            } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+                count += countExpressions(value, skipMeta);
+            }
+        }
+
+        return count;
+    }
+
+    function evaluateObjectExpressions(obj, context) {
+        if (!obj || typeof obj !== 'object') return 0;
+
+        let evaluatedCount = 0;
+
+        for (const key in obj) {
+            if (!obj.hasOwnProperty(key)) continue;
+
+            const value = obj[key];
+
+            // Skip display rules and other metadata
+            if (key === 'display' || key === 'promptTemplate' || key === 'generationwizard') continue;
+
+            if (typeof value === 'string' && value.includes('$(')) {
+                try {
+                    // Check if entire value is an expression
+                    if (value.startsWith('$(') && value.endsWith(')')) {
+                        // Extract expression without $( and )
+                        const expression = value.slice(2, -1);
+
+                        // Create a scoped eval with context variables
+                        const evalInContext = function(expr) {
+                            // Destructure context to make variables available
+                            const { stats, info, attributes, inventory, skills,
+                                    randomInt, calculateXPRequired, calculateMaxHP, selectRandomSkills } = context;
+
+                            // Direct eval with all context available
+                            try {
+                                return eval(expr);
+                            } catch (e) {
+                                // If eval fails, return undefined to skip
+                                return undefined;
+                            }
+                        };
+
+                        const result = evalInContext(expression);
+
+                        if (result !== undefined) {
+                            obj[key] = result;
+                            evaluatedCount++;
+                            if (debug) console.log(`${MODULE_NAME}: Evaluated ${key}: ${value} -> ${obj[key]}`);
+                        }
+                    }
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to evaluate expression in ${key}: ${value} - ${e.message}`);
+                }
+            } else if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
+                // Recurse into nested objects
+                evaluatedCount += evaluateObjectExpressions(value, context);
+            }
+        }
+
+        return evaluatedCount;
+    }
+
+    // ==========================
+    // Response Processing
+    // ==========================
+
+    // Build prompt from embedded generationwizard component
+    function preparePromptFromComponent(entity) {
+        if (!entity || !entity.generationwizard) return null;
+
+        try {
+            // Use entity's own generation object - self-contained component
+            const activeGen = entity.generationwizard?.activeGeneration || 'initial';
+            const generation = entity.generationwizard?.generations?.[activeGen];
+
+            if (!generation) {
+                if (debug) console.log(`${MODULE_NAME}: No generation object '${activeGen}' in entity`);
+                return null;
+            }
+
+            if (debug) {
+                console.log(`${MODULE_NAME}: Building prompt for entity: ${entity.id}`);
+                console.log(`${MODULE_NAME}: Active generation: ${activeGen}`);
+                console.log(`${MODULE_NAME}: Generation object has promptTemplate: ${!!generation.promptTemplate}`);
+                if (!generation.promptTemplate) {
+                    console.log(`${MODULE_NAME}: Generation object structure:`, JSON.stringify(generation, null, 2).substring(0, 500));
+                }
+            }
+
+            // Compile prompt from entity's self-contained generation
+            const compiledPrompt = compileGenerationPrompt(entity, generation);
+
+            if (debug) {
+                console.log(`${MODULE_NAME}: Compiled prompt length: ${compiledPrompt ? compiledPrompt.length : 0}`);
+                if (compiledPrompt && compiledPrompt.length < 1000) {
+                    console.log(`${MODULE_NAME}: Compiled prompt preview:`, compiledPrompt.substring(0, 500));
+                }
+            }
+
+            return compiledPrompt;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error preparing prompt: ${e.message}`);
+            return null;
+        }
+    }
+
+    function processResponse(responseText) {
+        // Process AI response for field collection
+        // Returns: 'completed', true, or false
+        const activeGen = findActiveGenerator();
+        if (!activeGen) {
+            if (debug) console.log(`${MODULE_NAME}: No active generation to process`);
+            return false;
+        }
+
+        try {
+            const entity = activeGen.entity;
+            const tempEntityId = activeGen.entityId;
+            const genComponent = entity.generationwizard;
+            const activeGenName = genComponent.activeGeneration || 'initial';
+            const generation = genComponent.generations?.[activeGenName];
+
+            if (!generation) {
+                console.log(`${MODULE_NAME}: No active generation object found`);
+                return false;
+            }
+
+            if (debug) console.log(`${MODULE_NAME}: Processing response for generation '${activeGenName}'`);
+
+            // Get expected fields from the generation object
+            const expectedKeys = [];
+            const keyToFieldMap = {}; // Map from KEY to field name
+            const collectedFields = entity.generationwizard?.fields_collected || {};
+
+            if (generation.fields) {
+                for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                    // Check if field has already been collected in the entity's fields_collected
+                    if (!collectedFields[fieldName]) {
+                        const key = fieldDef.key || fieldName.toUpperCase();
+                        expectedKeys.push(key);
+                        keyToFieldMap[key] = fieldName;
+                    }
+                }
+            }
+
+            if (expectedKeys.length === 0) {
+                if (debug) console.log(`${MODULE_NAME}: All fields collected`);
+                return 'completed';
+            }
+
+            // Debug the expectedKeys structure
+            if (debug) {
+                console.log(`${MODULE_NAME}: expectedKeys type:`, typeof expectedKeys);
+                console.log(`${MODULE_NAME}: expectedKeys isArray:`, Array.isArray(expectedKeys));
+                console.log(`${MODULE_NAME}: expectedKeys content:`, JSON.stringify(expectedKeys));
+            }
+            if (debug) console.log(`${MODULE_NAME}: Still need fields: ${expectedKeys.join(', ')}`);
+            if (debug) console.log(`${MODULE_NAME}: Response preview:`, responseText.substring(0, 200));
+
+            const parsedValues = parseMultipleKeyValues(responseText, expectedKeys);
+
+            if (debug) {
+                console.log(`${MODULE_NAME}: Parsed values:`, JSON.stringify(parsedValues));
+            }
+
+            if (Object.keys(parsedValues).length === 0) {
+                console.log(`${MODULE_NAME}: Failed to parse any fields from response`);
+                console.log(`${MODULE_NAME}: Expected: ${expectedKeys.join(', ')}`);
+                return false;
+            }
+
+            // Process each parsed field
+            if (debug) console.log(`${MODULE_NAME}: Processing ${Object.keys(parsedValues).length} parsed fields`);
+            for (const [parsedKey, value] of Object.entries(parsedValues)) {
+                // Skip numeric keys or single character keys (parsing artifacts)
+                if (/^\d+$/.test(parsedKey) || parsedKey.length === 1) {
+                    if (debug) console.log(`${MODULE_NAME}: Skipping invalid field key: ${parsedKey}`);
+                    continue;
+                }
+
+                // Map the parsed KEY back to the field name
+                const fieldName = keyToFieldMap[parsedKey] || parsedKey.toLowerCase();
+
+                // Get field definition from generation object
+                const fieldDef = generation.fields?.[fieldName];
+                if (!fieldDef) {
+                    if (debug) console.log(`${MODULE_NAME}: No field mapping for key '${parsedKey}' (mapped to '${fieldName}')`);
+                    continue;
+                }
+
+                // Field validation - run validation function if defined
+                if (fieldDef.validation) {
+                    let validationResult = true;
+                    let validationMessage = '';
+
+                    // Handle different validation types
+                    if (typeof fieldDef.validation === 'string') {
+                        // Built-in validation type
+                        if (fieldDef.validation === 'unique_entity_id') {
+                            // Check if entity ID already exists
+                            const entityId = value.replace(/\s+/g, '_');
+                            const existingEntity = GameState.get(entityId);
+                            if (existingEntity && existingEntity.id && existingEntity.id !== tempEntityId &&
+                                (existingEntity.aliases || existingEntity.GameplayTags || existingEntity.components)) {
+                                validationResult = false;
+                                validationMessage = `Entity '${value}' already exists`;
+                            }
+                        }
+                    } else if (typeof fieldDef.validation === 'function') {
+                        // Custom validation function
+                        try {
+                            validationResult = fieldDef.validation(value, entity, GameState);
+                            if (validationResult !== true && typeof validationResult === 'string') {
+                                validationMessage = validationResult;
+                                validationResult = false;
+                            }
+                        } catch (e) {
+                            console.log(`${MODULE_NAME}: Validation function error: ${e.message}`);
+                            validationResult = false;
+                            validationMessage = 'Validation error';
+                        }
+                    }
+
+                    // If validation failed, don't store the field
+                    if (!validationResult) {
+                        console.log(`${MODULE_NAME}: Validation failed for ${fieldName}: ${validationMessage}`);
+
+                        // Track rejected values (useful for debugging and avoiding re-suggestions)
+                        const rejectedPath = `${tempEntityId}.generationwizard.rejected_${fieldName}`;
+                        let rejectedValues = GameState.get(rejectedPath) || [];
+                        if (!rejectedValues.includes(value)) {
+                            rejectedValues.push(value);
+                            GameState.set(rejectedPath, rejectedValues);
+                        }
+
+                        // Skip storing this field - it will be re-requested
+                        continue;
+                    }
+                }
+
+                // Apply field to entity AFTER collision check
+                if (fieldDef.maps_to) {
+                    // Apply to entity using maps_to pattern
+                    const success = applyMapsTo(tempEntityId, fieldDef.maps_to, value);
+                    if (success) {
+                        if (debug) console.log(`${MODULE_NAME}: Applied ${fieldName} = ${value} to ${fieldDef.maps_to}`);
+                    } else {
+                        console.log(`${MODULE_NAME}: Failed to apply ${fieldName} to ${fieldDef.maps_to}`);
+                    }
+                }
+
+                // Track this field as collected in generationwizard
+                const gwPath = `${tempEntityId}.generationwizard.fields_collected.${fieldName}`;
+                GameState.set(gwPath, value);
+                if (debug) console.log(`${MODULE_NAME}: Stored ${fieldName} = ${value} in fields_collected`);
+            }
+
+            // Check if we should finalize - need to have collected all required fields
+            if (debug) console.log(`${MODULE_NAME}: Checking if ready to finalize entity ${tempEntityId}`);
+            const updatedEntity = GameState.get(tempEntityId);
+
+            // Entities always have an ID - that's what matters for finalization
+            // Check if all required fields have been collected
+            // Use the generation.fields from entity's generationwizard component
+            const generationFields = generation.fields;
+            if (generationFields) {
+                // Find all required fields from the generation
+                const requiredFields = [];
+                for (const [fieldName, fieldDef] of Object.entries(generationFields)) {
+                    // All fields are required unless they come from a tool
+                    // Skip tool-provided fields (those would have source: 'tool')
+                    if (fieldDef.source !== 'tool') {
+                        requiredFields.push(fieldName);
+                    }
+                }
+
+                // Check if all required fields have been collected
+                const collectedFieldsCheck = updatedEntity.generationwizard?.fields_collected || {};
+
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Required fields:`, requiredFields);
+                    console.log(`${MODULE_NAME}: Collected fields:`, Object.keys(collectedFieldsCheck));
+                }
+
+                const missingFields = requiredFields.filter(fieldName => !collectedFieldsCheck[fieldName]);
+
+                if (missingFields.length > 0) {
+                    if (debug) console.log(`${MODULE_NAME}: Still need fields: ${missingFields.join(', ')}`);
+                    return true; // More fields to collect
+                }
+            }
+
+            // All required fields collected, finalize the entity
+            const finalName = updatedEntity?.info?.displayname || updatedEntity?.id || tempEntityId;
+            if (debug) console.log(`${MODULE_NAME}: All fields collected, finalizing as: ${finalName}`);
+            finalizeEntity(updatedEntity, { tempEntityId });
+
+            // Activate next queued entity after this one completes
+            activateNextGenerator();
+
+            return 'completed';
+        } catch (e) {
+            console.log(`${MODULE_NAME}: Error processing response: ${e.message}`);
+            console.log(`${MODULE_NAME}: Stack trace:`, e.stack);
+            return false;
+        }
+    }
+
+    function parseMultipleKeyValues(text, expectedKeys) {
+        // Parse multiple KEY: value pairs from response with improved edge case handling
+        const results = {};
+
+        if (!text || !expectedKeys) {
+            return results;
+        }
+
+        // Ensure expectedKeys is an array
+        if (!Array.isArray(expectedKeys)) {
+            console.log(`${MODULE_NAME}: ERROR - expectedKeys is not an array:`, typeof expectedKeys, expectedKeys);
+            return results;
+        }
+
+        if (expectedKeys.length === 0) {
+            return results;
+        }
+
+        // Try different parsing strategies
+        for (const strategy of PARSER_CONFIG.strategies) {
+            const parsed = parseWithStrategy(text, expectedKeys, strategy);
+            if (Object.keys(parsed).length > 0) {
+                // Merge results, prioritizing new findings
+                Object.assign(results, parsed);
+            }
+        }
+
+        return results;
+    }
+
+    function parseWithStrategy(text, expectedKeys, strategy) {
+        const results = {};
+
+        // Safety check - ensure expectedKeys is an array
+        if (!Array.isArray(expectedKeys)) {
+            console.log(`${MODULE_NAME}: ERROR in parseWithStrategy - expectedKeys is not an array`);
+            return results;
+        }
+
+        if (debug) {
+            console.log(`${MODULE_NAME}: Trying strategy: ${strategy}`);
+            console.log(`${MODULE_NAME}: Text to parse (first 100 chars): ${text.substring(0, 100)}`);
+        }
+
+        switch (strategy) {
+            case 'keyValue':
+                // Standard KEY: value parsing with multiple patterns
+                for (const pattern of PARSER_CONFIG.keyValuePatterns) {
+                    const lines = text.split('\n');
+                    let currentKey = null;
+                    let currentValue = [];
+
+                    for (const line of lines) {
+                        // Check if this line starts with an expected key
+                        let foundKey = null;
+                        for (const key of expectedKeys) {
+                            // Try exact match for this key
+                            const keyPattern = `^\\s*${key}:\\s*(.+)$`;
+                            const exactRegex = new RegExp(keyPattern, 'i');
+                            const match = line.match(exactRegex);
+                            if (match) {
+                                // Save previous key-value if exists
+                                if (currentKey) {
+                                    results[currentKey] = currentValue.join('\n').trim();
+                                }
+                                // Start new key-value
+                                foundKey = key;
+                                currentKey = key;
+                                currentValue = [match[1] || ''];
+                                break;
+                            }
+                        }
+
+                        // If no key found and we're collecting a value, append to current
+                        if (!foundKey && currentKey) {
+                            // Check for multi-line value continuation
+                            if (line.trim() && !line.match(/^[A-Z_]+[:=]/)) {
+                                currentValue.push(line);
+                            }
+                        }
+                    }
+
+                    // Save last key-value
+                    if (currentKey) {
+                        results[currentKey] = currentValue.join('\n').trim();
+                    }
+                }
+                break;
+
+            case 'json':
+                // Try to parse as JSON-like structure
+                try {
+                    // Extract JSON blocks from text (handle malformed JSON)
+                    let jsonText = text;
+
+                    // Try to find a JSON-like structure
+                    const jsonMatch = jsonText.match(/\{[\s\S]*\}/);
+                    if (!jsonMatch) break;
+
+                    jsonText = jsonMatch[0];
+
+                    // Fix common JSON issues
+                    // Remove trailing commas before } or ]
+                    jsonText = jsonText.replace(/,(\s*[}\]])/g, '$1');
+                    // Fix empty values (like "inventory":,)
+                    jsonText = jsonText.replace(/:,/g, ':null,');
+                    jsonText = jsonText.replace(/:\s*,/g, ':null,');
+                    // Fix trailing : at end of object
+                    jsonText = jsonText.replace(/:(\s*})/g, ':null$1');
+
+                    // Handle incomplete JSON - if it doesn't end with }, try to close it
+                    if (!jsonText.trim().endsWith('}')) {
+                        // Check if we're in the middle of a string value
+                        const lastQuoteIndex = jsonText.lastIndexOf('"');
+                        const lastColonIndex = jsonText.lastIndexOf(':');
+
+                        if (lastColonIndex > lastQuoteIndex) {
+                            // We're after a colon, might be missing the value
+                            jsonText += 'null}';
+                        } else {
+                            // We're probably in the middle of a string, close it
+                            jsonText += '"}';
+                        }
+
+                        // Count open braces and close any remaining
+                        const openBraces = (jsonText.match(/\{/g) || []).length;
+                        const closeBraces = (jsonText.match(/\}/g) || []).length;
+                        jsonText += '}'.repeat(Math.max(0, openBraces - closeBraces));
+                    }
+
+                    const parsed = JSON.parse(jsonText);
+
+                    // Try case-insensitive matching for each expected key
+                    for (const expectedKey of expectedKeys) {
+                        // Skip wildcard keys for JSON parsing
+                        if (expectedKey.includes('*')) continue;
+
+                        // Look for exact match first
+                        if (parsed[expectedKey] !== undefined) {
+                            results[expectedKey] = String(parsed[expectedKey]);
+                            continue;
+                        }
+
+                        // Try lowercase version
+                        const lowerKey = expectedKey.toLowerCase();
+                        if (parsed[lowerKey] !== undefined) {
+                            results[expectedKey] = String(parsed[lowerKey]);
+                            continue;
+                        }
+
+                        // Try with underscores removed
+                        const noUnderscoreKey = lowerKey.replace(/_/g, '');
+                        if (parsed[noUnderscoreKey] !== undefined) {
+                            results[expectedKey] = String(parsed[noUnderscoreKey]);
+                            continue;
+                        }
+                    }
+                } catch (e) {
+                    // Not valid JSON or couldn't be fixed, skip
+                    if (debug) console.log(`${MODULE_NAME}: JSON parse error: ${e.message}`);
+                }
+                break;
+
+            case 'fuzzy':
+                // Fuzzy matching for keys with variations
+                const lines = text.split('\n');
+                for (const key of expectedKeys) {
+                    // Create variations of the key
+                    const variations = [
+                        key,
+                        key.toLowerCase(),
+                        key.replace(/_/g, ' '),
+                        key.replace(/_/g, ''),
+                        // Convert snake_case to Title Case
+                        key.split('_').map(w => w.charAt(0) + w.slice(1).toLowerCase()).join(' ')
+                    ];
+
+                    for (const line of lines) {
+                        for (const variant of variations) {
+                            const fuzzyRegex = new RegExp(`\\b${variant}\\b[:\\s=]+(.+)`, 'i');
+                            const match = line.match(fuzzyRegex);
+                            if (match && !results[key]) {
+                                results[key] = match[1].trim();
+                                break;
+                            }
+                        }
+                    }
+                }
+                break;
+        }
+
+        return results;
+    }
+
+    // Entity Lifecycle Management
+    // =============================================================================
+    // PURPOSE: Manage entity creation through generationwizard component lifecycle
+    //
+    // ENTITY STATES WITH generationwizard COMPONENT:
+    // {
+    //   "TempNPC_12345": {
+    //     "aliases": ["TempNPC_12345"],
+    //     "GameplayTags": ["Character.NPC"],
+    //     "components": ["generationwizard", "info", "stats"],
+    //     "generationwizard": {
+    //       "blueprint": "npc",
+    //       "stage": "collecting_fields",
+    //       "fields_collected": {
+    //         "NAME": "Argo",
+    //         "CLASS": "Information_Broker"  // From tool
+    //       },
+    //       "fields_needed": ["GENDER", "PERSONALITY", "BACKGROUND"],
+    //       "trigger": "gw_npc_12345"
+    //     }
+    //   }
+    // }
+    //
+    // DETAILED LIFECYCLE STAGES:
+    //
+    // 1. INITIALIZATION (Tool invocation → Temp entity):
+    //    a. Tool called: gw_npc("Argo", "Information_Broker", "Town")
+    //    b. Generate temp ID: `TempNPC_${Date.now()}`
+    //    c. Load [SANE:BP] blueprint for "npc" type
+    //    d. Create base entity structure from blueprint.template
+    //    e. Add generationwizard component with:
+    //       - blueprint: "npc"
+    //       - stage: "collecting_fields"
+    //       - trigger: original trigger name
+    //    f. Process tool-provided fields (source: "tool"):
+    //       - Find fields where source="tool" in blueprint
+    //       - Apply values using maps_to patterns
+    //       - Mark as collected in generationwizard
+    //
+    // 2. PROMPT GENERATION & COLLECTION:
+    //    a. Identify fields still needed from generation object
+    //    b. Use embedded promptTemplate from blueprint
+    //    c. Evaluate conditional limits for wildcard fields:
+    //       - If TYPE="Story", stages limit = 5
+    //       - If TYPE="Side", stages limit = 3
+    //    d. Expand iterations in template:
+    //       - {@stages:STAGE_{i}:} → "STAGE_1: STAGE_2: STAGE_3:"
+    //    e. Apply conditionals based on collected fields:
+    //       - {NAME?Name\: {NAME}:} → "Name: Argo" or ""
+    //    f. Send prompt to LLM and parse response
+    //
+    // 3. FIELD APPLICATION (Progressive updates):
+    //    a. For each field in LLM response:
+    //       - Parse value using field.parser
+    //       - Apply transformation if field.transformer exists
+    //       - Use maps_to pattern to determine path
+    //    b. Example: GENDER field
+    //       - maps_to: "*.info.gender"
+    //       - Replace * with "TempNPC_12345"
+    //       - GameState.set("TempNPC_12345.info.gender", "Female")
+    //    c. Handle wildcard fields:
+    //       - SKILL_1: "Linear" → skills.Linear = {level: 1, xp: {}}
+    //       - REWARD_1: "Col x50" → inventory.Col = {quantity: 50}
+    //    d. Execute @generate directives:
+    //       - Find Library.functionName
+    //       - Call with entity context
+    //       - Apply returned values
+    //
+    // 4. FINALIZATION (Temp → Permanent):
+    //    a. Verify all required fields collected
+    //    b. Remove generationwizard component
+    //    c. Extract final name from NAME field (aliases[0])
+    //    d. Attempt rename: GameState.renameEntity(tempId, finalName)
+    //    e. If name taken, append number: "Argo_2"
+    //    f. Add display component (triggers [SANE:E] storage)
+    //    g. GameState.save() automatically routes to correct storage
+    //
+    // STORAGE ROUTING:
+    // - Has display component → [SANE:E] EntityName
+    // - No display component → [SANE:D] Data~~N~~
+    // - Automatic via GameState.save()
+    // =============================================================================
+
+    function finalizeEntity(entity, metadata) {
+        // Entity is already loaded, metadata has tempEntityId
+        const tempEntityId = metadata.tempEntityId;
+        if (!tempEntityId) {
+            console.log(`${MODULE_NAME}: Cannot finalize - no temp entity ID`);
+            return false;
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Finalizing entity ${tempEntityId}`);
+
+        // Apply collected fields to the entity
+        const collectedFields = entity.generationwizard?.fields_collected || {};
+        const generation = entity.generationwizard?.generations?.initial;
+
+        if (generation?.fields) {
+            for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                let collectedValue = collectedFields[fieldName];
+                if (collectedValue !== undefined && fieldDef.path) {
+                    // Type conversion for numeric fields
+                    if (fieldDef.path.includes('rewards.xp') ||
+                        fieldDef.path.includes('rewards.col') ||
+                        fieldDef.path.includes('.value') ||
+                        fieldDef.path.includes('.quantity')) {
+                        const numValue = parseInt(collectedValue, 10);
+                        if (!isNaN(numValue)) {
+                            collectedValue = numValue;
+                        }
+                    }
+
+                    // Special handling for itemList type - parse "item_name x qty" format
+                    if (fieldDef.specialType === 'itemList') {
+                        if (collectedValue && collectedValue.toLowerCase() !== 'null' && collectedValue.trim() !== '') {
+                            const itemsObject = {};
+                            const itemPairs = collectedValue.split(',');
+                            for (const pair of itemPairs) {
+                                // Match "item_name x quantity" format
+                                const match = pair.trim().match(/^(.+?)\s*x\s*(\d+)$/i);
+                                if (match) {
+                                    const itemName = match[1].trim();
+                                    const quantity = parseInt(match[2], 10);
+                                    if (itemName && !isNaN(quantity)) {
+                                        itemsObject[itemName] = { quantity };
+                                    }
+                                }
+                            }
+                            collectedValue = itemsObject;
+                        } else {
+                            // If null or empty, keep the empty object
+                            collectedValue = {};
+                        }
+                    }
+
+
+                    // Apply the collected value to the entity
+                    GameState.set(`${tempEntityId}.${fieldDef.path}`, collectedValue);
+                    if (debug) console.log(`${MODULE_NAME}: Applied ${fieldName} = ${JSON.stringify(collectedValue)} to ${fieldDef.path}`);
+                }
+            }
+        }
+
+
+        // Extract final name from multiple possible sources
+        // Priority: fields_collected displayname > aliases[0] > info.displayname
+        let finalName = entity.generationwizard?.fields_collected?.displayname ||
+                       entity.generationwizard?.fields_collected?.username ||
+                       entity.generationwizard?.fields_collected?.USERNAME ||
+                       entity.generationwizard?.fields_collected?.name ||
+                       entity.generationwizard?.fields_collected?.NAME;
+
+        if (!finalName && entity.aliases && entity.aliases[0]) {
+            finalName = entity.aliases[0];
+        }
+
+        if (!finalName && entity.info?.displayname) {
+            finalName = entity.info.displayname;
+        }
+
+        if (!finalName && entity.info?.username) {
+            finalName = entity.info.username;
+        }
+
+        if (!finalName && entity.info?.name) {
+            finalName = entity.info.name;
+        }
+
+        if (!finalName) {
+            console.log(`${MODULE_NAME}: No name found for entity, using default`);
+            finalName = 'Unknown_' + Date.now();
+        }
+
+        // Convert spaces to underscores for entity ID
+        const entityId = finalName.replace(/\s+/g, '_');
+
+        // Use finalization to remove generationwizard and rename
+        const result = finalizeEntityCreation(tempEntityId, entityId);
+        if (result) {
+            // Show completion message
+            if (state) {
+                state.message = `✅ Created entity: ${result}`;
+            }
+            console.log(`${MODULE_NAME}: Successfully created entity: ${result}`);
+
+            // Clear the in-progress card
+            Utilities.storyCard.remove(CARD_PREFIXES.inProgress);
+        }
+        return result;
+    }
+
+    // ==========================
+    // Command Handling
+    // ==========================
+
+    function handleCommand(command, params) {
+        // Process /GW commands
+        switch(command.toLowerCase()) {
+            case 'status':
+                return showStatus();
+
+            case 'abort':
+            case 'cancel':
+                return abortGeneration();
+
+            case 'debug':
+                debug = !debug;
+                return `Debug mode ${debug ? 'enabled' : 'disabled'}`;
+
+            case 'clear':
+                const queue = loadQueue();
+                const cleared = queue.length;
+                saveQueue([]);
+                return `Queue cleared (${cleared} items removed)`;
+
+            default:
+                return `Unknown command: ${command}\nAvailable: status, abort, debug, clear`;
+        }
+    }
+
+    function showStatus() {
+        // Display generation queue status
+        const status = getQueueStatus();
+        let output = '# Generation Status\n\n';
+
+        if (status.inProgress) {
+            output += `## Currently Generating\n`;
+            output += `- Blueprint: ${status.inProgress.type}\n`;
+            output += `- Entity ID: ${status.inProgress.triggerName}\n`;
+            output += `- Stage: ${status.inProgress.progress}\n\n`;
         } else {
-            characterData.isPlayer = false;
+            output += `## No generation in progress\n\n`;
         }
-        
-        // Parse skills
-        if (entityData.PRIMARY_SKILLS) {
-            characterData.skills = {};
-            const skills = entityData.PRIMARY_SKILLS.split(',').map(s => s.trim());
-            for (const skill of skills) {
-                const skillKey = skill.toLowerCase().replace(/\s+/g, '_');
-                characterData.skills[skillKey] = {
-                    level: 1,
-                    xp: { current: 0, max: 100 }
-                };
-            }
-        }
-        
-        // Parse items
-        if (entityData.STARTING_ITEMS) {
-            characterData.inventory = {};
-            const items = entityData.STARTING_ITEMS.split(',').map(s => s.trim());
-            for (const item of items) {
-                const itemKey = item.toLowerCase().replace(/\s+/g, '_');
-                characterData.inventory[itemKey] = { quantity: 1 };
-            }
-        }
-        
-        // Parse relationships
-        if (entityData.RELATIONSHIPS) {
-            characterData.relationships = {};
-            // Simple parsing - could be enhanced
-            const rels = entityData.RELATIONSHIPS.split(',').map(s => s.trim());
-            for (const rel of rels) {
-                if (rel && rel !== 'None') {
-                    const relKey = rel.toLowerCase().replace(/\s+/g, '_');
-                    characterData.relationships[relKey] = 'neutral';
-                }
-            }
-        }
-        
-        return characterData;
-    }
-    
-    // ==========================
-    // Hook Processing / API Mode
-    // ==========================
-    
-    // Auto-initialize API methods on first call
-    if (!GenerationWizard.isActive) {
-        // Set up all public API methods
-        GenerationWizard.isActive = isGenerationActive;
-        GenerationWizard.shouldTakeControl = shouldTakeControl;
-        
-        GenerationWizard.startGeneration = function(entityType, initialData = {}) {
-            if (isGenerationActive()) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return false;
-            }
-            
-            // Special handling for 'Entity' - it's a branching path
-            if (entityType === 'Entity') {
-                const progress = {
-                    entityType: 'Entity',
-                    collectedData: {},
-                    templateFields: null,
-                    completed: false,
-                    currentBatch: null,
-                    branchResolved: false,
-                    startTurn: info?.actionCount || 0
-                };
-                
-                saveProgress(progress);
-                if (debug) console.log(`${MODULE_NAME}: Started Entity branching generation`);
-                return true;
-            }
-            
-            // Load the specific template
-            const template = loadTemplate(entityType);
-            if (!template) {
-                if (debug) console.log(`${MODULE_NAME}: No template for ${entityType}`);
-                return false;
-            }
-            
-            let templateFields = parseTemplateFields(template.description);
-            
-            // Handle predefined fields from initialData for any entity type
-            if (initialData && Object.keys(initialData).length > 0) {
-                // Remove fields we already have values for
-                templateFields = templateFields.filter(field => {
-                    // Skip if this field was predefined
-                    if (field.requirement === 'predefined') {
-                        return false;
-                    }
-                    // Skip if we already have a value for this field
-                    if (initialData.hasOwnProperty(field.name)) {
-                        if (debug) console.log(`${MODULE_NAME}: Skipping ${field.name} - already provided`);
-                        return false;
-                    }
-                    return true;
-                });
-            }
-            
-            if (templateFields.length === 0 && entityType !== 'Quest') {
-                if (debug) console.log(`${MODULE_NAME}: Empty template for ${entityType}`);
-                return false;
-            }
-            
-            // Store trigger name separately if it exists
-            const collectedData = { ...initialData };
-            let triggerName = null;
-            if (collectedData.name) {
-                triggerName = collectedData.name;
-                delete collectedData.name; // Remove from collected data to avoid confusion
-            }
-            
-            // Pre-fill default values for optional fields
-            for (const field of templateFields) {
-                if (field.requirement === 'optional' && field.type === 'default' && field.params) {
-                    if (!collectedData.hasOwnProperty(field.name)) {
-                        collectedData[field.name] = field.params;
-                        if (debug) console.log(`${MODULE_NAME}: Set default for ${field.name}: ${field.params}`);
-                    }
-                }
-            }
-            
-            // Initialize progress - initialData already contains the predefined values
-            const progress = {
-                entityType: entityType,
-                triggerName: triggerName, // Store the original trigger name
-                collectedData: collectedData,
-                templateFields: templateFields,
-                completed: false,
-                currentBatch: null,
-                branchResolved: true,
-                startTurn: info?.actionCount || 0,
-                // Quest-specific fields
-                stageCollection: entityType === 'Quest' ? {
-                    stageCount: initialData?.STAGE_COUNT || 3,
-                    stages: {}
-                } : null,
-                expectingQuestBatch: entityType === 'Quest'
-            };
-            
-            saveProgress(progress);
-            if (debug) console.log(`${MODULE_NAME}: Started ${entityType} generation`);
-            return true;
-        };
-        
-        GenerationWizard.cancelGeneration = function() {
-            if (!isGenerationActive()) return false;
-            clearProgress();
-            return true;
-        };
-        
-        GenerationWizard.process = function(hook, text) {
-            if (!isGenerationActive()) return { active: false };
-            return processGeneration(hook, text);
-        };
-        
-        GenerationWizard.startQuestGeneration = function(questName, questGiver, questType, stageCount) {
-            if (!questName || !questGiver || !questType || !stageCount) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest parameters - missing required fields`);
-                return false;
-            }
-            
-            // Validate stage count (minimum 2)
-            stageCount = parseInt(stageCount);
-            if (isNaN(stageCount) || stageCount < 2) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid stage count: ${stageCount} (minimum 2 required)`);
-                return false;
-            }
-            
-            // Load valid quest types from schema
-            let validTypes = ['story', 'side', 'hidden', 'raid']; // Default fallback
-            
-            if (typeof Utilities !== 'undefined') {
-                const questSchema = Utilities.storyCard.get('[RPG_SCHEMA] Quest Types');
-                if (questSchema && questSchema.value) {
-                    const parsed = Utilities.config.load('[RPG_SCHEMA] Quest Types');
-                    validTypes = Object.keys(parsed).map(type => type.toLowerCase());
-                }
-            }
-            
-            // Validate quest type - expect lowercase
-            if (!validTypes.includes(questType)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType}. Valid types: ${validTypes.join(', ')}`);
-                return false;
-            }
-            
-            // Start generation with predefined values
-            return GenerationWizard.startGeneration('Quest', {
-                NAME: questName,
-                QUEST_TYPE: questType,  // Pass through as lowercase
-                QUEST_GIVER: questGiver,
-                STAGE_COUNT: stageCount
+
+        if (status.queued.length > 0) {
+            output += `## Queue (${status.queued.length} items)\n`;
+            status.queued.forEach((item, i) => {
+                output += `${i + 1}. ${item.type}: ${item.triggerName}`;
+                if (item.priority > 0) output += ` (priority: ${item.priority})`;
+                output += `\n`;
             });
+        } else {
+            output += `## Queue is empty\n`;
+        }
+
+        return output;
+    }
+
+    function abortGeneration() {
+        // Cancel current generation using component state
+        const activeGen = findActiveGenerator();
+        if (activeGen) {
+            // Set state to deactivated
+            setGeneratorState(activeGen.entityId, 'deactivated');
+            // Clear state message
+            if (state && state.message) {
+                state.message = '';
+            }
+            return 'Generation aborted successfully';
+        }
+        return 'No generation in progress to abort';
+    }
+
+
+    // ==========================
+    // Entity Tracker Integration
+    // ==========================
+
+    function reportToEntityTracker(entityName, success, reason) {
+        // Report generation result to Entity Tracker
+        // This allows Entity Tracker to clear the entity from its tracking list
+        if (success) {
+            // Clear entity from tracker and queue
+            GameState.completeEntityGeneration(entityName);
+            if (debug) console.log(`${MODULE_NAME}: Reported successful generation of ${entityName} to Entity Tracker`);
+        } else {
+            // Could implement retry logic or error reporting here
+            if (debug) console.log(`${MODULE_NAME}: Generation failed for ${entityName}: ${reason}`);
+        }
+    }
+
+    // ==========================
+    // Public API
+    // ==========================
+
+    function getQueueStatus() {
+        // Get current queue status using new greedy component system
+        const activeGen = findActiveGenerator();
+        const queuedGens = findQueuedGenerators();
+
+        const status = {
+            queueLength: queuedGens.length,
+            inProgress: null,
+            queued: []
         };
-        
-        GenerationWizard.startEntityGeneration = function(entityData) {
-            if (!entityData || !entityData.name) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid entity data - missing name`);
-                return false;
-            }
-            
-            if (isGenerationActive()) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return false;
-            }
-            
-            // Start with entity classification stage
-            const progress = {
-                entityType: 'EntityClassification',
-                entityName: entityData.name,
-                triggerName: entityData.name,  // Store the trigger name from entity tracker
-                stage: entityData.stage || 'classification',
-                collectedData: entityData.collectedData || {},
-                templateFields: null,
-                completed: false,
-                currentBatch: null,
-                branchResolved: false,
-                startTurn: info?.actionCount || 0
+
+        // Check active generation
+        if (activeGen) {
+            const activeGenObj = activeGen.component.generations[activeGen.component.activeGeneration];
+            status.inProgress = {
+                type: 'Unknown', // Blueprint type not directly available
+                triggerName: activeGen.entityId,
+                progress: activeGen.component.state || 'generating'
             };
-            
-            saveProgress(progress);
-            if (debug) console.log(`${MODULE_NAME}: Started entity classification for ${entityData.name}`);
+        }
+
+        // List queued items
+        status.queued = queuedGens.map(item => ({
+            type: 'Unknown', // Blueprint type not directly available
+            triggerName: item.entityId,
+            priority: item.priority
+        }));
+
+        return status;
+    };
+
+    // ==========================
+    // Public API (for GameState integration)
+    // ==========================
+
+    function isActive() {
+        // Check if any entity has an active generation using new system
+        const activeGen = findActiveGenerator();
+        return activeGen !== null;
+    }
+
+    // Process function for hook handling
+    function process(hook, text) {
+        // Called by GameState during context/output hooks
+        // Returns {active: bool, text: string}
+
+        if (!isActive()) {
+            // Clear any stale message when not active
+            if (state && state.message) {
+                state.message = '';
+            }
+            return { active: false, text: text };  // Pass through original text
+        }
+
+        switch (hook) {
+            case 'context':
+                // Find active or transition queued->generating entity
+                let activeGen = findActiveGenerator();
+
+                // If no active generator, check for queued ones
+                if (!activeGen) {
+                    const queued = findQueuedGenerators();
+                    if (queued.length > 0) {
+                        // Activate the first queued generator
+                        activeGen = queued[0];
+                        setGeneratorState(activeGen.entityId, 'generating');
+                        if (debug) console.log(`${MODULE_NAME}: Activated generation for ${activeGen.entityId}`);
+                    }
+                }
+
+                if (!activeGen) {
+                    return { active: false, text: text };  // No active generation
+                }
+
+                // Build prompt from embedded component
+                if (debug) {
+                    console.log(`${MODULE_NAME}: About to prepare prompt for entity ${activeGen.entityId}`);
+                    console.log(`${MODULE_NAME}: Entity has generationwizard: ${!!activeGen.entity.generationwizard}`);
+                    if (activeGen.entity.generationwizard) {
+                        console.log(`${MODULE_NAME}: - activeGeneration: ${activeGen.entity.generationwizard.activeGeneration}`);
+                        const hasGens = activeGen.entity.generationwizard.generations &&
+                                      Object.keys(activeGen.entity.generationwizard.generations).length > 0;
+                        console.log(`${MODULE_NAME}: - has generations: ${hasGens}`);
+                    }
+                }
+                const prompt = preparePromptFromComponent(activeGen.entity);
+                if (prompt) {
+                    // Set thinking message for user
+                    if (state && typeof state === 'object') {
+                        state.message = THINKING_MESSAGE;
+                    }
+                    // Append prompt to context
+                    const modifiedText = text + prompt;
+                    return { active: true, text: modifiedText };
+                }
+                if (debug) console.log(`${MODULE_NAME}: No prompt generated, returning original text`);
+                return { active: false, text: text };  // Pass through original text
+
+            case 'output':
+                // Process AI response for field collection
+                if (!isActive()) {
+                    return { active: false, text: text };  // Pass through original text
+                }
+
+                // Process the response
+                const result = processResponse(text);
+
+                // Set appropriate message based on result
+                if (state && typeof state === 'object') {
+                    if (result === 'completed') {
+                        state.message = COMPLETION_MESSAGE;
+                    } else if (result) {
+                        state.message = PROCESSING_MESSAGE;
+                    }
+                }
+
+                // Hide the output during generation
+                return { active: true, text: ZERO_WIDTH_CHAR };
+
+            default:
+                return { active: false, text: text };  // Pass through original text
+        }
+    };
+
+    // ==========================
+    // Input Processing
+    // ==========================
+    // Commands are handled by GameState's debug command system
+    // This hook is only used for intercepting input during active generation
+
+    function processInput(text) {
+        // Only intercept input if we have an active generation
+        const activeGen = findActiveGenerator();
+        if (activeGen) {
+            // Block all input during generation to prevent context pollution
+            console.log(`${MODULE_NAME}: Blocking input during active generation for ${activeGen.id}`);
+            return { active: true, text: ZERO_WIDTH_CHAR };
+        }
+
+        // Pass through all other input
+        return { active: false, text: text };
+    }
+
+    // ==========================
+    // GameState Compatibility API
+    // ==========================
+
+    function instantiateBlueprint(blueprintName, data = {}) {
+        // Delegate to GameState.instantiateBlueprint for basic entity creation
+        if (debug) console.log(`${MODULE_NAME}: Delegating instantiateBlueprint to GameState`);
+
+        // Pre-process data if needed for generation
+        const processedData = { ...data };
+
+        // Evaluate template expressions if present
+        if (processedData.generationwizard?.generations?.initial) {
+            evaluateEntityExpressions(processedData);
+        }
+
+        // Call GameState to create the entity
+        const entityId = GameState.instantiateBlueprint(blueprintName, processedData);
+        if (!entityId) {
+            return null;
+        }
+
+        // Post-process for generation wizard
+        const entity = GameState.get(entityId);
+        if (entity?.generationwizard) {
+            // Update generation fields based on what's already populated
+            updateGenerationFields(entity);
+            GameState.save(entityId, entity);
+
+            // Check if we should activate this entity (if no other is generating)
+            if (entity.generationwizard.state === 'queued') {
+                const activeGen = findActiveGenerator();
+                if (!activeGen) {
+                    // No active generation, activate this one
+                    setGeneratorState(entityId, 'generating');
+                    if (debug) console.log(`${MODULE_NAME}: Activated generation for ${entityId}`);
+                }
+            }
+        }
+
+        return entityId;
+    };
+
+    // Helper to update generationwizard based on current entity state
+    function updateGenerationFields(entity) {
+        if (!entity.generationwizard) return;
+
+        // Check each field definition against actual entity
+        const activeGen = entity.generationwizard.generations[entity.generationwizard.activeGeneration];
+        if (!activeGen) {
+            if (debug) console.log(`${MODULE_NAME}: No active generation for entity ${entity.id}`);
+            return;
+        }
+
+        // Handle dynamic field generation if configured
+        if (activeGen.dynamicFields && activeGen.dynamicFields.type === 'range') {
+            const basedOnPath = activeGen.dynamicFields.basedOn;
+            // Get the value directly from the entity object, not from GameState
+            // The entity might not be saved yet
+            const parts = basedOnPath.split('.');
+            let rangeValue = entity;
+            for (const part of parts) {
+                rangeValue = rangeValue?.[part];
+                if (rangeValue === undefined) break;
+            }
+
+            if (rangeValue && !activeGen.dynamicFieldsGenerated) {
+                // Generate fields based on the range
+                const generatedFields = {};
+                const template = activeGen.dynamicFields.template;
+
+                for (let i = 1; i <= rangeValue; i++) {
+                    // Replace {index} with the actual index in all template properties
+                    const fieldName = template.name.replace(/\{index\}/g, i);
+                    const field = {
+                        path: template.path.replace(/\{index\}/g, i),
+                        key: template.key.replace(/\{index\}/g, i),
+                        prompt: {
+                            uncollected: template.prompt.uncollected.replace(/\{index\}/g, i),
+                            known: template.prompt.known.replace(/\{index\}/g, i),
+                            priority: (template.prompt.priorityBase || 30) + i
+                        }
+                    };
+                    generatedFields[fieldName] = field;
+                }
+
+                // Merge generated fields with existing fields
+                if (!activeGen.fields) {
+                    activeGen.fields = {};
+                }
+                Object.assign(activeGen.fields, generatedFields);
+
+                // Mark as generated so we don't regenerate
+                activeGen.dynamicFieldsGenerated = true;
+
+                // Save the entity with the generated fields
+                GameState.save(entity.id, entity);
+
+                if (debug) console.log(`${MODULE_NAME}: Generated ${rangeValue} dynamic fields for ${entity.id}`);
+            }
+        }
+
+        if (!activeGen.fields) return;
+
+        for (const [fieldName, fieldDef] of Object.entries(activeGen.fields)) {
+            // Use GameState path resolution to check if field has a value
+            const currentValue = GameState ? GameState.get(`${entity.id}.${fieldDef.path}`) : null;
+
+            if (currentValue !== null && currentValue !== undefined) {
+                // Field already has a value (from tool/override)
+                fieldDef.collected = true;
+                fieldDef.value = currentValue;
+            }
+        }
+
+        // Check if any fields still need collection
+        const needsGeneration = Object.values(activeGen.fields)
+            .some(f => !f.collected && f.source !== 'tool');
+
+        // Set initial state based on needs
+        if (needsGeneration) {
+            entity.generationwizard.state = 'queued';
+        } else {
+            entity.generationwizard.state = 'dormant';
+            // Activate display since generation is complete
+            if (entity.display) {
+                entity.display.active = true;
+            }
+        }
+    }
+
+    function cancelGeneration() {
+        // Find active generator and deactivate it
+        const activeGen = findActiveGenerator();
+        if (activeGen) {
+            setGeneratorState(activeGen.entityId, 'deactivated');
+            if (state && state.message) {
+                state.message = '';
+            }
+            if (debug) console.log(`${MODULE_NAME}: Cancelled generation for ${activeGen.entityId}`);
             return true;
+        }
+        return false;
+    };
+
+    // ==========================
+    // Hook Processors
+    // ==========================
+
+    function processPreContext(text) {
+        // Process before context (greedy module check)
+        // Check for active or queued generators
+        if (debug) console.log(`${MODULE_NAME}: processPreContext called, checking for active/queued generators`);
+        const activeGen = findActiveGenerator();
+        const queued = findQueuedGenerators();
+
+        if (debug) {
+            console.log(`${MODULE_NAME}: Active generator: ${activeGen ? activeGen.entityId : 'none'}, Queued: ${queued.length}`);
+        }
+
+        if (!activeGen && queued.length === 0) {
+            return { active: false, text: text };
+        }
+
+        // Delegate to main context processing
+        return processContext(text);
+    }
+
+    function processContext(text) {
+        // Find active or transition queued->generating entity
+        let activeGen = findActiveGenerator();
+
+        // If no active generator, check for queued ones
+        if (!activeGen) {
+            const queued = findQueuedGenerators();
+            if (queued.length > 0) {
+                // Activate the first queued generator
+                activeGen = queued[0];
+                setGeneratorState(activeGen.entityId, 'generating');
+                if (debug) console.log(`${MODULE_NAME}: Activated generation for ${activeGen.entityId}`);
+            }
+        }
+
+        if (!activeGen) {
+            return { active: false, text: text };  // No active generation
+        }
+
+        // Build prompt from embedded component
+        if (debug) {
+            console.log(`${MODULE_NAME}: About to prepare prompt for entity ${activeGen.entityId}`);
+        }
+        const prompt = preparePromptFromComponent(activeGen.entity);
+        if (prompt) {
+            // Set thinking message for user
+            if (state && typeof state === 'object') {
+                state.message = THINKING_MESSAGE;
+            }
+            // Append prompt to context
+            const modifiedText = text + prompt;
+            return { active: true, text: modifiedText };
+        }
+        if (debug) console.log(`${MODULE_NAME}: No prompt generated, returning original text`);
+        return { active: false, text: text };  // Pass through original text
+    }
+
+    function processOutput(text) {
+        // Process AI response for field collection
+        const activeGen = findActiveGenerator();
+        if (!activeGen) {
+            return { active: false, text: text };  // Pass through original text
+        }
+
+        // Process the response
+        const result = processResponse(text);
+
+        // Set appropriate message based on result
+        if (state && typeof state === 'object') {
+            if (result === 'completed') {
+                state.message = COMPLETION_MESSAGE;
+            } else if (result) {
+                state.message = PROCESSING_MESSAGE;
+            }
+        }
+
+        // Hide the output during generation
+        return { active: true, text: ZERO_WIDTH_CHAR };
+    }
+
+    // ==========================
+    // Tool Functions
+    // ==========================
+
+    function gw_npc(params) {
+        console.log(`${MODULE_NAME}: gw_npc called with params:`, params);
+        console.log(`${MODULE_NAME}: GameState available:`, !!GameState);
+
+        const [name, location] = params;
+
+        // Properly structure the data for the blueprint
+        const entityData = {};
+
+        // Set the ID if name is provided
+        if (name) {
+            entityData.id = name.toLowerCase();
+            // Store the trigger name in generationwizard for prompt context
+            entityData.generationwizard = {
+                trigger: name  // This will be used in prompt generation
+            };
+        }
+
+        // Map fields to their proper component locations
+        if (location) {
+            entityData.info = {};
+            if (location) entityData.info.currentLocation = location;
+        }
+
+        console.log(`${MODULE_NAME}: Calling instantiateBlueprint('Character', ...)`)
+        // Use the internal instantiateBlueprint which handles updateGenerationFields
+        const result = instantiateBlueprint('Character', entityData);
+        console.log(`${MODULE_NAME}: instantiateBlueprint returned:`, result);
+        return result ? 'executed' : 'malformed';
+    }
+
+    function gw_location(params) {
+        const [name] = params;
+
+        // Properly structure the data for the blueprint
+        const entityData = {};
+        if (name) {
+            entityData.id = name.toLowerCase().replace(/\s+/g, '_');
+            // Store the trigger name in generationwizard for prompt context
+            entityData.generationwizard = {
+                trigger: name  // This will be used in prompt generation
+            };
+        }
+
+        // Use the internal instantiateBlueprint which handles updateGenerationFields
+        const result = instantiateBlueprint('Location', entityData);
+        return result ? 'executed' : 'malformed';
+    }
+
+    function gw_quest(params) {
+        const [name, giver, type] = params;
+
+        // Random quest name templates if not provided
+        const questNames = [
+            'The Lost Treasure', 'Dangerous Delivery', 'Monster Hunt',
+            'Herb Collection', 'Missing Person', 'Ancient Ruins',
+            'The Mysterious Stranger', 'Bandits in the Woods', 'Sacred Artifact',
+            'The Broken Bridge', 'Supply Run', 'Escort Mission'
+        ];
+
+        // Random NPCs who might give quests
+        const questGivers = [
+            'Argo', 'Village Elder', 'Merchant', 'Guard Captain',
+            'Innkeeper', 'Blacksmith', 'Mysterious Traveler', 'Farmer',
+            'Town Mayor', 'Guild Master', 'Priest', 'Scholar'
+        ];
+
+        // Quest types
+        const questTypes = ['Story', 'Side', 'Side', 'Side']; // Weight toward Side quests
+
+        // Properly structure the data for the blueprint
+        const entityData = {};
+
+        // Use provided name or generate random one
+        const questName = name || questNames[Math.floor(Math.random() * questNames.length)];
+        const questGiver = giver || questGivers[Math.floor(Math.random() * questGivers.length)];
+        const questType = type || questTypes[Math.floor(Math.random() * questTypes.length)];
+
+        // Determine number of stages based on quest type (using ranges for variety)
+        const stageRanges = {
+            'Story': [4, 7],   // Main story quests: 4-7 stages
+            'Side': [2, 4],    // Side quests: 2-4 stages
+            'Hidden': [3, 5],  // Hidden quests: 3-5 stages
+            'Raid': [5, 8]     // Raid quests: 5-8 stages
         };
-        
+
+        const range = stageRanges[questType] || [2, 4];
+        const stageCount = Math.floor(Math.random() * (range[1] - range[0] + 1)) + range[0];
+
+        // Set the quest ID and display name
+        entityData.id = questName.toLowerCase().replace(/\s+/g, '_');
+
+        // Pre-fill all known data
+        entityData.info = {
+            displayname: questName,
+            trigger_name: questName  // Used for prompt context
+        };
+
+        entityData.quest = {
+            giver: questGiver,
+            type: questType
+        };
+
+        // Just set the objectives structure with the stage count
+        // The GenerationWizard will handle creating the dynamic fields
+        entityData.objectives = {
+            stages: {},  // Dynamic fields will populate this
+            current: 1,
+            total: stageCount  // This triggers dynamic field generation
+        };
+
+        // Don't pre-initialize stages - let dynamic field generation handle it
+        // The GenerationWizard will create the stage structure when collecting fields
+
+        // Don't set generationwizard here - let the blueprint handle it
+        // The blueprint already has the complete generationwizard configuration
+        // including fields, dynamicFields, and promptTemplate
+
+        // Use the internal instantiateBlueprint which handles updateGenerationFields
+        const result = instantiateBlueprint('Quest', entityData);
+        if (result) {
+            console.log(`${MODULE_NAME}: Created ${questType} quest '${questName}' from ${questGiver} with ${stageCount} stages and queued for generation`);
+            return 'executed';
+        }
+        return 'malformed';
     }
-    
-    // Handle hook-based initialization
-    if (hook === 'api') {
-        return GenerationWizard;
+
+    // gw_item removed - items don't need generation wizard
+
+    function gw_abort(params) {
+        const result = cancelGeneration();
+        return result ? 'executed' : 'malformed';
     }
-    
-    // Create default templates on first run
-    if (!Utilities.storyCard.get('[GW Template] NPC')) {
-        createDefaultTemplates();
+
+    function gw_status(params) {
+        const status = getQueueStatus();
+        if (state && state.message) {
+            state.message = JSON.stringify(status);
+        }
+        return 'executed';
     }
-    
-    // Create combined config/prompts card on first run
-    if (!Utilities.storyCard.get(CONFIG_AND_PROMPTS_CARD)) {
-        createDefaultConfigAndPrompts();
+
+    function gw_retry(params) {
+        // Retry last failed generation
+        const activeGen = findActiveGenerator();
+        if (activeGen) {
+            activeGen.retryCount = 0;
+            return 'executed';
+        }
+        return 'malformed';
     }
-    
-    return GenerationWizard;
+
+    // ==========================
+    // Module API
+    // ==========================
+
+    const moduleAPI = {
+        // Component schemas
+        schemas: {
+            generationwizard: {
+                id: 'generationwizard',
+                defaults: {
+                    // CLEAN NEW STRUCTURE - no legacy support
+                    state: "dormant",                 // ENUM: generating | dormant | queued | deactivated
+                    activeGeneration: null,           // Which generation object is currently active
+                    generations: {},                  // Generation objects (temporary work packages)
+
+                    // Display is always null for generationwizard (it's not user-visible)
+                    display: null
+                }
+            }
+        },
+
+        // Tool definitions
+        tools: {
+            gw_npc: gw_npc,
+            gw_location: gw_location,
+            gw_quest: gw_quest,
+            gw_abort: gw_abort,
+            gw_status: gw_status,
+            gw_retry: gw_retry
+        },
+
+        // Hook processors
+        hooks: {
+            preContext: [processPreContext],  // Greedy processing before context
+            context: [processContext],        // Context processing
+            input: [processInput],            // Process input commands
+            output: [processOutput]            // Process AI responses
+        },
+
+        // Module initialization
+        init: function(api) {
+            if (debug) console.log(`${MODULE_NAME}: Initializing with GameState API`);
+            // Store GameState API reference
+            GameState = api;
+            // Blueprints now handled by BlueprintModule
+        },
+
+        // Public API functions (for direct access)
+        instantiateBlueprint: instantiateBlueprint,
+        getQueueStatus: getQueueStatus,
+        cancelGeneration: cancelGeneration,
+        isActive: isActive,
+    };
+
+    return moduleAPI;
+}
+GenerationWizardModule.isSANEModule = true;
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = GenerationWizardModule;
 }

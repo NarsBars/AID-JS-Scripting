@@ -1,7 +1,7 @@
 function GameState(hook, text) {
     'use strict';
 
-    // BlueprintManager active state - checked once per hook
+    // GenerationWizard state
     let gwActive = false;
 
     const debug = true;
@@ -12,7 +12,7 @@ function GameState(hook, text) {
     let currentHash = null;
     
     // Unified data cache for everything - entities, variables, functions, schemas, etc.
-    // Keys are just the ID
+    // Keys are the ID
     // Stores data from:
     // - [SANE:E] cards: entities with display
     // - [SANE:D] cards: entities without display, variables
@@ -30,6 +30,82 @@ function GameState(hook, text) {
     function normalizeEntityId(entityId) {
         if (!entityId || typeof entityId !== 'string') return entityId;
         return entityId.toLowerCase();
+    }
+
+    // ==========================
+    // Module Registry System
+    // ==========================
+    // Allows modules to register tools, schemas, and hooks
+
+    const moduleRegistry = {
+        tools: {},          // Tool functions by name
+        schemas: {},        // Component schemas
+        hooks: {
+            preContext: [],   // Run BEFORE context (for greedy modules like GenerationWizard)
+            context: [],      // Context modifiers
+            input: [],        // Input processors
+            output: [],       // Output processors
+            init: []          // Initialization hooks
+        },
+        modules: {}         // Track registered modules by name
+    };
+
+    function registerModule(moduleName, module) {
+        if (moduleRegistry.modules[moduleName]) {
+            if (debug) console.log(`${MODULE_NAME}: Module '${moduleName}' already registered, skipping`);
+            return;
+        }
+
+        // Register tools
+        if (module.tools) {
+            for (const [toolName, toolFunc] of Object.entries(module.tools)) {
+                if (moduleRegistry.tools[toolName]) {
+                    console.log(`${MODULE_NAME}: Warning - tool '${toolName}' already registered, overwriting`);
+                }
+                moduleRegistry.tools[toolName] = toolFunc;
+                // Tool registration is silent to reduce log spam
+            }
+        }
+
+        // Register schemas
+        if (module.schemas) {
+            for (const [schemaName, schema] of Object.entries(module.schemas)) {
+                if (moduleRegistry.schemas[schemaName]) {
+                    console.log(`${MODULE_NAME}: Warning - schema '${schemaName}' already registered, overwriting`);
+                }
+                moduleRegistry.schemas[schemaName] = schema;
+                // Also add to dataCache for universal access
+                dataCache[`schema.${schemaName}`] = schema;
+                // Schema registration is silent to reduce log spam
+            }
+        }
+
+        // Register hooks
+        if (module.hooks) {
+            for (const [hookName, handlers] of Object.entries(module.hooks)) {
+                if (!moduleRegistry.hooks[hookName]) {
+                    console.log(`${MODULE_NAME}: Warning - unknown hook type '${hookName}'`);
+                    continue;
+                }
+                if (Array.isArray(handlers)) {
+                    moduleRegistry.hooks[hookName].push(...handlers);
+                } else {
+                    moduleRegistry.hooks[hookName].push(handlers);
+                }
+                // Hook registration is silent to reduce log spam
+            }
+        }
+
+        // Run module initialization
+        if (module.init && typeof module.init === 'function') {
+            try {
+                module.init(GameStateAPI);
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Failed to initialize module '${moduleName}': ${e.message}`);
+            }
+        }
+
+        moduleRegistry.modules[moduleName] = module;
     }
 
     // Load Library functions from [SANE_RUNTIME] LIBRARY card and add built-in helpers
@@ -1589,6 +1665,19 @@ function GameState(hook, text) {
             if (evaluable === 'false') return false;
             if (evaluable === 'undefined' || evaluable === 'null') return false;
 
+            // Handle logical operators (||, &&, ===, !==, etc.)
+            // Safe evaluation for simple expressions
+            try {
+                // Only allow safe operations - no function calls or complex code
+                if (/^[\d\s"'truefalsenuludefined\|\|&&===!==<><=>=\+\-\*\/\(\)]+$/.test(evaluable)) {
+                    // Use eval for evaluation (Function constructor not available in AI Dungeon)
+                    const result = eval(evaluable);
+                    return !!result; // Convert to boolean
+                }
+            } catch (e) {
+                // If evaluation fails, continue to default
+            }
+
             // Default to true if we can't evaluate
             return true;
         } catch (e) {
@@ -1601,17 +1690,34 @@ function GameState(hook, text) {
     function formatTemplateString(format, entity, componentData, componentName) {
         if (!format) return '';
 
-        let result = format;
-
-        // Debug: Check what componentData looks like
-        if (debug && format.includes('{*\\:') && componentName) {
-            console.log(`${MODULE_NAME}: Formatting ${componentName} with data:`, Object.keys(componentData || {}));
+        // First try using TemplateParser for field-based iteration patterns like {field.*→}
+        // This handles the new syntax properly
+        if (format.includes('.*→') || format.includes('.*|') || format.includes('.*:')) {
+            // Create a data context that includes the component data
+            const templateData = componentData || {};
+            if (debug && componentName === 'rewards') {
+                console.log(`${MODULE_NAME}: Parsing rewards format with TemplateParser`);
+                console.log(`${MODULE_NAME}: Format: ${format}`);
+                console.log(`${MODULE_NAME}: Data keys:`, Object.keys(templateData));
+                if (templateData.items) {
+                    console.log(`${MODULE_NAME}: Items:`, Object.keys(templateData.items));
+                }
+            }
+            const parser = new TemplateParser(templateData);
+            return parser.parse(format);
         }
 
-        // Handle wildcard patterns {*\: template} (escaped colon)
-        if (format.includes('{*\\:')) {
-            // Find the complete {*\: ...} pattern by counting braces
-            const startIndex = format.indexOf('{*\\:');
+        let result = format;
+
+        // Legacy: Handle old-style wildcard patterns {*→ template} or {*\: template}
+        // These iterate over the current component's data
+        const hasArrowPattern = format.includes('{*→');
+        const hasLegacyPattern = format.includes('{*\\:');
+
+        if (hasArrowPattern || hasLegacyPattern) {
+            const patternToFind = hasArrowPattern ? '{*→' : '{*\\:';
+            // Find the complete pattern by counting braces
+            const startIndex = format.indexOf(patternToFind);
             if (startIndex !== -1) {
                 let braceCount = 0;
                 let endIndex = -1;
@@ -1629,7 +1735,8 @@ function GameState(hook, text) {
 
                 if (endIndex !== -1) {
                     const fullPattern = format.substring(startIndex, endIndex + 1);
-                    const template = format.substring(startIndex + 4, endIndex); // Skip '{*\:' and final '}'
+                    const skipLength = hasArrowPattern ? 3 : 4; // Skip '{*→' (3 chars) or '{*\:' (4 chars)
+                    const template = format.substring(startIndex + skipLength, endIndex); // Skip pattern prefix and final '}'
 
                     if (componentData && typeof componentData === 'object') {
                         const items = [];
@@ -1857,17 +1964,91 @@ function GameState(hook, text) {
     // ==========================
     // Template-based entity creation system with field mapping and inheritance
 
-    // REMOVED: loadBlueprint - blueprints are handled by BlueprintManager only
+    // Cache for loaded blueprints
+    const blueprintCache = {};
+
+    // Load blueprint from [SANE:BP] card
+    function loadBlueprint(blueprintName) {
+        // Check cache first
+        if (blueprintCache[blueprintName]) {
+            return blueprintCache[blueprintName];
+        }
+
+        // Load from [SANE:BP] card
+        const cardTitle = `[SANE:BP] ${blueprintName}`;
+        const card = Utilities.storyCard.get(cardTitle);
+
+        if (!card || !card.description) {
+            if (debug) console.log(`${MODULE_NAME}: Blueprint '${blueprintName}' not found`);
+            return null;
+        }
+
+        // Parse blueprint
+        let blueprint;
+        try {
+            // Extract JSON from between <== SANE DATA ==> tags if present
+            let jsonContent = card.description;
+            const dataMatch = jsonContent.match(/<==\s*SANE DATA\s*==>([\s\S]*?)<==\s*END DATA\s*==>/);
+            if (dataMatch) {
+                jsonContent = dataMatch[1];
+            }
+            blueprint = JSON.parse(jsonContent);
+        } catch (e) {
+            console.log(`${MODULE_NAME}: Failed to parse blueprint '${blueprintName}': ${e.message}`);
+            return null;
+        }
+
+        // Validate blueprint structure
+        if (!blueprint.id) {
+            console.log(`${MODULE_NAME}: Invalid blueprint structure for '${blueprintName}' - missing id`);
+            return null;
+        }
+
+        // Cache and return
+        blueprintCache[blueprintName] = blueprint;
+        return blueprint;
+    }
+
+    // Create entity from blueprint
+    function instantiateBlueprint(blueprintName, data = {}) {
+        // Load blueprint
+        const blueprint = loadBlueprint(blueprintName);
+        if (!blueprint) {
+            console.log(`${MODULE_NAME}: Cannot instantiate - blueprint '${blueprintName}' not found`);
+            return null;
+        }
+
+        // Merge blueprint with provided data
+        const entity = Utilities.collection.deepMerge(blueprint, data);
+
+        // Generate unique ID if not provided
+        entity.id = data.id || `${blueprintName.toLowerCase()}_${Date.now()}`;
+
+        // Normalize ID to lowercase
+        const normalizedId = entity.id.toLowerCase();
+        entity.id = normalizedId;
+
+        // Save entity
+        save(normalizedId, entity);
+
+        // If entity has generationwizard component with state 'queued',
+        // GenerationWizard will pick it up on next context hook
+        if (entity.generationwizard?.state === 'queued') {
+            if (debug) console.log(`${MODULE_NAME}: Entity ${normalizedId} queued for generation`);
+        }
+
+        return normalizedId;
+    }
 
     function saveEntity(entityId, entity) {
-        if (debug) console.log(`${MODULE_NAME}: saveEntity called for ${entityId}`);
+        // if (debug) console.log(`${MODULE_NAME}: saveEntity called for ${entityId}`);
 
         // Clean up any existing overflow cards first
         cleanupOverflowCards(entityId);
 
         // Determine if entity should have display card (must have active display)
         if (hasDisplayComponent(entity)) {
-            if (debug) console.log(`${MODULE_NAME}: saveEntity: Entity has active display component`);
+            // if (debug) console.log(`${MODULE_NAME}: saveEntity: Entity has active display component`);
 
             // Save to [SANE:E] card with display
             const entry = buildEntityDisplay(entity);
@@ -1975,12 +2156,12 @@ function GameState(hook, text) {
         // Check if display component is active
         if (entity.display && typeof entity.display === 'object') {
             const active = entity.display.active === true;
-            if (debug) console.log(`${MODULE_NAME}: hasDisplayComponent: display.active = ${entity.display.active}, returning ${active}`);
+            // if (debug) console.log(`${MODULE_NAME}: hasDisplayComponent: display.active = ${entity.display.active}, returning ${active}`);
             return active; // Only true if explicitly set to true
         }
 
         // Has display component but no display object - consider it inactive
-        if (debug) console.log(`${MODULE_NAME}: hasDisplayComponent: No display object found, returning false`);
+        // if (debug) console.log(`${MODULE_NAME}: hasDisplayComponent: No display object found, returning false`);
         return false;
     }
 
@@ -2598,22 +2779,65 @@ function GameState(hook, text) {
         return true;
     }
 
+    // Load all entities from both [SANE:D] and [SANE:E] cards into dataCache
+    function loadAllEntities() {
+        // Load entities from [SANE:D] Data cards
+        const dataCardEntities = loadFromDataCards();
+
+        // Store all data card entities in cache
+        for (const entityId in dataCardEntities) {
+            dataCache[entityId] = dataCardEntities[entityId];
+        }
+
+        // Also load entities from [SANE:E] Entity cards
+        const entityCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:E]'),
+            true  // Get all matching cards
+        ) || [];
+
+        let loadedCount = 0;
+        for (const card of entityCards) {
+            try {
+                const entities = parseEntityData(card.description || '');
+                for (const entityId in entities) {
+                    // Store in dataCache for querying
+                    dataCache[entityId] = entities[entityId];
+                    loadedCount++;
+                }
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Failed to load entity from ${card.title}: ${e.message}`);
+            }
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Loaded ${loadedCount} entities from [SANE:E] cards`);
+    }
+
     function queryTags(query) {
 
         // Query entities using either a predicate function or tag expression
         // query: function(entity) => boolean OR string tag expression
-        // Returns: object of matching entities keyed by ID
+        // Returns: array of matching entities
         // Examples:
         //   queryTags('Character')                    // All characters
         //   queryTags('Character.NPC')                // All NPCs
         //   queryTags('Character && Elite')           // Characters with Elite tag
         //   queryTags(e => e.stats.level.value > 10)  // Custom predicate
+        //   queryTags('*')                            // ALL entities (loads from storage)
+
+        // Special handling for wildcard - load all entities from storage
+        if (query === '*') {
+            loadAllEntities();
+        }
 
         let predicate;
 
         // If query is a function, use it directly
         if (typeof query === 'function') {
             predicate = query;
+        }
+        // Special case for '*' wildcard - match everything
+        else if (query === '*') {
+            predicate = entity => true;
         }
         // If query is a simple tag string (no operators)
         else if (typeof query === 'string' && !query.includes(' && ') && !query.includes(' || ') &&
@@ -2629,10 +2853,10 @@ function GameState(hook, text) {
         else {
             // Invalid query
             if (debug) console.log(`${MODULE_NAME}: Invalid query type: ${typeof query}`);
-            return {};
+            return [];
         }
 
-        const results = {};
+        const results = [];
         for (const [key, entity] of Object.entries(dataCache)) {
             if (!entity || typeof entity !== 'object') continue;
 
@@ -2642,7 +2866,7 @@ function GameState(hook, text) {
             // Apply predicate
             try {
                 if (predicate(entity)) {
-                    results[key] = entity;
+                    results.push(entity);
                 }
             } catch (e) {
                 // Skip entities that cause errors in predicate
@@ -4496,8 +4720,10 @@ function GameState(hook, text) {
         // Parse the content inside {...}
         parseExpressionContent(content) {
             
-            // Check for loop syntax: field.*:template or field.*|template
-            const loopMatch = content.match(/^([^.*]+)\.\*([:|])(.+)$/s);
+            // Check for loop syntax: field.*→template or field.*|template or field.*:template
+            // → is the preferred iteration operator (no conflict with ternary)
+            // : still supported for backwards compatibility but discouraged
+            const loopMatch = content.match(/^([^.*]+)\.\*([→:|])(.+)$/s);
             if (loopMatch) {
                 // Pass the delimiter as part of the template only if it's a pipe
                 const template = loopMatch[2] === '|' ? loopMatch[2] + loopMatch[3] : loopMatch[3];
@@ -4517,7 +4743,10 @@ function GameState(hook, text) {
         // Process a loop expression
         processLoop(objectPath, template) {
             const obj = getNestedField(this.data, objectPath);
-            if (!obj || typeof obj !== 'object') return '';
+            if (!obj || typeof obj !== 'object') {
+                if (debug) console.log(`${MODULE_NAME}: processLoop - no object found at path '${objectPath}'`);
+                return '';
+            }
             
             // Check for pipe delimiter at start of template
             let delimiter = '\n';
@@ -4528,7 +4757,7 @@ function GameState(hook, text) {
             }
             
             const results = [];
-            
+
             for (const [key, value] of Object.entries(obj)) {
                 // Create a new parser with loop context
                 const loopData = { ...this.data };
@@ -4629,7 +4858,8 @@ function GameState(hook, text) {
                 // Process any remaining field references
                 const subParser = new TemplateParser(loopData);
                 processed = subParser.parse(processed);
-                
+
+                // Only push non-empty results
                 if (processed.trim()) {
                     results.push(processed);
                 }
@@ -5386,32 +5616,6 @@ function GameState(hook, text) {
             }
         }
 
-        // Temporary entities with generationwizard should be saved to [SANE:D] cards
-        // so they persist between hooks, but not to [SANE:E] cards
-        if (entity.generationwizard) {
-            if (debug) console.log(`${MODULE_NAME}: Saving temp entity ${entityId} to [SANE:D] card (has generationwizard)`);
-
-            // Load existing data entities
-            const existingData = loadFromDataCards() || {};
-
-            // Add this temporary entity
-            existingData[entityId] = entity;
-
-            // Save back to data cards
-            saveToDataCards(existingData);
-
-            // Entity is already in cache from earlier
-            return true;
-        }
-
-        // Clean up stale generationwizard from components array if needed
-        if (entity.components && entity.components.includes('generationwizard')) {
-            const index = entity.components.indexOf('generationwizard');
-            if (index !== -1) {
-                entity.components.splice(index, 1);
-                if (debug) console.log(`${MODULE_NAME}: Cleaned up stale generationwizard from components array for ${entityId}`);
-            }
-        }
 
         // Save entity (handles both [SANE:E] and [SANE:D] cards based on display component)
         const saved = saveEntity(entityId, entity);
@@ -5486,10 +5690,8 @@ function GameState(hook, text) {
     // ==========================
     // Tool Processors
     // ==========================
-    // All tool processors have been moved to SANEDefaults module
-    // They are now accessed via builtInTools after being created from factory functions
-    // The old toolProcessors object (937 lines) has been removed.
-    // All tools are now defined in SANEDefaults.js
+    // All tools are now provided by individual modules
+    // Modules self-register their tools during auto-discovery
     // Entity Tracking System
     // ==========================
     function loadEntityTrackerConfig() {
@@ -5523,14 +5725,14 @@ function GameState(hook, text) {
         // First check if character exists in the loaded character cache
         // This is the most reliable way to check for existing characters
         const allCharacters = queryTags('Character');
-        if (allCharacters[entityName]) {
+        const existingChar = allCharacters.find(c => c.id.toLowerCase() === entityName);
+        if (existingChar) {
             if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${entityName}`);
             return;
         }
-        
+
         // Check if any character has this as a trigger_name
-        for (const charName in allCharacters) {
-            const character = allCharacters[charName];
+        for (const character of allCharacters) {
             if (character.info && character.info.trigger_name) {
                 // Check if trigger_name matches (could be string or array)
                 const triggers = Array.isArray(character.info.trigger_name) 
@@ -5699,8 +5901,7 @@ function GameState(hook, text) {
         
         // Check if any existing character has this as a trigger_name
         const allCharacters = queryTags('Character');
-        for (const charName in allCharacters) {
-            const character = allCharacters[charName];
+        for (const character of allCharacters) {
             if (character.info && character.info.trigger_name) {
                 const triggers = Array.isArray(character.info.trigger_name) 
                     ? character.info.trigger_name 
@@ -5791,20 +5992,25 @@ function GameState(hook, text) {
             }
         }
         
-        // Instead of queuing, directly trigger BlueprintManager if available
-        if (typeof BlueprintManager !== 'undefined' && BlueprintManager.instantiateBlueprint) {
-            if (debug) console.log(`${MODULE_NAME}: Triggering BlueprintManager for entity: ${entityName}`);
-            // Create character using new unified API
-            const entityId = BlueprintManager.instantiateBlueprint('Character', {
-                info: {
-                    trigger_name: entityName
-                }
-            });
+        // Create entity using blueprint system
+        if (debug) console.log(`${MODULE_NAME}: Creating entity via instantiateBlueprint: ${entityName}`);
+        const entityId = instantiateBlueprint('Character', {
+            info: {
+                trigger_name: entityName
+            }
+        });
+        if (entityId) {
             if (debug) console.log(`${MODULE_NAME}: Created character ${entityId} via instantiateBlueprint`);
+
+            // If BlueprintManager is loaded, it will handle generation
+            // Otherwise entity exists but fields won't auto-generate
+            if (typeof BlueprintManager !== 'undefined') {
+                if (debug) console.log(`${MODULE_NAME}: BlueprintManager will handle field generation`);
+            }
             return;
         }
-        
-        // Fallback to queue system if BlueprintManager not available
+
+        // Fallback to queue system if blueprint creation fails
         const queueCard = Utilities.storyCard.get('[SANE:C] Entity Queue');
         let queue = [];
         if (queueCard) {
@@ -6043,7 +6249,8 @@ function GameState(hook, text) {
                 // Load all characters into entity cache
                 try {
                     const allChars = queryTags('Character');
-                    for (const [name, char] of Object.entries(allChars || {})) {
+                    for (const char of allChars || []) {
+                        const name = char.id.toLowerCase();
                         // Update to use just entity ID
                         dataCache[name] = char;  // New way
                         dataCache[`Character.${name}`] = char;  // Old way
@@ -6155,17 +6362,27 @@ function GameState(hook, text) {
         return { modifiedText, executedTools };
     }
     
-    // Helper to convert entity array to dict keyed by name/ID
+    // Helper to convert entity array or object to dict keyed by name/ID
     function entitiesToDict(entities) {
         const dict = {};
-        for (const entity of entities) {
-            const entityId = entity.aliases && entity.aliases[0] ? entity.aliases[0] : 'unknown';
-            if (entityId) {
-                dict[entityId.toLowerCase()] = entity;
-                // Also store by original case for compatibility
-                dict[entityId] = entity;
+
+        // Handle both array and object inputs
+        if (Array.isArray(entities)) {
+            // Original array handling
+            for (const entity of entities) {
+                const entityId = entity.aliases && entity.aliases[0] ? entity.aliases[0] : entity.id || 'unknown';
+                if (entityId) {
+                    dict[entityId.toLowerCase()] = entity;
+                    // Also store by original case for compatibility
+                    dict[entityId] = entity;
+                }
             }
+        } else if (typeof entities === 'object' && entities !== null) {
+            // If already an object (from queryTags), just return it
+            // queryTags already returns entities keyed by their IDs
+            return entities;
         }
+
         return dict;
     }
 
@@ -6208,7 +6425,20 @@ function GameState(hook, text) {
 
         // Characters are already in entityCache, set by processTools
 
-        // Check runtime tools FIRST (highest priority - can override built-ins)
+        // Check module tools FIRST (highest priority)
+        if (moduleRegistry.tools[normalizedToolName]) {
+            try {
+                const result = moduleRegistry.tools[normalizedToolName](params);
+                return result;
+            } catch (e) {
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Error in module tool ${normalizedToolName}: ${e.message}`);
+                }
+                return 'malformed';
+            }
+        }
+
+        // Check runtime tools (second priority - can override built-ins)
         if (runtimeTools[normalizedToolName]) {
             try {
                 const result = runtimeTools[normalizedToolName](...params);
@@ -6221,19 +6451,7 @@ function GameState(hook, text) {
             }
         }
 
-        // Check built-in tools from SANEDefaults
-        if (builtInTools[normalizedToolName]) {
-            try {
-                const result = builtInTools[normalizedToolName](...params);
-                return result;
-            } catch (e) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Error in built-in tool ${normalizedToolName}: ${e.message}`);
-                }
-                logError(e, `Tool execution: ${normalizedToolName}(${params.join(', ')})`);
-                return 'malformed';
-            }
-        }
+        // Built-in tools removed - all tools now in modules or runtime
 
         // Legacy toolProcessors removed - all tools now in built-in or runtime
 
@@ -6367,45 +6585,78 @@ function GameState(hook, text) {
             }
 
             if (commandName === 'gw_activate') {
-                if (typeof BlueprintManager === 'undefined') return "<<<BlueprintManager not available>>>";
-                BlueprintManager('activate', null);
-                return "\n<<<BlueprintManager activated for next turn>>>\n";
+                // GenerationWizard module handles activation automatically
+                return "\n<<<GenerationWizard module auto-activates queued entities>>>\n";
             }
 
             if (commandName === 'gw_npc') {
-                if (typeof BlueprintManager === 'undefined') return "<<<BlueprintManager not available>>>";
-                const triggerName = `debug_trigger_${Math.floor(Math.random() * 10000)}`;
+                // Call the gw_npc tool from module registry
+                const tool = moduleRegistry.tools['gw_npc'];
+                if (!tool) return "<<<gw_npc tool not available (GenerationWizardModule not loaded?)>>>";
 
-                // Use new instantiateBlueprint API
-                const entityId = BlueprintManager.instantiateBlueprint('Character', {
-                    info: {
-                        trigger_name: triggerName
-                    }
-                });
+                // Generate a random name for the NPC
+                const npcName = `npc_${Math.floor(Math.random() * 10000)}`;
+                const result = tool([npcName]);
 
-                console.log(`[DEBUG] Created Character entity: ${entityId} from trigger: ${triggerName}`);
-                return `\n<<<Created Character entity: ${entityId} from trigger: ${triggerName}>>>\n`;
+                if (result === 'executed') {
+                    console.log(`[DEBUG] Created NPC entity: ${npcName}`);
+                    return `\n<<<Created NPC entity: ${npcName} for generation>>>\n`;
+                } else {
+                    return `\n<<<Failed to create NPC: ${result}>>>\n`;
+                }
+            }
+
+            if (commandName === 'gw_quest') {
+                // Call the gw_quest tool from module registry
+                const tool = moduleRegistry.tools['gw_quest'];
+                if (!tool) return "<<<gw_quest tool not available (GenerationWizardModule not loaded?)>>>";
+
+                // Use provided name or generate a random one
+                const questName = args[0] || `quest_${Math.floor(Math.random() * 10000)}`;
+                const result = tool([questName]);
+
+                if (result === 'executed') {
+                    console.log(`[DEBUG] Created Quest entity: ${questName}`);
+                    return `\n<<<Created Quest entity: ${questName} for generation>>>\n`;
+                } else {
+                    return `\n<<<Failed to create Quest: ${result}>>>\n`;
+                }
+            }
+
+            if (commandName === 'gw_location') {
+                // Call the gw_location tool from module registry
+                const tool = moduleRegistry.tools['gw_location'];
+                if (!tool) return "<<<gw_location tool not available (GenerationWizardModule not loaded?)>>>";
+
+                // Use provided name or generate a random one
+                const locationName = args[0] || `location_${Math.floor(Math.random() * 10000)}`;
+                const result = tool([locationName]);
+
+                if (result === 'executed') {
+                    console.log(`[DEBUG] Created Location entity: ${locationName}`);
+                    return `\n<<<Created Location entity: ${locationName} for generation>>>\n`;
+                } else {
+                    return `\n<<<Failed to create Location: ${result}>>>\n`;
+                }
             }
 
             if (commandName === 'gw_status') {
-                if (typeof BlueprintManager === 'undefined') return "<<<BlueprintManager not available>>>";
-                const activeGen = findActiveGeneration();
-                const queuedGens = findQueuedGenerations();
+                // Call the gw_status tool from module registry
+                const tool = moduleRegistry.tools['gw_status'];
+                if (!tool) return "<<<gw_status tool not available (GenerationWizardModule not loaded?)>>>";
 
-                let status = "=== BlueprintManager Status ===\n";
-                status += `Active: ${activeGen !== null}\n`;
+                // Execute the tool
+                const result = tool([]);
 
-                if (progressCard) {
-                    try {
-                        const data = JSON.parse(progressCard.entry || '{}');
-                        status += `\nIn Progress:\n`;
-                        status += `- Type: ${data.entityType}\n`;
-                        status += `- Trigger: ${data.triggerName}\n`;
-                        status += `- Blueprint: ${data.blueprintName}\n`;
-                    } catch (e) {}
+                // The gw_status tool sets state.message with status info
+                let status = "=== GenerationWizard Status ===\n";
+                if (state && state.message) {
+                    status += state.message;
+                } else {
+                    status += "No active generation\n";
                 }
 
-                return status;
+                return `\n<<<${status}>>>\n`;
             }
 
             if (commandName === 'gw_blueprints') {
@@ -6501,24 +6752,32 @@ function GameState(hook, text) {
         if (debug) console.log(`${MODULE_NAME}: Created initial [SANE:D] Data card with Global entity`);
     }
 
-    // Load defaults and built-in tools (will be initialized later)
-    let builtInTools;
-    let defaultCards;
-
     function createSANESchemas() {
-        // Simple function to create all default cards from SANEDefaults
-        for (const cardDef of defaultCards) {
-            if (!Utilities.storyCard.get(cardDef.title)) {
+        // Create schema Story Cards from module registry
+        for (const [schemaName, schema] of Object.entries(moduleRegistry.schemas)) {
+            const cardTitle = `[SANE:S] ${schemaName}`;
+            if (!Utilities.storyCard.get(cardTitle)) {
+                const cardDef = {
+                    title: cardTitle,
+                    description: JSON.stringify(schema, null, 2),
+                    type: 'schema'
+                };
                 Utilities.storyCard.add(cardDef);
-                if (debug) console.log(`${MODULE_NAME}: Created ${cardDef.title}`);
+                if (debug) console.log(`${MODULE_NAME}: Created ${cardTitle} from module`);
             }
         }
     }
 
-    // Create GameState API for SANEDefaults to use
+    // Create GameState API for modules to use
     const GameStateAPI = {
         get, set, del, resolve, save,
         debug, MODULE_NAME,
+        queryTags,             // Query system
+        hasGameplayTag,        // Tag checking utility
+        loadAllEntities,       // Load all entities from storage
+        registerModule,        // Module system
+        instantiateBlueprint,  // Blueprint system
+        changeEntityId,        // Rename entities
         trackUnknownEntity, shouldTriggerGeneration, addToEntityQueue,
         getItemQuantity, setItemQuantity,
         calculateLevelXPRequirement,
@@ -6530,14 +6789,45 @@ function GameState(hook, text) {
         Utilities
     };
 
-    // Initialize defaults from external SANEDefaults module
-    const defaults = SANEDefaults();
-    defaultCards = defaults.defaultCards;
+    // Auto-discover all SANE modules by looking for the isSANEModule marker
+    function discoverModules() {
+        const discovered = [];
 
-    // Create tools from factories
-    builtInTools = {};
+        // Check for any function with our marker
+        try {
+            // Get all global function names
+            const globalKeys = Object.keys(this || globalThis || window || {});
 
-    // Create context object to pass to tool factories
+            for (const key of globalKeys) {
+                try {
+                    const value = (this || globalThis || window)[key];
+
+                    // Check if it's a function with our marker
+                    if (typeof value === 'function' && value.isSANEModule === true) {
+                        const moduleInstance = value();
+                        registerModule(key, moduleInstance);
+                        discovered.push(key);
+                        if (debug) console.log(`${MODULE_NAME}: Loaded module: ${key}`);
+                    }
+                } catch (e) {
+                    // Not a module or error instantiating, skip
+                }
+            }
+        } catch (e) {
+            console.log(`${MODULE_NAME}: Error during module discovery: ${e.message}`);
+        }
+
+        if (debug && discovered.length === 0) {
+            console.log(`${MODULE_NAME}: No modules discovered. Modules must have .isSANEModule = true marker`);
+        }
+
+        return discovered;
+    }
+
+    // Discover and load all modules
+    const discoveredModules = discoverModules();
+
+    // Create context object for runtime tools (if needed)
     const toolContext = {
         // Logging variables
         debug: debug,
@@ -6585,17 +6875,14 @@ function GameState(hook, text) {
         BlueprintManager: typeof BlueprintManager !== 'undefined' ? BlueprintManager : undefined,
         Calendar: typeof Calendar !== 'undefined' ? Calendar : undefined,
 
-        // Built-in tools reference (for tools that call other tools)
-        builtInTools: builtInTools,
+        // Module tools reference
+        moduleTools: moduleRegistry.tools,
 
         // BlueprintManager active flag
         gwActive: gwActive
     };
 
-    // Create each tool by calling its factory with the context
-    for (const [name, factory] of Object.entries(defaults.toolFactories)) {
-        builtInTools[name] = factory(toolContext);
-    }
+    // No built-in tools to create - all provided by modules
 
     // Auto-initialize SANE schemas on first run
     createSANESchemas();
@@ -6603,8 +6890,7 @@ function GameState(hook, text) {
     // Initialize data cache after creating schemas
     initializeDataCache();
 
-    // Built-in tools are already created by SANEDefaults with the GameStateAPI
-    // No need for factory functions since we pass the API directly
+    // Built-in tools removed - all tools provided by modules
 
     // Public API
 
@@ -6615,6 +6901,7 @@ function GameState(hook, text) {
     // Query system
     GameState.queryTags = queryTags;  // Primary query interface
     GameState.hasGameplayTag = hasGameplayTag;  // Tag checking utility
+    GameState.loadAllEntities = loadAllEntities;  // Load all entities from storage
 
     GameState.processTools = processTools;
     GameState.processGetters = processGetters;
@@ -6622,15 +6909,16 @@ function GameState(hook, text) {
     // Display system
     GameState.buildEntityDisplay = buildEntityDisplay;  // Build display text for entity
 
-    // Blueprints are handled entirely by BlueprintManager
-    // GameState is only responsible for data storage
+    // Module system
+    GameState.registerModule = registerModule;
 
     // Universal data access (replaces getGlobalValue/setGlobalValue)
     GameState.get = get;
     GameState.set = set;
     GameState.del = del;
 
-    // Entity management functions for BlueprintManager
+    // Entity management functions
+    GameState.instantiateBlueprint = instantiateBlueprint;  // Create entity from blueprint
     GameState.changeEntityId = changeEntityId;  // Change the actual entity ID
     GameState.removeComponent = removeComponent;
     GameState.addComponent = addComponent;
@@ -6788,12 +7076,43 @@ function GameState(hook, text) {
             // If any commands were processed, return their combined results
             if (commandResults.length > 0) {
                 const result = commandResults.join('\n');
-                // Calculate hash of the result
+
+                // Show debug messages to player via state.message but don't add to context
+                if (result.includes('<<<') && result.includes('>>>')) {
+                    // Debug message - show via state.message but consume the input
+                    if (state) {
+                        state.message = result.replace(/<<<|>>>/g, '').trim();
+                    }
+                    // Return a zero-width space to consume the input without adding to context
+                    currentHash = RewindSystem.quickHash('\u200B');
+                    logTime();
+                    return '\u200B';  // Zero-width space - effectively hides from AI
+                }
+
+                // Regular command output - return as normal
                 currentHash = RewindSystem.quickHash(result);
                 logTime();
                 return result;
             }
-            
+
+            // Run module input hooks
+            for (const inputHook of moduleRegistry.hooks.input) {
+                try {
+                    const result = inputHook(text);
+                    if (result && result.active) {
+                        // Module consumed the input
+                        text = result.text || '\u200B';
+                        if (debug) console.log(`${MODULE_NAME}: Module input hook consumed input`);
+                        break; // Stop processing after first module that consumes input
+                    } else if (result && result.text) {
+                        // Module modified but didn't consume the input
+                        text = result.text;
+                    }
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Error in module input hook: ${e.message}`);
+                }
+            }
+
             // If BlueprintManager is active, delegate to it
             gwActive = hasActiveGeneration();
             if (typeof BlueprintManager !== 'undefined' && gwActive) {
@@ -6849,12 +7168,34 @@ function GameState(hook, text) {
             
             // Remove any hidden message markers from previous turns (including surrounding newlines)
             let modifiedText = text.replace(/\n*<<<[^>]*>>>\n*/g, '');
-            
-            // Move current scene card if it exists (before getters)
-            modifiedText = moveCurrentSceneCard(modifiedText);
-            
-            // Process all getters in the entire context (if getters exist)
+
+            // Run preContext hooks FIRST (for greedy modules like GenerationWizard)
+            let intercepted = false;
+            if (debug && moduleRegistry.hooks.preContext.length > 0) {
+                console.log(`${MODULE_NAME}: Running ${moduleRegistry.hooks.preContext.length} preContext hooks`);
+            }
+            for (const handler of moduleRegistry.hooks.preContext) {
+                try {
+                    const result = handler(modifiedText);
+                    if (result && result.active) {
+                        modifiedText = result.text;
+                        intercepted = true;
+                        if (debug) console.log(`${MODULE_NAME}: preContext hook intercepted context`);
+                        break; // Greedy hook - stop processing
+                    }
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Error in preContext hook: ${e.message}`);
+                }
+            }
+
+            // Initialize variables for logging (must be accessible outside conditional blocks)
+            let triggerNameMap = {};
             let gettersReplaced = {};
+
+            // If intercepted by greedy hook, skip normal context building
+            if (!intercepted) {
+                // Move current scene card if it exists (before getters)
+                modifiedText = moveCurrentSceneCard(modifiedText);
             // Check for universal object getters
             const hasUniversalGetters = UNIVERSAL_GETTER_PATTERN.test(modifiedText);
             
@@ -6890,7 +7231,8 @@ function GameState(hook, text) {
                     // Pre-load characters if needed
                     if (needsCharacters) {
                         const allChars = queryTags('Character');
-                        for (const [name, char] of Object.entries(allChars || {})) {
+                        for (const char of allChars || []) {
+                            const name = char.id.toLowerCase();
                             // Update to use just entity ID
                         dataCache[name] = char;  // New way
                         dataCache[`Character.${name}`] = char;  // Old way
@@ -6901,14 +7243,15 @@ function GameState(hook, text) {
             }
             
             // Build trigger name to username mapping and replace in tool usages
-            const triggerNameMap = {};
+            // triggerNameMap already declared above for logging scope
             const allCharacters = queryTags('Character');
-            
+
             // Get current action count for cleanup check
             const currentTurn = info?.actionCount || 0;
-            
+
             // Build the mapping from character data (info.trigger_name)
-            for (const [charName, character] of Object.entries(allCharacters || {})) {
+            for (const character of allCharacters || []) {
+                const charName = character.id.toLowerCase();
                 if (character.info?.trigger_name) {
                     const triggerName = character.info.trigger_name;
                     const username = character.id.toLowerCase();
@@ -6963,22 +7306,22 @@ function GameState(hook, text) {
                 });
             }
             
-            // Check if BlueprintManager needs to append prompts
-            gwActive = hasActiveGeneration();
-            if (typeof BlueprintManager !== 'undefined' && gwActive) {
-                if (debug) console.log(`${MODULE_NAME}: BlueprintManager is active`);
+            // Legacy BlueprintManager support removed - GenerationWizardModule handles this via hooks
+            } // End of !intercepted block
 
-                const result = BlueprintManager.process('context', modifiedText);
-                if (debug) console.log(`${MODULE_NAME}: BlueprintManager.process result: active=${result.active}, text length before=${modifiedText.length}, after=${result.text ? result.text.length : 'null'}`);
-                if (result.active) {
-                    modifiedText = result.text;  // Use wizard's modified context (with prompts appended)
+            // Run context modifier hooks (unless intercepted by greedy hook)
+            if (!intercepted) {
+                for (const handler of moduleRegistry.hooks.context) {
+                    try {
+                        modifiedText = handler(modifiedText);
+                    } catch (e) {
+                        console.log(`${MODULE_NAME}: Error in context hook: ${e.message}`);
+                    }
                 }
-            } else if (gwActive && typeof BlueprintManager === 'undefined') {
-                if (debug) console.log(`${MODULE_NAME}: BlueprintManager not available but generation is active`);
             }
-            
+
             // Apply CONTEXT_MODIFIER if available
-            if (contextModifier) {
+            if (!intercepted && contextModifier) {
                 try {
                     // Create context for the modifier
                     const context = {
@@ -6986,7 +7329,7 @@ function GameState(hook, text) {
                         set: set,
                         loadCharacter: function(name) {
                             const chars = queryTags('Character');
-                            return chars[name.toLowerCase()];
+                            return chars.find(c => c.id.toLowerCase() === name.toLowerCase());
                         },
                         Utilities: Utilities,
                         Calendar: typeof Calendar !== 'undefined' ? Calendar : null
@@ -7025,8 +7368,25 @@ function GameState(hook, text) {
             
             // Load output modifier
             loadOutputModifier();
-            
-            // Check if BlueprintManager is processing
+
+            // Run output hooks
+            for (const handler of moduleRegistry.hooks.output) {
+                try {
+                    const result = handler(text);
+                    if (result && result.active) {
+                        text = result.text;
+                        // If a greedy output hook intercepts, log and return
+                        logDebugTurn('output', null, null, {
+                            moduleIntercepted: true
+                        });
+                        return text;
+                    }
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Error in output hook: ${e.message}`);
+                }
+            }
+
+            // Check if BlueprintManager is processing (legacy support)
             gwActive = hasActiveGeneration();
             if (typeof BlueprintManager !== 'undefined' && gwActive) {
                 const result = BlueprintManager.process('output', text);
@@ -7109,4 +7469,8 @@ function GameState(hook, text) {
     // Log execution time before returning
     logTime();
     return GameState;
+}
+// Export for Node.js testing
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports = GameState;
 }
