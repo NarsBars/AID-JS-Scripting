@@ -66,7 +66,7 @@ function BlueprintModule() {
                             line: "section",
                             priority: 30,
                             format: "**Skills**\n{*: • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
-                            condition: "{Object.keys(skills).length > 0}"
+                            condition: "Object.keys(skills).length > 0"
                         }
                     ]
                 },
@@ -91,7 +91,7 @@ function BlueprintModule() {
                             line: "section",
                             priority: 40,
                             format: "**Inventory**\n{*: • {*} x{*.quantity}}",
-                            condition: "{Object.keys(inventory).length > 0}"
+                            condition: "Object.keys(inventory).length > 0"
                         }
                     ]
                 },
@@ -214,10 +214,24 @@ function BlueprintModule() {
                     displayname: null,  // The location's display name
                     description: null,
                     atmosphere: null,
-                    features: []
+                    features: [],
+                    display: [
+                        { line: "nameline", priority: 10, format: "## **{displayname}**" },
+                        { line: "section", priority: 20, format: "**Description**\n{description}", condition: "{description}" },
+                        { line: "section", priority: 25, format: "**Atmosphere**\n{atmosphere}", condition: "{atmosphere}" }
+                    ]
                 },
 
-                pathways: {}, // Connections to other locations
+                pathways: {
+                    display: [
+                        {
+                            line: "section",
+                            priority: 30,
+                            format: "**Pathways**\n{*→ • {*}: to {*}}",
+                            condition: "Object.keys(pathways).length > 0"
+                        }
+                    ]
+                }, // Connections to other locations
 
                 display: {
                     active: false
@@ -233,16 +247,7 @@ function BlueprintModule() {
                             stage: "collecting_fields",
                             promptTemplate: "embedded",
                             fields: {
-                                displayname: {
-                                    path: "info.displayname",
-                                    validation: "unique_entity_id",
-                                    key: "NAME",  // Use NAME in the prompt for locations
-                                    prompt: {
-                                        uncollected: "NAME: [What is this location called?]",
-                                        known: "Name: $(value)",
-                                        priority: 10
-                                    }
-                                },
+                                // displayname is provided when location is created, not collected
                                 description: {
                                     path: "info.description",
                                     key: "DESCRIPTION",
@@ -322,7 +327,8 @@ function BlueprintModule() {
                     type: 'Side',
                     display: [
                         { line: "infoline", priority: 15, format: "Given by: {giver}", condition: "{giver}" },
-                        { line: "infoline", priority: 16, format: "Type: {type}" }
+                        { line: "infoline", priority: 16, format: "Type: {type}" },
+                        { line: "infoline", priority: 17, format: "Current Stage: {objectives.current}/{objectives.total}" }
                     ]
                 },
 
@@ -331,17 +337,7 @@ function BlueprintModule() {
                     current: 1,
                     total: null,  // Will be set to match stage count
                     display: [
-                        {
-                            line: "infoline",
-                            priority: 17,
-                            format: "Current Stage: {current} of {total}"
-                        },
-                        {
-                            line: "section",
-                            priority: 35,
-                            format: "**Objectives**\n{stages.*→ • Stage {*}: {*.description}}",
-                            condition: "{stages}"
-                        }
+                        { line: "section", priority: 30, format: "**Objectives** ({current}/{total})\n{stages.*→ • Stage {*}: {*.description}}", condition: "Object.keys(stages).length > 0" }
                     ]
                 },
 
@@ -350,12 +346,8 @@ function BlueprintModule() {
                     col: null,  // Using col for SAO currency
                     items: {},
                     display: [
-                        {
-                            line: "section",
-                            priority: 45,
-                            format: "**Rewards**\nXP: {xp} | Col: {col}\n{items.*→ • {*} x{*.quantity}}",
-                            condition: "{xp || col}"
-                        }
+                        { line: "section", priority: 40, format: "**Rewards**\nXP: {xp} | Col: {col}", condition: "{xp} || {col}" },
+                        { line: "section", priority: 41, format: "Items:\n{items.*→ • {*} x{*.quantity}}", condition: "Object.keys(items).length > 0" }
                     ]
                 },
 

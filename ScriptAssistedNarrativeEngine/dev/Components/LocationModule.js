@@ -45,27 +45,15 @@ function LocationModule() {
                     return 'executed';
                 }
 
-                // Get location (optional - create if doesn't exist)
-                let location = GameState.get(locName);
+                // Get location - must already exist
+                const location = GameState.get(locName);
                 if (!location) {
-                    // Auto-create basic location if it doesn't exist
-                    if (debug) console.log(`${MODULE_NAME}: Location ${locName} not found, creating basic location`);
-                    location = {
-                        id: locName,
-                        GameplayTags: ['Location'],
-                        components: ['info', 'pathways', 'display']
-                    };
-                    // Initialize components with defaults
-                    if (GameState.initializeEntityComponents) {
-                        GameState.initializeEntityComponents(location);
+                    if (debug) console.log(`${MODULE_NAME}: Location ${locName} not found - use discover_location first`);
+                    // Track unknown location for potential generation
+                    if (GameState.trackUnknownEntity) {
+                        GameState.trackUnknownEntity(locName, 'update_location');
                     }
-                    // Set basic info for the location
-                    if (!location.info) location.info = {};
-                    location.info.description = `A location called ${locName}`;
-                    location.info.discovered = true;
-                    location.info.visited = true;
-
-                    GameState.save(locName, location);
+                    return 'executed';
                 }
 
                 // Ensure info component exists
@@ -109,26 +97,71 @@ function LocationModule() {
                     return 'executed';
                 }
 
-                // Get or create location
+                // Check if location already exists - if so, it's already discovered!
                 let location = GameState.get(locName);
-                if (!location) {
-                    if (debug) console.log(`${MODULE_NAME}: Creating new location ${locName}`);
-                    location = {
-                        id: locName,
-                        GameplayTags: ['Location'],
-                        components: ['info', 'pathways', 'display']
-                    };
-                    // Initialize components with defaults
-                    if (GameState.initializeEntityComponents) {
-                        GameState.initializeEntityComponents(location);
-                    }
-                    if (!location.info) location.info = {};
-                    location.info.description = `A location called ${locName}`;
+                if (location) {
+                    if (debug) console.log(`${MODULE_NAME}: Location ${locName} already exists - cannot discover existing location`);
+                    return 'malformed';
                 }
 
-                // Mark as discovered
-                if (!location.info) location.info = {};
-                location.info.discovered = true;
+                // Create new location using blueprint
+                if (debug) console.log(`${MODULE_NAME}: Creating new location ${locName} using blueprint`);
+
+                // Use instantiateBlueprint to create location with GenerationWizard support
+                if (GameState.instantiateBlueprint) {
+                    const locationData = {
+                        info: {
+                            displayname: locName,
+                            trigger_name: locName,
+                            discovered: true
+                        },
+                        pathways: {}
+                    };
+
+                    // If direction specified, set up pathways before creation
+                    if (dir && character.info?.currentLocation) {
+                        const opposites = {
+                            'north': 'south',
+                            'south': 'north',
+                            'east': 'west',
+                            'west': 'east',
+                            'up': 'down',
+                            'down': 'up',
+                            'inside': 'outside',
+                            'outside': 'inside',
+                            'enter': 'exit',
+                            'exit': 'enter'
+                        };
+
+                        // Add reverse pathway in the new location
+                        if (opposites[dir]) {
+                            locationData.pathways[opposites[dir]] = character.info.currentLocation;
+                        }
+                    }
+
+                    const newLocationId = GameState.instantiateBlueprint('Location', locationData);
+                    if (newLocationId) {
+                        location = GameState.get(newLocationId);
+                    }
+                }
+
+                // Fallback if blueprint system not available
+                if (!location) {
+                        location = {
+                            id: locName,
+                            GameplayTags: ['Location'],
+                            components: ['info', 'pathways', 'display']
+                        };
+                        // Initialize components with defaults
+                        if (GameState.initializeEntityComponents) {
+                            GameState.initializeEntityComponents(location);
+                        }
+                        if (!location.info) location.info = {};
+                        location.info.displayname = locName;
+                        location.info.description = `A location called ${locName}`;
+                        location.info.discovered = true;
+                        GameState.save(locName, location);
+                }
 
                 // If direction specified and character has current location, create connection
                 if (dir && character.info?.currentLocation) {
@@ -180,36 +213,51 @@ function LocationModule() {
                 const loc2Name = String(location2Name).toLowerCase();
                 const dir = direction ? String(direction).toLowerCase() : 'both';
 
-                // Get or create both locations
-                let loc1 = GameState.get(loc1Name);
-                if (!loc1) {
-                    if (debug) console.log(`${MODULE_NAME}: Creating location ${loc1Name}`);
-                    loc1 = {
-                        id: loc1Name,
-                        GameplayTags: ['Location'],
-                        components: ['info', 'pathways', 'display']
-                    };
-                    if (GameState.initializeEntityComponents) {
-                        GameState.initializeEntityComponents(loc1);
+                // Helper function to create location using blueprint
+                function getOrCreateLocation(locationName) {
+                    let location = GameState.get(locationName);
+                    if (!location) {
+                        if (debug) console.log(`${MODULE_NAME}: Creating location ${locationName} using blueprint`);
+
+                        // Use instantiateBlueprint to create location with GenerationWizard support
+                        if (GameState.instantiateBlueprint) {
+                            const locationData = {
+                                info: {
+                                    displayname: locationName,
+                                    trigger_name: locationName,
+                                    discovered: true
+                                },
+                                pathways: {}
+                            };
+
+                            const newLocationId = GameState.instantiateBlueprint('Location', locationData);
+                            if (newLocationId) {
+                                location = GameState.get(newLocationId);
+                            }
+                        }
+
+                        // Fallback if blueprint system not available
+                        if (!location) {
+                            location = {
+                                id: locationName,
+                                GameplayTags: ['Location'],
+                                components: ['info', 'pathways', 'display']
+                            };
+                            if (GameState.initializeEntityComponents) {
+                                GameState.initializeEntityComponents(location);
+                            }
+                            if (!location.info) location.info = {};
+                            location.info.displayname = locationName;
+                            location.info.description = `A location called ${locationName}`;
+                            GameState.save(locationName, location);
+                        }
                     }
-                    if (!loc1.info) loc1.info = {};
-                    loc1.info.description = `A location called ${loc1Name}`;
+                    return location;
                 }
 
-                let loc2 = GameState.get(loc2Name);
-                if (!loc2) {
-                    if (debug) console.log(`${MODULE_NAME}: Creating location ${loc2Name}`);
-                    loc2 = {
-                        id: loc2Name,
-                        GameplayTags: ['Location'],
-                        components: ['info', 'pathways', 'display']
-                    };
-                    if (GameState.initializeEntityComponents) {
-                        GameState.initializeEntityComponents(loc2);
-                    }
-                    if (!loc2.info) loc2.info = {};
-                    loc2.info.description = `A location called ${loc2Name}`;
-                }
+                // Get or create both locations
+                let loc1 = getOrCreateLocation(loc1Name);
+                let loc2 = getOrCreateLocation(loc2Name);
 
                 // Ensure pathways component exists
                 if (!loc1.pathways) loc1.pathways = {};

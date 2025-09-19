@@ -37,32 +37,62 @@ function QuestModule() {
 
                 const player = String(playerName).toLowerCase();
                 const quest = String(questName).toLowerCase().replace(/\s+/g, '_');
-                const giver = questGiver ? String(questGiver).toLowerCase() : null;
+                const giver = questGiver ? String(questGiver) : 'Unknown';
                 const type = questType ? String(questType) : 'Main';
 
-                // Get or create quest
+                // Check if quest already exists - if it does, we can't accept a new quest with same name
                 let questEntity = GameState.get(quest);
-                if (!questEntity) {
-                    if (debug) console.log(`${MODULE_NAME}: Creating new quest ${quest}`);
-                    questEntity = {
-                        id: quest,
-                        GameplayTags: ['Quest'],
-                        components: ['quest', 'objectives', 'rewards']
-                    };
-                    // Initialize components with defaults
-                    if (GameState.initializeEntityComponents) {
-                        GameState.initializeEntityComponents(questEntity);
-                    }
+                if (questEntity) {
+                    if (debug) console.log(`${MODULE_NAME}: Quest ${quest} already exists - cannot create duplicate`);
+                    return 'malformed';
                 }
 
-                // Update quest data
-                if (!questEntity.quest) questEntity.quest = {};
-                questEntity.quest.giver = giver;
-                questEntity.quest.type = type;
-                questEntity.quest.status = 'active';
+                // Create new quest
+                if (!questEntity) {
+                    if (debug) console.log(`${MODULE_NAME}: Creating new quest ${quest} using blueprint`);
 
-                // Save quest
-                GameState.save(quest, questEntity);
+                    // Use instantiateBlueprint to create quest with GenerationWizard support
+                    if (GameState.instantiateBlueprint) {
+                        const questData = {
+                            info: {
+                                displayname: quest,
+                                trigger_name: quest
+                            },
+                            quest: {
+                                giver: giver,
+                                type: type
+                            },
+                            objectives: {
+                                total: 3  // Default to 3 stages, can be adjusted
+                            }
+                        };
+
+                        const newQuestId = GameState.instantiateBlueprint('Quest', questData);
+                        if (newQuestId) {
+                            questEntity = GameState.get(newQuestId);
+                        }
+                    }
+
+                    // Fallback if blueprint system not available
+                    if (!questEntity) {
+                        questEntity = {
+                            id: quest,
+                            GameplayTags: ['Quest'],
+                            components: ['info', 'quest', 'objectives', 'rewards', 'display']
+                        };
+                        // Initialize components with defaults
+                        if (GameState.initializeEntityComponents) {
+                            GameState.initializeEntityComponents(questEntity);
+                        }
+                        // Update quest data
+                        if (!questEntity.quest) questEntity.quest = {};
+                        questEntity.quest.giver = giver;
+                        questEntity.quest.type = type;
+
+                        // Save quest
+                        GameState.save(quest, questEntity);
+                    }
+                }
 
                 // Update player's active quests if player exists
                 const playerEntity = GameState.get(player);
@@ -83,43 +113,12 @@ function QuestModule() {
             },
 
             offer_quest: function(params) {
-                const [npcName, questName, questGiver, questType] = params;
-
-                if (!npcName || !questName) return 'malformed';
-
-                const npc = String(npcName).toLowerCase();
-                const quest = String(questName).toLowerCase().replace(/\s+/g, '_');
-                const giver = questGiver ? String(questGiver).toLowerCase() : npc;
-                const type = questType ? String(questType) : 'Side';
-
-                // Create or update quest as available
-                let questEntity = GameState.get(quest);
-                if (!questEntity) {
-                    if (debug) console.log(`${MODULE_NAME}: Creating new quest ${quest}`);
-                    questEntity = {
-                        id: quest,
-                        GameplayTags: ['Quest'],
-                        components: ['quest', 'objectives', 'rewards']
-                    };
-                    // Initialize components with defaults
-                    if (GameState.initializeEntityComponents) {
-                        GameState.initializeEntityComponents(questEntity);
-                    }
-                }
-
-                // Update quest data
-                if (!questEntity.quest) questEntity.quest = {};
-                questEntity.quest.giver = giver;
-                questEntity.quest.type = type;
-                questEntity.quest.status = 'available';
-
-                // Save quest
-                GameState.save(quest, questEntity);
-
+                // This tool does nothing - it's just a notification that an NPC has a quest
+                // The actual quest creation happens with accept_quest
                 if (debug) {
-                    console.log(`${MODULE_NAME}: ${npc} offers quest ${quest} (${type})`);
+                    const [npcName, questName] = params;
+                    console.log(`${MODULE_NAME}: ${npcName} offers quest ${questName} (notification only)`);
                 }
-
                 return 'executed';
             },
 

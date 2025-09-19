@@ -1575,6 +1575,11 @@ function GameState(hook, text) {
 
             // Format the display text using the new template system
             const formatted = formatTemplateString(rule.format, entity, rule.componentData, rule.component);
+            if (debug && (rule.component === 'rewards' || rule.component === 'objectives')) {
+                console.log(`${MODULE_NAME}: Processing ${rule.component} display rule`);
+                console.log(`${MODULE_NAME}: Format: ${rule.format}`);
+                console.log(`${MODULE_NAME}: Formatted result: ${formatted}`);
+            }
             if (formatted && formatted.trim()) {
                 const targetSection = sections[rule.line] || sections.section;
                 targetSection.push(formatted);
@@ -1631,8 +1636,21 @@ function GameState(hook, text) {
             if (evaluable.includes('Object.keys')) {
                 const match = evaluable.match(/Object\.keys\((\w+)\)\.length\s*>\s*(\d+)/);
                 if (match) {
-                    const component = entity[match[1]];
+                    // First try to find it in the component data
+                    const fieldName = match[1];
                     const threshold = parseInt(match[2]);
+
+                    // Try component data first (for fields like stages, items)
+                    if (componentData && componentData[fieldName]) {
+                        const fieldValue = componentData[fieldName];
+                        if (typeof fieldValue === 'object') {
+                            const dataKeys = Object.keys(fieldValue).filter(k => k !== 'display');
+                            return dataKeys.length > threshold;
+                        }
+                    }
+
+                    // Fall back to entity level (for top-level components)
+                    const component = entity[fieldName];
                     if (component) {
                         // Exclude 'display' field when counting component keys
                         const dataKeys = Object.keys(component).filter(k => k !== 'display');
@@ -2127,6 +2145,15 @@ function GameState(hook, text) {
 
             // Update card map
             entityCardMap[entityId] = `[SANE:E] ${entityId}`;
+
+            // Remove from [SANE:D] data cards if it exists there
+            const existingData = loadFromDataCards() || {};
+            if (existingData[entityId]) {
+                if (debug) console.log(`${MODULE_NAME}: Removing ${entityId} from [SANE:D] data cards (moved to [SANE:E])`);
+                delete existingData[entityId];
+                saveToDataCards(existingData);
+            }
+
             return true; // Successfully saved to [SANE:E] card
         } else {
             // Save to [SANE:D] collection
@@ -2138,6 +2165,16 @@ function GameState(hook, text) {
 
             // Save back to cards
             saveToDataCards(existingData);
+
+            // Remove from [SANE:E] cards if it exists there (entity was deactivated)
+            const entityCard = Utilities.storyCard.get(`[SANE:E] ${entityId}`);
+            if (entityCard) {
+                if (debug) console.log(`${MODULE_NAME}: Removing [SANE:E] ${entityId} card (moved to [SANE:D])`);
+                Utilities.storyCard.remove(`[SANE:E] ${entityId}`);
+                // Also clean up any overflow cards
+                cleanupOverflowCards(entityId);
+            }
+
             return true; // Successfully saved to [SANE:D] card
         }
     }

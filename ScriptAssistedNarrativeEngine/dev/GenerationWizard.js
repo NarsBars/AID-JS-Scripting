@@ -2205,12 +2205,21 @@ function GenerationWizardModule() {
 
         const [name, location] = params;
 
+        if (!name) return 'malformed';
+
+        // Check if character already exists
+        const characterId = name.toLowerCase();
+        if (GameState.get(characterId)) {
+            console.log(`${MODULE_NAME}: Character ${characterId} already exists - cannot generate existing character`);
+            return 'malformed';
+        }
+
         // Properly structure the data for the blueprint
         const entityData = {};
 
         // Set the ID if name is provided
         if (name) {
-            entityData.id = name.toLowerCase();
+            entityData.id = characterId;
             // Store the trigger name in generationwizard for prompt context
             entityData.generationwizard = {
                 trigger: name  // This will be used in prompt generation
@@ -2231,16 +2240,61 @@ function GenerationWizardModule() {
     }
 
     function gw_location(params) {
-        const [name] = params;
+        const [name, direction] = params;
+
+        if (!name) return 'malformed';
+
+        // Check if location already exists
+        const locationId = name.toLowerCase().replace(/\s+/g, '_');
+        if (GameState.get(locationId)) {
+            console.log(`${MODULE_NAME}: Location ${locationId} already exists - cannot generate existing location`);
+            return 'malformed';
+        }
 
         // Properly structure the data for the blueprint
         const entityData = {};
         if (name) {
-            entityData.id = name.toLowerCase().replace(/\s+/g, '_');
-            // Store the trigger name in generationwizard for prompt context
-            entityData.generationwizard = {
-                trigger: name  // This will be used in prompt generation
+            entityData.id = locationId;
+            entityData.info = {
+                displayname: name,
+                trigger_name: name
             };
+
+            // Get player's current location for pathway connection
+            const player = GameState.get('player');
+            if (player && player.info && player.info.currentLocation) {
+                const currentLocation = GameState.get(player.info.currentLocation);
+                if (currentLocation) {
+                    // Add pathway from current location to new location
+                    const dir = direction || 'path';  // Default to generic 'path' if no direction specified
+
+                    // Set up pathways - will be saved after blueprint instantiation
+                    entityData.pathways = {};
+
+                    // Determine opposite direction
+                    const opposites = {
+                        'north': 'south',
+                        'south': 'north',
+                        'east': 'west',
+                        'west': 'east',
+                        'up': 'down',
+                        'down': 'up',
+                        'inside': 'outside',
+                        'outside': 'inside'
+                    };
+
+                    // Add reverse pathway
+                    const reverseDir = opposites[dir] || player.info.currentLocation;
+                    entityData.pathways[reverseDir] = player.info.currentLocation;
+
+                    // Update current location's pathways to include new location
+                    if (!currentLocation.pathways) currentLocation.pathways = {};
+                    currentLocation.pathways[dir] = entityData.id;
+                    GameState.save(player.info.currentLocation, currentLocation);
+
+                    if (debug) console.log(`${MODULE_NAME}: Connecting ${player.info.currentLocation} -${dir}-> ${entityData.id}`);
+                }
+            }
         }
 
         // Use the internal instantiateBlueprint which handles updateGenerationFields
@@ -2277,6 +2331,13 @@ function GenerationWizardModule() {
         const questGiver = giver || questGivers[Math.floor(Math.random() * questGivers.length)];
         const questType = type || questTypes[Math.floor(Math.random() * questTypes.length)];
 
+        // Check if quest already exists
+        const questId = questName.toLowerCase().replace(/\s+/g, '_');
+        if (GameState.get(questId)) {
+            console.log(`${MODULE_NAME}: Quest ${questId} already exists - cannot generate existing quest`);
+            return 'malformed';
+        }
+
         // Determine number of stages based on quest type (using ranges for variety)
         const stageRanges = {
             'Story': [4, 7],   // Main story quests: 4-7 stages
@@ -2289,7 +2350,7 @@ function GenerationWizardModule() {
         const stageCount = Math.floor(Math.random() * (range[1] - range[0] + 1)) + range[0];
 
         // Set the quest ID and display name
-        entityData.id = questName.toLowerCase().replace(/\s+/g, '_');
+        entityData.id = questId;
 
         // Pre-fill all known data
         entityData.info = {

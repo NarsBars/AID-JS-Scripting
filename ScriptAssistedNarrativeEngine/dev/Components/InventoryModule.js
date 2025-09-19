@@ -36,7 +36,7 @@ function InventoryModule() {
                             line: "section",
                             priority: 40,
                             format: "**Inventory**\n{*→ • {*} x{*.quantity}}",
-                            condition: "{Object.keys(inventory).length > 0}"
+                            condition: "Object.keys(inventory).length > 0"
                         }
                     ]
                 }

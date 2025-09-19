@@ -91,7 +91,7 @@ function SkillsModule() {
                             line: "section",
                             priority: 30,
                             format: "**Skills**\n{*→ • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
-                            condition: "{Object.keys(skills).length > 0}"
+                            condition: "Object.keys(skills).length > 0"
                         }
                     ]
                 },
