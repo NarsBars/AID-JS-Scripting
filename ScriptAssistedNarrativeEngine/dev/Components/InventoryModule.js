@@ -30,16 +30,7 @@ function InventoryModule() {
         schemas: {
             inventory: {
                 id: 'inventory',
-                defaults: {
-                    display: [
-                        {
-                            line: "section",
-                            priority: 40,
-                            format: "**Inventory**\n{*→ • {*} x{*.quantity}}",
-                            condition: "Object.keys(inventory).length > 0"
-                        }
-                    ]
-                }
+                defaults: {}  // Items are added dynamically
             }
         },
 
@@ -182,6 +173,12 @@ function InventoryModule() {
                 // Alias for remove_item
                 return this.remove_item(params);
             }
+        },
+
+        // API functions exposed to GameState and other modules
+        api: {
+            getItemQuantity: getItemQuantity,
+            setItemQuantity: setItemQuantity
         },
 
         // Module initialization

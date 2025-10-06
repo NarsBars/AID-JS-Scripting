@@ -14,16 +14,9 @@ function QuestModule() {
                 id: 'quest',
                 defaults: {
                     giver: null,
-                    type: 'Main',
-                    status: 'available',
+                    type: null,
                     stages: {},
-                    prerequisites: [],
-                    display: [
-                        { line: "nameline", priority: 10, format: "## **Quest: $(id)**" },
-                        { line: "infoline", priority: 10, format: "Type: $(type)", condition: "$(type)" },
-                        { line: "infoline", priority: 20, format: "Status: $(status)", condition: "$(status)" },
-                        { line: "section", priority: 30, format: "**Stages**\n$(stages: • Stage $(*): $(*))", condition: "$(Object.keys(stages).length > 0)" }
-                    ]
+                    prerequisites: []
                 }
             }
         },

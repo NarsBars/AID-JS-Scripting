@@ -12,16 +12,7 @@ function LocationModule() {
         schemas: {
             pathways: {
                 id: 'pathways',
-                defaults: {
-                    // Connections to other locations
-                    // Format: { "north": "location_id", "south": "location_id", etc. }
-                    display: {
-                        line: "section",
-                        priority: 40,
-                        format: "**Connections**\n$(*: • $(*.direction): $(*.destination))",
-                        condition: "$(Object.keys(pathways).length > 0)"
-                    }
-                }
+                defaults: {}  // Connections to other locations - Format: { "north": "location_id", "south": "location_id", etc. }
             }
         },
 
@@ -135,7 +126,7 @@ function LocationModule() {
 
                         // Add reverse pathway in the new location
                         if (opposites[dir]) {
-                            locationData.pathways[opposites[dir]] = character.info.currentLocation;
+                            locationData.pathways[opposites[dir]] = { destination: character.info.currentLocation };
                         }
                     }
 
@@ -169,7 +160,7 @@ function LocationModule() {
                     if (currentLoc) {
                         // Add pathway from current location to new location
                         if (!currentLoc.pathways) currentLoc.pathways = {};
-                        currentLoc.pathways[dir] = locName;
+                        currentLoc.pathways[dir] = { destination: locName };
 
                         // Add reverse pathway if opposites are defined
                         const opposites = {
@@ -187,7 +178,7 @@ function LocationModule() {
 
                         if (opposites[dir]) {
                             if (!location.pathways) location.pathways = {};
-                            location.pathways[opposites[dir]] = character.info.currentLocation;
+                            location.pathways[opposites[dir]] = { destination: character.info.currentLocation };
                         }
 
                         GameState.save(character.info.currentLocation, currentLoc);
@@ -263,32 +254,25 @@ function LocationModule() {
                 if (!loc1.pathways) loc1.pathways = {};
                 if (!loc2.pathways) loc2.pathways = {};
 
-                // Handle direction connections
-                if (dir === 'both') {
-                    // Create bidirectional connection with generic names
-                    loc1.pathways[loc2Name] = loc2Name;
-                    loc2.pathways[loc1Name] = loc1Name;
-                } else {
-                    // Create directional connection
-                    loc1.pathways[dir] = loc2Name;
+                // Create directional connection
+                loc1.pathways[dir] = { destination: loc2Name };
 
-                    // Add reverse pathway if opposites are defined
-                    const opposites = {
-                        'north': 'south',
-                        'south': 'north',
-                        'east': 'west',
-                        'west': 'east',
-                        'up': 'down',
-                        'down': 'up',
-                        'inside': 'outside',
-                        'outside': 'inside',
-                        'enter': 'exit',
-                        'exit': 'enter'
-                    };
+                // Add reverse pathway if opposites are defined
+                const opposites = {
+                    'north': 'south',
+                    'south': 'north',
+                    'east': 'west',
+                    'west': 'east',
+                    'up': 'down',
+                    'down': 'up',
+                    'inside': 'outside',
+                    'outside': 'inside',
+                    'enter': 'exit',
+                    'exit': 'enter'
+                };
 
-                    if (opposites[dir]) {
-                        loc2.pathways[opposites[dir]] = loc1Name;
-                    }
+                if (opposites[dir]) {
+                    loc2.pathways[opposites[dir]] = { destination: loc1Name };
                 }
 
                 // Save both locations

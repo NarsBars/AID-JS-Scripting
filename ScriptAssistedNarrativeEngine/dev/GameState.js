@@ -1,6 +1,45 @@
 function GameState(hook, text) {
     'use strict';
 
+    // ========================================
+    // TABLE OF CONTENTS
+    // ========================================
+    // SECTION 1: INITIALIZATION & VARIABLES
+    // SECTION 2: MODULE REGISTRY SYSTEM
+    // SECTION 3: DATA MANAGEMENT SYSTEM
+    //   3A: Data Cache & Storage
+    //   3B: Universal Data Access (get/set/resolve)
+    //   3C: Entity Management
+    //   3D: Component System
+    //   3E: Global Variables
+    //   3F: Data Card Operations
+    //   3G: Schema Management
+    // SECTION 4: DEBUG & LOGGING SYSTEM
+    // SECTION 5: LOCATION & PATHWAYS
+    // SECTION 6: DISPLAY SYSTEM
+    // SECTION 7: BLUEPRINT SYSTEM
+    // SECTION 8: GAMEPLAY TAG SYSTEM
+    // SECTION 9: ALIAS MANAGEMENT
+    // SECTION 10: RUNTIME LOADERS (Tools, Commands, Modifiers)
+    // SECTION 11: REWIND SYSTEM
+    // SECTION 12: ENTITY TRACKER & AUTO-GENERATION
+    // SECTION 13: RPG CALCULATIONS & FORMULAS
+    // SECTION 14: TEMPLATE & DISPLAY FUNCTIONS
+    // SECTION 15: INVENTORY MANAGEMENT
+    // SECTION 16: COMMAND PROCESSING
+    // SECTION 17: GETTER PROCESSING
+    // SECTION 18: TIME INTEGRATION
+    // SECTION 19: SCENE MANAGEMENT
+    // SECTION 20: TOOL PROCESSING
+    // SECTION 21: DEBUG COMMANDS
+    // SECTION 22: MODULE DISCOVERY
+    // SECTION 23: HOOK PROCESSORS
+    // ========================================
+
+    // ========================================
+    // SECTION 1: INITIALIZATION & VARIABLES
+    // ========================================
+
     // GenerationWizard state
     let gwActive = false;
 
@@ -54,6 +93,16 @@ function GameState(hook, text) {
         if (moduleRegistry.modules[moduleName]) {
             if (debug) console.log(`${MODULE_NAME}: Module '${moduleName}' already registered, skipping`);
             return;
+        }
+
+        // Special handling for DisplayModule - capture its API functions
+        if (moduleName === 'DisplayModule' && module.api) {
+            buildEntityDisplay = module.api.buildEntityDisplay;
+            formatTemplateString = module.api.formatTemplateString;
+            evaluateTemplateCondition = module.api.evaluateTemplateCondition;
+            TemplateParser = module.api.TemplateParser;
+            displayModule = module;
+            if (debug) console.log(`${MODULE_NAME}: DisplayModule API functions registered`);
         }
 
         // Register tools
@@ -141,9 +190,6 @@ function GameState(hook, text) {
             }
 
             // Execute to populate Library object with custom functions
-            // The library code should assign functions to the Library object
-            // Example: Library.customFunction = function() { ... }
-            // The Library object and all standard globals are available in eval context
             eval(libCode);
 
             // Store any new library functions in dataCache
@@ -153,11 +199,6 @@ function GameState(hook, text) {
                 }
             }
 
-            // Universal data access - IMPORTANT: These will be set after functions are defined
-            // We'll assign them at the end of GameState initialization
-            // Library.get = get;
-            // Library.set = set;
-            // Library.del = del;
 
             if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(Library).length} library functions (built-in + custom)`);
         } catch (e) {
@@ -241,20 +282,20 @@ function GameState(hook, text) {
                         if (entity && entity.aliases) {
                             for (const alias of entity.aliases) {
                                 const normalizedAlias = normalizeEntityId(alias);
-                                const normalizedEntityId = normalizeEntityId(entityId);
-                                if (entityAliasMap[normalizedAlias] && entityAliasMap[normalizedAlias] !== normalizedEntityId) {
-                                    console.log(`${MODULE_NAME}: WARNING - Duplicate alias '${alias}' - was ${entityAliasMap[normalizedAlias]}, now ${normalizedEntityId}`);
+                                // Map normalized alias to ORIGINAL entity ID (preserves case for card lookup)
+                                if (entityAliasMap[normalizedAlias] && entityAliasMap[normalizedAlias] !== entityId) {
+                                    console.log(`${MODULE_NAME}: WARNING - Duplicate alias '${alias}' - was ${entityAliasMap[normalizedAlias]}, now ${entityId}`);
                                     duplicates++;
                                 }
-                                entityAliasMap[normalizedAlias] = normalizedEntityId;
+                                entityAliasMap[normalizedAlias] = entityId;  // Store original case
                                 aliasCount++;
                             }
                         }
 
-                        // Always map the entity ID to itself for lookups (normalized)
+                        // Always map the normalized entity ID to the ORIGINAL for lookups
                         if (entityId) {
                             const normalizedId = normalizeEntityId(entityId);
-                            entityAliasMap[normalizedId] = normalizedId;
+                            entityAliasMap[normalizedId] = entityId;  // Map normalized to original
                         }
                     }
 
@@ -277,16 +318,22 @@ function GameState(hook, text) {
                     for (const [entityId, entity] of Object.entries(data)) {
                         if (entity && entity.aliases) {
                             for (const alias of entity.aliases) {
-                                if (entityAliasMap[alias] && entityAliasMap[alias] !== entityId) {
-                                    console.warn(`${MODULE_NAME}: Duplicate alias '${alias}' - was ${entityAliasMap[alias]}, now ${entityId}`);
+                                const normalizedAlias = normalizeEntityId(alias);
+                                // Map normalized alias to ORIGINAL entity ID (preserves case)
+                                if (entityAliasMap[normalizedAlias] && entityAliasMap[normalizedAlias] !== entityId) {
+                                    console.warn(`${MODULE_NAME}: Duplicate alias '${alias}' - was ${entityAliasMap[normalizedAlias]}, now ${entityId}`);
                                     duplicates++;
                                 }
-                                entityAliasMap[alias] = entityId;
+                                entityAliasMap[normalizedAlias] = entityId;  // Store original case
                                 aliasCount++;
                             }
                         }
 
-                        // Don't map the entity ID to itself - that's redundant
+                        // Map normalized entity ID to ORIGINAL for lookups
+                        if (entityId) {
+                            const normalizedId = normalizeEntityId(entityId);
+                            entityAliasMap[normalizedId] = entityId;  // Map normalized to original
+                        }
                     }
                 } catch (e) {
                     console.log(`${MODULE_NAME}: Failed to parse ${card.title}: ${e.message}`);
@@ -420,55 +467,16 @@ function GameState(hook, text) {
         return false;
     }
 
-    function findActiveGeneration() {
-        // Find entity with generationwizard.state = 'generating'
-        const allEntities = loadFromDataCards() || {};
-        for (const [id, entity] of Object.entries(allEntities)) {
-            if (entity?.generationwizard?.state === 'generating') {
-                return { entityId: id, entity };
-            }
-        }
-        // Check [SANE:E] cards too
-        const entityCards = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[SANE:E]'),
-            true
-        ) || [];
-        for (const card of entityCards) {
-            try {
-                const entities = parseEntityData(card.description || '');
-                for (const [id, entity] of Object.entries(entities)) {
-                    if (entity?.generationwizard?.state === 'generating') {
-                        return { entityId: id, entity };
-                    }
-                }
-            } catch (e) {}
-        }
-        return null;
-    }
-
-    function findQueuedGenerations() {
-        const queued = [];
-        // Check all entities for queued generations
-        const allEntities = loadFromDataCards() || {};
-        for (const [id, entity] of Object.entries(allEntities)) {
-            if (entity?.generationwizard?.state === 'queued') {
-                queued.push({ entityId: id, entity });
-            }
-        }
-        return queued;
-    }
-
     // Tool pattern: standard function calls like tool_name(param1, param2, param3)
     const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/gi;
     
     // Universal getter pattern for object data: get(objectType.entityName.field)
     // Examples: get(Bob.level)
     const UNIVERSAL_GETTER_PATTERN = /get\[([^\]]+)\]/gi;
-    
-    
-    // ==========================
-    // Debug Logging System
-    // ==========================
+
+    // ========================================
+    // SECTION 4: DEBUG & LOGGING SYSTEM
+    // ========================================
     const MAX_DEBUG_TURNS = 5; // Keep only last 5 turns to save state space
     
     function initDebugLogging() {
@@ -864,11 +872,31 @@ function GameState(hook, text) {
         
         return `Debug log saved to [DEBUG] Debug Log story card.`;
     }
-    
-    // ==========================
-    // Universal Data System
-    // ==========================
-    
+
+    // ========================================
+    // SECTION 3: DATA MANAGEMENT SYSTEM
+    // ========================================
+    // Consolidated data management functionality including:
+    // - Data cache and storage
+    // - Universal data access (get/set/resolve)
+    // - Entity management and persistence
+    // - Component system
+    // - Global variables
+    // - Data card operations
+    // - Schema management
+
+    // ========================================
+    // SECTION 3A: DATA CACHE & STORAGE
+    // ========================================
+
+    // Data cache is initialized at the module level (line 60)
+    // dataCache = {} - Unified cache for entities, variables, schemas, functions
+    // entityAliasMap = {} - Maps aliases to entity IDs
+
+    // ========================================
+    // SECTION 3B: UNIVERSAL DATA ACCESS
+    // ========================================
+
     // Universal getter function - access any data via path
     // Resolve dynamic expressions in paths
     // Examples:
@@ -998,48 +1026,51 @@ function GameState(hook, text) {
         // Parse path for regular data access
         const parts = path.split('.');
 
-        // Single part = direct dataCache lookup (entity ID or variable)
+        // Single part = direct lookup (entity ID or variable)
         if (parts.length === 1) {
-            // Check dataCache directly
-            if (dataCache[path] !== undefined) {
-                return dataCache[path];
-            }
+            // Normalize the path for case-insensitive lookup
+            const normalizedPath = normalizeEntityId(path);
 
-            // Check aliases
-            for (const [key, data] of Object.entries(dataCache)) {
-                if (data && data.aliases && data.aliases.includes(path)) {
-                    return data;
-                }
+            // Check if this is an alias that maps to a different entity ID
+            const mappedId = entityAliasMap[normalizedPath];
+            const lookupKey = mappedId ? normalizeEntityId(mappedId) : normalizedPath;
+
+            // Direct lookup in cache using normalized key
+            if (dataCache[lookupKey]) {
+                return dataCache[lookupKey];
             }
 
             // Try to load entity if not cached
             // First check if it's a known entity type by checking entity card map
             if (!entityCardMap) buildEntityCardMap();
 
-            // Check if path is an alias that maps to a different entity ID (case-insensitive)
-            const normalizedPath = normalizeEntityId(path);
-            const mappedId = entityAliasMap[normalizedPath];
-            const entityId = mappedId || normalizedPath; // Use mapped ID if it exists, otherwise use normalized path
+            // Get the actual card title from the map using the normalized path
+            const cardTitle = entityCardMap[normalizedPath];
+            if (!cardTitle) {
+                return undefined; // No card found for this entity
+            }
 
-            // Try to load from [SANE:E] card first
-            const entityCard = Utilities.storyCard.get(`[SANE:E] ${entityId}`);
+            // Load the card using the actual title
+            const entityCard = Utilities.storyCard.get(cardTitle);
             if (entityCard) {
                 // Use parseEntityData to handle delimiters properly
                 const parsedData = parseEntityData(entityCard.description || '');
-                // parseEntityData returns an object with entityId as key
-                const entity = parsedData ? parsedData[entityId] : null;
+                // Get the first (and should be only) entity from the parsed data
+                const actualEntityId = parsedData ? Object.keys(parsedData)[0] : null;
+                const entity = actualEntityId ? parsedData[actualEntityId] : null;
                 if (entity) {
-                    entity.id = entityId;  // Add the ID field
-                    dataCache[entityId] = entity;
-                    // Register all aliases
+                    entity.id = actualEntityId;  // Preserve original case in entity
+
+                    // Cache under NORMALIZED key for consistent lookups
+                    const normalizedEntityId = normalizeEntityId(actualEntityId);
+                    dataCache[normalizedEntityId] = entity;
+
+                    // Register all aliases to point to the actual entity ID
                     if (entity.aliases) {
                         for (const alias of entity.aliases) {
-                            entityAliasMap[alias] = entityId;
+                            const normalizedAlias = normalizeEntityId(alias);
+                            entityAliasMap[normalizedAlias] = actualEntityId;
                         }
-                    }
-                    // Also cache under the original path if it was an alias
-                    if (mappedId) {
-                        dataCache[path] = entity;
                     }
                     return entity;
                 }
@@ -1064,15 +1095,17 @@ function GameState(hook, text) {
                     // Check if entityId exists in this card (either as direct ID or mapped from alias)
                     if (data[entityId]) {
                         const entity = data[entityId];
-                        entity.id = entityId;  // Add the ID field
+                        entity.id = entityId;  // Preserve original case
 
-                        // Cache the entity
-                        dataCache[entityId] = entity;
+                        // Cache with NORMALIZED key
+                        const normalizedEntityId = normalizeEntityId(entityId);
+                        dataCache[normalizedEntityId] = entity;
 
                         // Register aliases if present
                         if (entity.aliases) {
                             for (const alias of entity.aliases) {
-                                entityAliasMap[alias] = entityId;
+                                const normalizedAlias = normalizeEntityId(alias);
+                                entityAliasMap[normalizedAlias] = entityId;
                             }
                         }
 
@@ -1130,8 +1163,9 @@ function GameState(hook, text) {
             return varFieldPath ? getNestedField(value, varFieldPath) : value;
         }
 
-        // Load entity from cache
-        const entity = dataCache[entityId] || get(entityId);
+        // Load entity from cache using normalized key
+        const normalizedEntityId = normalizeEntityId(entityId);
+        const entity = dataCache[normalizedEntityId] || get(entityId);
         if (!entity) return undefined;
 
         // Return field or entire entity
@@ -1357,6 +1391,37 @@ function GameState(hook, text) {
         return true;
     }
 
+    // ========================================
+    // SECTION 3C: ENTITY MANAGEMENT
+    // ========================================
+    // Functions for creating, saving, loading, and managing entities
+    // Note: Primary entity management functions are located here
+    // Additional entity functions like saveEntity() are in their original locations
+    // and will be consolidated in a future refactor
+
+    // ========================================
+    // SECTION 3D: COMPONENT SYSTEM
+    // ========================================
+    // Component initialization and schema management
+    // Note: Component functions to be consolidated here
+
+    // ========================================
+    // SECTION 3E: GLOBAL VARIABLES
+    // ========================================
+    // Global variable loading and management
+    // Note: Global variable functions to be consolidated here
+
+    // ========================================
+    // SECTION 3F: DATA CARD OPERATIONS
+    // ========================================
+    // Low-level Story Card read/write operations
+    // Note: Data card functions to be consolidated here
+
+    // ========================================
+    // SECTION 3G: SCHEMA MANAGEMENT
+    // ========================================
+    // Schema loading and caching
+    // Note: Schema functions to be consolidated here
 
     // ==========================
     // Location Helper Functions
@@ -1487,33 +1552,53 @@ function GameState(hook, text) {
     }
 
     // Build the display for an entity using component-embedded display rules
-    function buildEntityDisplay(entity) {
+    // NOTE: Default implementation - replaced by DisplayModule when it loads
+    buildEntityDisplay = function(entity) {
         if (!entity || typeof entity !== 'object') {
             if (debug) console.log(`${MODULE_NAME}: buildEntityDisplay: Invalid entity`);
             return '';
         }
 
-        // Collect all display rules from components
+        // Check if entity is wrapped (i.e., has only one key that matches an entity ID pattern)
+        const topKeys = Object.keys(entity);
+        if (topKeys.length === 1 && !entity.id) {
+            // Entity might be wrapped - unwrap it
+            const possibleEntityId = topKeys[0];
+            const possibleEntity = entity[possibleEntityId];
+            if (possibleEntity && possibleEntity.id) {
+                console.log(`${MODULE_NAME}: WARNING - buildEntityDisplay received wrapped entity, unwrapping ${possibleEntityId}`);
+                entity = possibleEntity;
+            }
+        }
+
+        if (debug && entity.id === 'asdf') {
+            console.log(`${MODULE_NAME}: buildEntityDisplay for asdf:`);
+            console.log(`  Has inventory:`, !!entity.inventory, entity.inventory ? Object.keys(entity.inventory) : 'N/A');
+            console.log(`  Has relationships:`, !!entity.relationships, entity.relationships ? Object.keys(entity.relationships) : 'N/A');
+        }
+
+
+        // Collect all display rules from the display component
         const displayRules = [];
+        const displayComponent = entity.display || {};
 
-        // Gather display rules embedded in each component's data
-        if (entity.components && Array.isArray(entity.components)) {
-            for (const componentName of entity.components) {
-                const component = entity[componentName];
-                if (!component || typeof component !== 'object') continue;
+        // Gather display rules from display component for each component
+        for (const componentName of Object.keys(displayComponent)) {
+            // Skip non-component fields in display
+            if (['active', 'separators', 'order', 'prefixline', 'footer'].includes(componentName)) {
+                continue;
+            }
 
-                // Check for display rules in the component
-                if (component.display) {
-                    // Handle both single rule and array of rules
-                    const rules = Array.isArray(component.display) ? component.display : [component.display];
-                    for (const rule of rules) {
-                        displayRules.push({
-                            component: componentName,
-                            componentData: component,
-                            ...rule
-                        });
-                    }
-                }
+            const componentRules = displayComponent[componentName];
+            if (!componentRules) continue;
+
+            // Handle both single rule and array of rules
+            const rules = Array.isArray(componentRules) ? componentRules : [componentRules];
+            for (const rule of rules) {
+                displayRules.push({
+                    component: componentName,
+                    ...rule
+                });
             }
         }
 
@@ -1530,15 +1615,14 @@ function GameState(hook, text) {
         };
 
         // Get display component configuration
-        const displayConfig = entity.display || {
-            separators: {
-                nameline: ' ',
-                infoline: ' | ',
-                section: '\n',
-                footer: '\n'
-            },
-            order: ['prefixline', 'nameline', 'infoline', 'section', 'footer']
+        const displayConfig = entity.display || {};
+        const separators = displayConfig.separators || {
+            nameline: ' ',
+            infoline: ' | ',
+            section: '\n',
+            footer: '\n'
         };
+        const order = displayConfig.order || ['prefixline', 'nameline', 'infoline', 'section', 'footer'];
 
         // 1. Handle prefixline from display component
         if (displayConfig.prefixline) {
@@ -1568,13 +1652,13 @@ function GameState(hook, text) {
         for (const rule of displayRules) {
             // Check condition if present
             if (rule.condition) {
-                if (!evaluateTemplateCondition(rule.condition, entity, rule.componentData)) {
+                if (!evaluateTemplateCondition(rule.condition, entity)) {
                     continue;
                 }
             }
 
             // Format the display text using the new template system
-            const formatted = formatTemplateString(rule.format, entity, rule.componentData, rule.component);
+            const formatted = formatTemplateString(rule.format, entity);
             if (debug && (rule.component === 'rewards' || rule.component === 'objectives')) {
                 console.log(`${MODULE_NAME}: Processing ${rule.component} display rule`);
                 console.log(`${MODULE_NAME}: Format: ${rule.format}`);
@@ -1588,13 +1672,12 @@ function GameState(hook, text) {
 
         // 3. Compile final output using display component's order and separators
         const output = [];
-        const order = displayConfig.order || ['prefixline', 'nameline', 'infoline', 'section', 'footer'];
 
         for (const sectionName of order) {
             const section = sections[sectionName];
             if (!section || section.length === 0) continue;
 
-            const separator = displayConfig.separators?.[sectionName] || '\n';
+            const separator = separators[sectionName] || '\n';
 
             if (sectionName === 'infoline' || sectionName === 'nameline') {
                 // Infoline and nameline sections are joined with their separator
@@ -1611,18 +1694,19 @@ function GameState(hook, text) {
         }
 
         return output.join('\n');
-    }
+    };
 
     // Evaluate template conditions with enhanced syntax support
-    function evaluateTemplateCondition(condition, entity, componentData) {
+    // NOTE: Default implementation - replaced by DisplayModule when it loads
+    evaluateTemplateCondition = function(condition, entity) {
         if (!condition) return true;
 
         try {
             // Replace field references with actual values
             const evaluable = condition.replace(/\{([^}]+)\}/g, (match, path) => {
-                // Navigate the path starting from component data
+                // Navigate the path starting from entity
                 const parts = path.split('.');
-                let value = componentData;
+                let value = entity;
 
                 for (const part of parts) {
                     value = value?.[part];
@@ -1636,24 +1720,14 @@ function GameState(hook, text) {
             if (evaluable.includes('Object.keys')) {
                 const match = evaluable.match(/Object\.keys\((\w+)\)\.length\s*>\s*(\d+)/);
                 if (match) {
-                    // First try to find it in the component data
                     const fieldName = match[1];
                     const threshold = parseInt(match[2]);
 
-                    // Try component data first (for fields like stages, items)
-                    if (componentData && componentData[fieldName]) {
-                        const fieldValue = componentData[fieldName];
-                        if (typeof fieldValue === 'object') {
-                            const dataKeys = Object.keys(fieldValue).filter(k => k !== 'display');
-                            return dataKeys.length > threshold;
-                        }
-                    }
-
-                    // Fall back to entity level (for top-level components)
-                    const component = entity[fieldName];
-                    if (component) {
-                        // Exclude 'display' field when counting component keys
-                        const dataKeys = Object.keys(component).filter(k => k !== 'display');
+                    // Get the field from entity
+                    const obj = entity[fieldName];
+                    if (obj && typeof obj === 'object') {
+                        // Exclude 'display' field when counting keys
+                        const dataKeys = Object.keys(obj).filter(k => k !== 'display');
                         return dataKeys.length > threshold;
                     }
                     return false;
@@ -1702,181 +1776,23 @@ function GameState(hook, text) {
             if (debug) console.log(`${MODULE_NAME}: Failed to evaluate condition: ${condition}`);
             return true;
         }
-    }
+    };
 
     // Format template strings with enhanced wildcard and function support
-    function formatTemplateString(format, entity, componentData, componentName) {
+    // NOTE: Default implementation - replaced by DisplayModule when it loads
+    formatTemplateString = function(format, entity) {
         if (!format) return '';
 
-        // First try using TemplateParser for field-based iteration patterns like {field.*→}
-        // This handles the new syntax properly
-        if (format.includes('.*→') || format.includes('.*|') || format.includes('.*:')) {
-            // Create a data context that includes the component data
-            const templateData = componentData || {};
-            if (debug && componentName === 'rewards') {
-                console.log(`${MODULE_NAME}: Parsing rewards format with TemplateParser`);
-                console.log(`${MODULE_NAME}: Format: ${format}`);
-                console.log(`${MODULE_NAME}: Data keys:`, Object.keys(templateData));
-                if (templateData.items) {
-                    console.log(`${MODULE_NAME}: Items:`, Object.keys(templateData.items));
-                }
-            }
-            const parser = new TemplateParser(templateData);
+        // Simply pass the entire entity as templateData
+        // Templates access components directly: {inventory.*→ ...}, {stats.level.value}, etc.
+        // TemplateParser is now provided by DisplayModule
+        if (TemplateParser) {
+            const parser = new TemplateParser(entity || {});
             return parser.parse(format);
         }
-
-        let result = format;
-
-        // Legacy: Handle old-style wildcard patterns {*→ template} or {*\: template}
-        // These iterate over the current component's data
-        const hasArrowPattern = format.includes('{*→');
-        const hasLegacyPattern = format.includes('{*\\:');
-
-        if (hasArrowPattern || hasLegacyPattern) {
-            const patternToFind = hasArrowPattern ? '{*→' : '{*\\:';
-            // Find the complete pattern by counting braces
-            const startIndex = format.indexOf(patternToFind);
-            if (startIndex !== -1) {
-                let braceCount = 0;
-                let endIndex = -1;
-
-                for (let i = startIndex; i < format.length; i++) {
-                    if (format[i] === '{') braceCount++;
-                    if (format[i] === '}') {
-                        braceCount--;
-                        if (braceCount === 0) {
-                            endIndex = i;
-                            break;
-                        }
-                    }
-                }
-
-                if (endIndex !== -1) {
-                    const fullPattern = format.substring(startIndex, endIndex + 1);
-                    const skipLength = hasArrowPattern ? 3 : 4; // Skip '{*→' (3 chars) or '{*\:' (4 chars)
-                    const template = format.substring(startIndex + skipLength, endIndex); // Skip pattern prefix and final '}'
-
-                    if (componentData && typeof componentData === 'object') {
-                        const items = [];
-
-                        // Iterate over component data entries
-                        for (const [key, value] of Object.entries(componentData)) {
-                    // Skip the display property itself
-                    if (key === 'display') continue;
-
-                    let itemResult = template.trim();
-
-                    // Replace nested wildcards in order of specificity
-                    // {*.property.subproperty}
-                    itemResult = itemResult.replace(/\{\*\.([^}]+)\}/g, (match, path) => {
-                        const parts = path.split('.');
-                        let val = value;
-                        for (const part of parts) {
-                            val = val?.[part];
-                            if (val === undefined) return '';
-                        }
-                        return val !== null && val !== undefined ? val : '';
-                    });
-
-                    // {*} represents the key itself
-                    itemResult = itemResult.replace(/\{\*\}/g, key);
-
-                    // Replace function calls like {getRelationshipFlavor(*, name, *)}
-                    itemResult = itemResult.replace(/\{(\w+)\(([^)]+)\)\}/g, (match, funcName, args) => {
-                        return evaluateTemplateFunction(funcName, args, entity, key, value);
-                    });
-
-                    if (itemResult.trim()) {
-                        items.push(itemResult);
-                    }
-                }
-
-                        if (items.length > 0) {
-                            const separator = '\n'; // Default to newline for wildcard expansions
-                            result = result.replace(fullPattern, items.join(separator));
-                        } else {
-                            return ''; // No items, return empty
-                        }
-                    }
-                }
-            }
-        }
-
-        // Handle regular field references {field.path}
-        result = result.replace(/\{([^}]+)\}/g, (match, expression) => {
-            // Check if it's a function call
-            const funcMatch = expression.match(/^(\w+)\(([^)]*)\)$/);
-            if (funcMatch) {
-                const [, funcName, args] = funcMatch;
-                return evaluateTemplateFunction(funcName, args, entity, null, null);
-            }
-
-            // Regular path navigation
-            const parts = expression.split('.');
-            let value = componentData;
-
-            for (const part of parts) {
-                value = value?.[part];
-                if (value === undefined) {
-                    // Try looking in entity root
-                    value = entity;
-                    for (const p of parts) {
-                        value = value?.[p];
-                        if (value === undefined) return '';
-                    }
-                    break;
-                }
-            }
-
-            return value !== null && value !== undefined ? value : '';
-        });
-
-        return result;
-    }
-
-    // Evaluate template functions
-    function evaluateTemplateFunction(funcName, args, entity, currentKey, currentValue) {
-        // Parse arguments
-        const argList = args.split(',').map(arg => arg.trim());
-
-        // Try to find and call the function dynamically
-        let targetFunction = null;
-
-        // Check global scope (GameState functions)
-        if (typeof eval !== 'undefined') {
-            try {
-                targetFunction = eval(funcName);
-            } catch (e) {
-                // Function doesn't exist in global scope
-            }
-        }
-
-        // Check Library functions as fallback
-        if (!targetFunction && Library[funcName] && typeof Library[funcName] === 'function') {
-            targetFunction = Library[funcName];
-        }
-
-        if (targetFunction) {
-            try {
-                // Prepare arguments, replacing * with current values
-                const processedArgs = argList.map(arg => {
-                    if (arg === '*') return currentKey;
-                    if (arg === '*.value' && currentValue && typeof currentValue === 'object') return currentValue.value;
-                    if (arg === 'id') return entity.id;
-                    if (arg === 'name') return entity.name || entity.id;
-                    // Try to parse as number
-                    if (typeof arg === 'string' && !isNaN(arg)) return parseFloat(arg);
-                    return arg;
-                });
-                return targetFunction(...processedArgs);
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Error calling ${funcName}: ${e.message}`);
-                return '';
-            }
-        }
-
-        return `[${funcName}?]`;
-    }
+        // Fallback if DisplayModule not loaded
+        return format;
+    };
 
     // Generate Entry field for a display entity
     function generateEntityEntry(entity) {
@@ -1914,7 +1830,14 @@ function GameState(hook, text) {
         }
 
         // Generate Entry field
-        const entry = generateEntityEntry(entity);
+        let entry = '';
+        try {
+            entry = generateEntityEntry(entity);
+        } catch (e) {
+            console.log(`${MODULE_NAME}: Error generating display for ${entityId}: ${e.message}`);
+            // Fallback to basic display
+            entry = `## ${entityId}\n[Display generation failed]`;
+        }
 
         // Save to [SANE:E] card
         const cardTitle = `[SANE:E] ${entityId}`;
@@ -1927,8 +1850,9 @@ function GameState(hook, text) {
             type: 'SANE'
         });
 
-        // Update entity card map
-        entityCardMap[entityId] = cardTitle;
+        // Update entity card map with normalized key
+        const normalizedMapKey = normalizeEntityId(entityId);
+        entityCardMap[normalizedMapKey] = cardTitle;
 
         // Remove from [SANE:D] if it was there
         const dataCards = loadFromDataCards();
@@ -1937,8 +1861,9 @@ function GameState(hook, text) {
             saveToDataCards(dataCards);
         }
 
-        // Update cache
-        dataCache[entityId] = entity;
+        // Update cache with normalized key
+        const normalizedId = normalizeEntityId(entityId);
+        dataCache[normalizedId] = entity;
     }
 
     // Move entity from [SANE:E] to [SANE:D] when display is removed
@@ -1969,13 +1894,13 @@ function GameState(hook, text) {
         cleanupOverflowCards(entityId);
 
         // Update entity card map
-        delete entityCardMap[entityId];
+        const normalizedMapKey = normalizeEntityId(entityId);
+        delete entityCardMap[normalizedMapKey];
 
-        // Update cache
-        dataCache[entityId] = entity;
+        // Update cache with normalized key
+        const normalizedId = normalizeEntityId(entityId);
+        dataCache[normalizedId] = entity;
     }
-
-    // Initialize Display Schema
 
     // ==========================
     // Blueprint System
@@ -2039,23 +1964,19 @@ function GameState(hook, text) {
         // Merge blueprint with provided data
         const entity = Utilities.collection.deepMerge(blueprint, data);
 
-        // Generate unique ID if not provided
+        // Generate unique ID if not provided - only generate lowercase if not provided
         entity.id = data.id || `${blueprintName.toLowerCase()}_${Date.now()}`;
 
-        // Normalize ID to lowercase
-        const normalizedId = entity.id.toLowerCase();
-        entity.id = normalizedId;
-
-        // Save entity
-        save(normalizedId, entity);
+        // Save entity with its original case
+        save(entity.id, entity);
 
         // If entity has generationwizard component with state 'queued',
         // GenerationWizard will pick it up on next context hook
         if (entity.generationwizard?.state === 'queued') {
-            if (debug) console.log(`${MODULE_NAME}: Entity ${normalizedId} queued for generation`);
+            if (debug) console.log(`${MODULE_NAME}: Entity ${entity.id} queued for generation`);
         }
 
-        return normalizedId;
+        return entity.id;
     }
 
     function saveEntity(entityId, entity) {
@@ -2143,8 +2064,9 @@ function GameState(hook, text) {
                 }
             }
 
-            // Update card map
-            entityCardMap[entityId] = `[SANE:E] ${entityId}`;
+            // Update card map with normalized key
+            const normalizedMapKey = normalizeEntityId(entityId);
+            entityCardMap[normalizedMapKey] = `[SANE:E] ${entityId}`;
 
             // Remove from [SANE:D] data cards if it exists there
             const existingData = loadFromDataCards() || {};
@@ -2268,23 +2190,30 @@ function GameState(hook, text) {
 
     // Delete entity and clean up all associated data
     function deleteEntity(entityId) {
-        // Get entity to find all aliases
-        const entity = dataCache[entityId] || loadEntityFromCard(`[SANE:E] ${entityId}`);
+        // Get entity using normalized key
+        const normalizedId = normalizeEntityId(entityId);
+        const entity = dataCache[normalizedId] || loadEntityFromCard(`[SANE:E] ${entityId}`);
 
         if (!entity) {
             console.log(`${MODULE_NAME}: Entity ${entityId} not found for deletion`);
             return false;
         }
 
+        // Preserve the original ID for card operations
+        const actualEntityId = entity.id || entityId;
+
         // Remove from alias map
         if (entity.aliases) {
             for (const alias of entity.aliases) {
-                delete entityAliasMap[alias];
+                const normalizedAlias = normalizeEntityId(alias);
+                delete entityAliasMap[normalizedAlias];
             }
         }
+        // Also remove the entity ID itself from alias map
+        delete entityAliasMap[normalizedId];
 
-        // Remove from cache
-        delete dataCache[entityId];
+        // Remove from cache using normalized key
+        delete dataCache[normalizedId];
 
         // Remove main card
         Utilities.storyCard.remove(`[SANE:E] ${entityId}`);
@@ -2293,7 +2222,8 @@ function GameState(hook, text) {
         cleanupOverflowCards(entityId);
 
         // Remove from card map
-        delete entityCardMap[entityId];
+        const normalizedMapKey = normalizeEntityId(entityId);
+        delete entityCardMap[normalizedMapKey];
 
         // If entity was in [SANE:D] collection, remove it
         const existingData = loadFromDataCards() || {};
@@ -2507,13 +2437,9 @@ function GameState(hook, text) {
         }
 
         // NOW clean up the old cache entries after successful save
-        delete dataCache[oldId];
-        delete entityCardMap[oldId];
-        if (entity.aliases) {
-            for (const alias of entity.aliases) {
-                delete dataCache[alias];
-            }
-        }
+        const normalizedOldId = normalizeEntityId(oldId);
+        delete dataCache[normalizedOldId];
+        delete entityCardMap[normalizedOldId];
 
         // Re-register all aliases to point to new ID (but not the ID itself)
         if (entity.aliases) {
@@ -2559,52 +2485,6 @@ function GameState(hook, text) {
 
         // Schema not found
         return null;
-    }
-
-    // Support array syntax in paths
-    function parsePathSegment(segment) {
-        // Parse segment like "aliases[0]" into {key: "aliases", index: 0}
-        const match = segment.match(/^([^\[]+)(?:\[(\d+)\])?$/);
-        if (!match) return null;
-
-        return {
-            key: match[1],
-            index: match[2] !== undefined ? parseInt(match[2], 10) : undefined
-        };
-    }
-
-    function processEvalDirectives(obj, context) {
-        // Process @eval directives in object
-        if (!obj || typeof obj !== 'object') return;
-
-        for (const [key, value] of Object.entries(obj)) {
-            if (typeof value === 'string' && value.startsWith('@eval ')) {
-                const code = value.substring(6);
-                try {
-                    const evalContext = {
-                        entity: context,
-                        Math: Math,
-                        Date: Date,
-                        JSON: JSON,
-                        // GameState utilities available
-                        // get: (path) => get(path),
-                        // set: (path, val) => set(path, val),
-                        // resolve: (path) => resolve(path),
-                        // random: (min, max) => Math.floor(Math.random() * (max - min + 1)) + min,
-                        // roll: (dice) => rollDice(dice),
-                        // tool: (toolStr) => executeToolString(toolStr)
-                    };
-                    const func = new Function(...Object.keys(evalContext), `return ${code}`);
-                    obj[key] = func(...Object.values(evalContext));
-                } catch (e) {
-                    console.log(`${MODULE_NAME}: Failed to eval '${code}': ${e.message}`);
-                    // Keep the @eval string for debugging
-                }
-            } else if (typeof value === 'object' && !Array.isArray(value)) {
-                // Recursively process objects but not arrays
-                processEvalDirectives(value, context);
-            }
-        }
     }
 
     // ==========================
@@ -2821,9 +2701,12 @@ function GameState(hook, text) {
         // Load entities from [SANE:D] Data cards
         const dataCardEntities = loadFromDataCards();
 
-        // Store all data card entities in cache
+        // Store all data card entities in cache with NORMALIZED keys
         for (const entityId in dataCardEntities) {
-            dataCache[entityId] = dataCardEntities[entityId];
+            const normalizedId = normalizeEntityId(entityId);
+            const entity = dataCardEntities[entityId];
+            entity.id = entityId; // Preserve original case
+            dataCache[normalizedId] = entity;
         }
 
         // Also load entities from [SANE:E] Entity cards
@@ -2837,8 +2720,11 @@ function GameState(hook, text) {
             try {
                 const entities = parseEntityData(card.description || '');
                 for (const entityId in entities) {
-                    // Store in dataCache for querying
-                    dataCache[entityId] = entities[entityId];
+                    // Store in dataCache with NORMALIZED key
+                    const normalizedId = normalizeEntityId(entityId);
+                    const entity = entities[entityId];
+                    entity.id = entityId; // Preserve original case
+                    dataCache[normalizedId] = entity;
                     loadedCount++;
                 }
             } catch (e) {
@@ -3180,7 +3066,11 @@ function GameState(hook, text) {
 
         return globalEntity;
     }
-    
+
+    // ========================================
+    // SECTION 3F: DATA CARD OPERATIONS (moved to Section 3)
+    // ========================================
+
     // Save data to [SANE:D] cards with overflow handling
     function saveToDataCards(allData) {
         const dataType = 'Data';
@@ -3444,7 +3334,6 @@ function GameState(hook, text) {
                     },
                     Utilities: Utilities,
                     Calendar: typeof Calendar !== 'undefined' ? Calendar : null,
-                    BlueprintManager: typeof BlueprintManager !== 'undefined' ? BlueprintManager : null,
                     RewindSystem: RewindSystem,  // Add RewindSystem access
                     debug: debug,
                     // Debug-only functions
@@ -4367,122 +4256,61 @@ function GameState(hook, text) {
     // RPG Schema Management
     // ==========================
     
+    // RPG calculation functions moved to SkillsModule
     function calculateLevelXPRequirement(level) {
-        // Get stats component for level progression formula
-        const statsComp = Utilities.storyCard.get('[SANE:S] stats');
-        if (statsComp && statsComp.description) {
-            try {
-                const schema = JSON.parse(statsComp.description);
-                if (schema.level_progression) {
-                    // Check for level override first
-                    if (schema.level_progression.xp_overrides && schema.level_progression.xp_overrides[String(level)]) {
-                        return schema.level_progression.xp_overrides[String(level)];
-                    }
-                    // Use formula: level * (level - 1) * 500
-                    if (schema.level_progression.xp_formula) {
-                        // Simple eval replacement for safety
-                        if (schema.level_progression.xp_formula === "level * (level - 1) * 500") {
-                            return level * (level - 1) * 500;
-                        }
-                    }
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse stats schema`);
-            }
+        const skillsModule = moduleRegistry.modules.SkillsModule;
+        if (skillsModule && skillsModule.api) {
+            return skillsModule.api.calculateLevelXPRequirement(level);
         }
         // Fallback formula
-        return level * 500;
+        return level * (level - 1) * 500;
     }
     
     function calculateMaxHP(level) {
-        // Get stats component for HP progression
-        const statsComp = Utilities.storyCard.get('[SANE:S] stats');
-        if (statsComp && statsComp.description) {
-            try {
-                const schema = JSON.parse(statsComp.description);
-                if (schema.hp_progression) {
-                    const base = schema.hp_progression.base || 100;
-                    const perLevel = schema.hp_progression.per_level || 20;
-                    return base + ((level - 1) * perLevel);
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse stats schema`);
-            }
+        const skillsModule = moduleRegistry.modules.SkillsModule;
+        if (skillsModule && skillsModule.api) {
+            return skillsModule.api.calculateMaxHP(level);
         }
         // Fallback: 100 + 20 per level
         return 100 + ((level - 1) * 20);
     }
     
     function calculateSkillXPRequirement(skillName, level) {
-        // Check skills component for formula
-        const skillsComp = Utilities.storyCard.get('[SANE:S] skills');
-        if (skillsComp && skillsComp.description) {
-            try {
-                const schema = JSON.parse(skillsComp.description);
-                if (schema.registry && schema.registry[skillName]) {
-                    const skillDef = schema.registry[skillName];
-                    
-                    // Check for skill-specific formula first
-                    if (skillDef.xp_formula) {
-                        const match = skillDef.xp_formula.match(/level\s*\*\s*(\d+)/);
-                        if (match) {
-                            return level * parseInt(match[1]);
-                        }
-                    }
-                    
-                    // Check category formula
-                    if (skillDef.category && schema.categories && schema.categories[skillDef.category]) {
-                        const categoryDef = schema.categories[skillDef.category];
-                        if (categoryDef.xp_formula) {
-                            const match = categoryDef.xp_formula.match(/level\s*\*\s*(\d+)/);
-                            if (match) {
-                                return level * parseInt(match[1]);
-                            }
-                        }
-                    }
-                }
-                
-                // Use default category if exists
-                if (schema.categories && schema.categories.default && schema.categories.default.xp_formula) {
-                    const match = schema.categories.default.xp_formula.match(/level\s*\*\s*(\d+)/);
-                    if (match) {
-                        return level * parseInt(match[1]);
-                    }
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse skill registry`);
-            }
+        const skillsModule = moduleRegistry.modules.SkillsModule;
+        if (skillsModule && skillsModule.api) {
+            return skillsModule.api.calculateSkillXPRequirement(skillName, level);
         }
         // Fallback formula
         return level * 100;
     }
     
     function getSkillRegistry() {
-        // Get the list of valid skills from component schema
-        const skillsComp = Utilities.storyCard.get('[SANE:S] skills');
-        if (skillsComp && skillsComp.description) {
-            try {
-                const schema = JSON.parse(skillsComp.description);
-                return schema.registry || {};
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse skill registry`);
-            }
+        const skillsModule = moduleRegistry.modules.SkillsModule;
+        if (skillsModule && skillsModule.api) {
+            return skillsModule.api.getSkillRegistry();
         }
-        return {};
+        // Fallback
+        return [];
     }
     
     // ==========================
     // Relationship System
     // ==========================
     function loadRelationshipThresholds() {
-        // Load from relationships component schema
+        // First check in-memory schema from module registry
+        const inMemorySchema = dataCache['schema.relationships'] || moduleRegistry.schemas.relationships;
+        if (inMemorySchema && inMemorySchema.thresholds) {
+            return inMemorySchema.thresholds;
+        }
+
+        // Fallback to loading from Story Card
         const relationshipSchema = Utilities.storyCard.get('[SANE:S] relationships');
         if (!relationshipSchema || !relationshipSchema.description) {
             // No component = no relationship system
             if (debug) console.log(`${MODULE_NAME}: Relationships component not found - relationship system disabled`);
             return [];
         }
-        
+
         try {
             const schema = JSON.parse(relationshipSchema.description);
             if (schema.thresholds && Array.isArray(schema.thresholds)) {
@@ -4498,16 +4326,39 @@ function GameState(hook, text) {
     }
     
     function getRelationshipFlavor(value, fromName, toName) {
+        // First try to use the module's function if available
+        const relationshipsModule = moduleRegistry.modules.RelationshipsModule;
+        if (relationshipsModule && relationshipsModule.getRelationshipFlavor) {
+            return relationshipsModule.getRelationshipFlavor(value, fromName, toName);
+        }
+
         const thresholds = loadRelationshipThresholds();
-        
+
+        // Validate value is a number
+        if (typeof value !== 'number' || isNaN(value)) {
+            return `${fromName || 'Someone'} has an indescribable relationship with ${toName || 'someone'}`;
+        }
+
+        // Ensure names are strings
+        fromName = String(fromName || '');
+        toName = String(toName || '');
+
         // Capitalize names for display
-        const capitalizeFirst = (str) => str ? str.charAt(0).toUpperCase() + str.slice(1).toLowerCase() : '';
+        const capitalizeFirst = (str) => {
+            if (!str || typeof str !== 'string') return '';
+            return str.charAt(0).toUpperCase() + str.slice(1).toLowerCase();
+        };
         const fromDisplay = capitalizeFirst(fromName);
         const toDisplay = capitalizeFirst(toName);
-        
+
         // Find matching threshold
         for (const threshold of thresholds) {
             if (value >= threshold.min && value <= threshold.max) {
+                // Check if flavor text exists
+                if (!threshold.flavor) {
+                    console.log(`${MODULE_NAME}: Warning: Relationship threshold ${threshold.min}-${threshold.max} missing flavor text`);
+                    return `${fromDisplay} and ${toDisplay} have a relationship (${value})`;
+                }
                 // Replace placeholders in flavor text if present
                 return threshold.flavor
                     .replace(/\{from\}/g, fromDisplay)
@@ -4515,9 +4366,9 @@ function GameState(hook, text) {
                     .replace(/\{value\}/g, value);
             }
         }
-        
+
         // Default if no threshold matches
-        return `${value} points`;
+        return `${fromDisplay} has an indescribable relationship with ${toDisplay}`;
     }
     
     
@@ -4528,10 +4379,6 @@ function GameState(hook, text) {
         Calendar('api', null);
     }
 
-    // Initialize BlueprintManager API if available
-    if (typeof BlueprintManager !== 'undefined' && typeof BlueprintManager === 'function') {
-        BlueprintManager('api', null);
-    }
     
     // ==========================
     // Entity Data Parsing
@@ -4603,7 +4450,7 @@ function GameState(hook, text) {
         try {
             // Simply parse the entire JSON object
             const entity = JSON.parse(dataSection);
-            
+
             return entity;
         } catch (e) {
             console.log(`${MODULE_NAME}: ERROR - Failed to parse entity JSON: ${e.message}`);
@@ -4612,456 +4459,43 @@ function GameState(hook, text) {
         }
     }
     
-    // Template Parser Class
-    class TemplateParser {
-        constructor(data) {
-            this.data = data;
-            this.pos = 0;
-            this.template = '';
-        }
-        
-        // Check if value is truthy for conditionals
-        isTruthy(value) {
-            if (value === undefined || value === null || value === '') return false;
-            if (value === false || value === 0) return false;
-            if (typeof value === 'object' && Object.keys(value).length === 0) return false;
-            return true;
-        }
-        
-        // Main parse function
-        parse(template) {
-            this.template = template;
-            this.pos = 0;
-            return this.parseTemplate();
-        }
-        
-        // Parse the entire template
-        parseTemplate() {
-            let result = '';
-            
-            while (this.pos < this.template.length) {
-                const char = this.template[this.pos];
-                
-                // Handle $() dynamic resolution syntax
-                if (char === '$' && this.pos + 1 < this.template.length && this.template[this.pos + 1] === '(') {
-                    const dollarResult = this.parseDollarExpression();
-                    if (dollarResult !== null) {
-                        result += dollarResult;
-                    } else {
-                        result += char;
-                        this.pos++;
-                    }
-                } else if (char === '{') {
-                    // Check for escaped braces {{
-                    if (this.template[this.pos + 1] === '{') {
-                        result += '{';
-                        this.pos += 2;
-                        continue;
-                    }
-                    
-                    // Parse template expression
-                    const expr = this.parseExpression();
-                    if (expr !== null) {
-                        result += expr;
-                    } else {
-                        // Failed to parse, treat as literal
-                        result += char;
-                        this.pos++;
-                    }
-                } else if (char === '}' && this.template[this.pos + 1] === '}') {
-                    // Escaped closing braces
-                    result += '}';
-                    this.pos += 2;
-                } else {
-                    result += char;
-                    this.pos++;
-                }
-            }
-            
-            return result;
-        }
-        
-        // Parse a $() expression
-        parseDollarExpression() {
-            const start = this.pos;
-            
-            if (this.template.substring(this.pos, this.pos + 2) !== '$(') {
-                return null;
-            }
-            
-            this.pos += 2; // Skip $(
-            
-            // Find the closing )
-            let parenDepth = 1;
-            let exprEnd = this.pos;
-            
-            while (exprEnd < this.template.length && parenDepth > 0) {
-                if (this.template[exprEnd] === '(') {
-                    parenDepth++;
-                } else if (this.template[exprEnd] === ')') {
-                    parenDepth--;
-                }
-                exprEnd++;
-            }
-            
-            if (parenDepth !== 0) {
-                // Unmatched parentheses
-                this.pos = start;
-                return null;
-            }
-            
-            const fieldPath = this.template.substring(this.pos, exprEnd - 1);
-            this.pos = exprEnd; // Move past the closing )
-            
-            // Process as a simple field reference
-            return this.processField(fieldPath);
-        }
-        
-        // Parse a template expression {...}
-        parseExpression() {
-            const start = this.pos;
-            
-            if (this.template[this.pos] !== '{') {
-                return null;
-            }
-            
-            this.pos++; // Skip opening brace
-            
-            // Find the matching closing brace, accounting for nesting
-            let braceDepth = 1;
-            let exprEnd = this.pos;
-            
-            while (exprEnd < this.template.length && braceDepth > 0) {
-                if (this.template[exprEnd] === '{') {
-                    braceDepth++;
-                } else if (this.template[exprEnd] === '}') {
-                    braceDepth--;
-                }
-                exprEnd++;
-            }
-            
-            if (braceDepth !== 0) {
-                // Unmatched braces
-                this.pos = start;
-                return null;
-            }
-            
-            const content = this.template.substring(this.pos, exprEnd - 1);
-            this.pos = exprEnd; // Move past the closing brace
-            
-            
-            // Parse the expression content
-            return this.parseExpressionContent(content);
-        }
-        
-        // Parse the content inside {...}
-        parseExpressionContent(content) {
-            
-            // Check for loop syntax: field.*→template or field.*|template or field.*:template
-            // → is the preferred iteration operator (no conflict with ternary)
-            // : still supported for backwards compatibility but discouraged
-            const loopMatch = content.match(/^([^.*]+)\.\*([→:|])(.+)$/s);
-            if (loopMatch) {
-                // Pass the delimiter as part of the template only if it's a pipe
-                const template = loopMatch[2] === '|' ? loopMatch[2] + loopMatch[3] : loopMatch[3];
-                return this.processLoop(loopMatch[1], template);
-            }
-            
-            // Check for conditional/ternary: field?content or field?true:false
-            const condMatch = content.match(/^([^?]+)\?(.+)$/s);
-            if (condMatch) {
-                return this.processConditional(condMatch[1], condMatch[2]);
-            }
-            
-            // Simple field replacement
-            return this.processField(content);
-        }
-        
-        // Process a loop expression
-        processLoop(objectPath, template) {
-            const obj = getNestedField(this.data, objectPath);
-            if (!obj || typeof obj !== 'object') {
-                if (debug) console.log(`${MODULE_NAME}: processLoop - no object found at path '${objectPath}'`);
-                return '';
-            }
-            
-            // Check for pipe delimiter at start of template
-            let delimiter = '\n';
-            let actualTemplate = template;
-            if (template.startsWith('|')) {
-                delimiter = ' | ';
-                actualTemplate = template.substring(1);
-            }
-            
-            const results = [];
+    // ==========================
+    // Simplified Template Parser - Leverages existing get() system
+    // ==========================
 
-            for (const [key, value] of Object.entries(obj)) {
-                // Create a new parser with loop context
-                const loopData = { ...this.data };
-                
-                // Process template with loop replacements
-                let processed = actualTemplate;
-                
-                // Replace {*} with key (format nicely)
-                processed = processed.replace(/\{\*\}/g, () => {
-                    // Format snake_case to Title Case, or just capitalize single words
-                    if (key.includes('_')) {
-                        return key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                    }
-                    // Capitalize first letter of single words
-                    return key.charAt(0).toUpperCase() + key.slice(1);
-                });
-                
-                // Handle function calls with *. arguments FIRST
-                processed = processed.replace(/\{(\w+)\(([^)]*)\)\}/g, (m, funcName, argsStr) => {
-                    // Parse and resolve arguments that use *.
-                    const args = argsStr ? argsStr.split(',').map(arg => {
-                        arg = arg.trim();
-                        
-                        // Handle *.value or other *. references
-                        if (arg.startsWith('*.')) {
-                            const prop = arg.slice(2);
-                            if (prop === '') {
-                                return value;
-                            }
-                            return getNestedField(value, prop);
-                        }
-                        
-                        // Handle * (just the key)
-                        if (arg === '*') {
-                            return key;
-                        }
-                        
-                        // Handle field references from data
-                        if (arg && !arg.startsWith('"') && !arg.startsWith("'") && isNaN(arg)) {
-                            return getNestedField(loopData, arg);
-                        }
-                        
-                        // Handle string literals
-                        if ((arg.startsWith('"') && arg.endsWith('"')) || 
-                            (arg.startsWith("'") && arg.endsWith("'"))) {
-                            return arg.slice(1, -1);
-                        }
-                        
-                        // Handle numbers
-                        if (!isNaN(arg)) {
-                            return Number(arg);
-                        }
-                        
-                        return arg;
-                    }) : [];
-                    
-                    // Call the function
-                    if (funcName === 'getRelationshipFlavor' && typeof getRelationshipFlavor === 'function') {
-                        return getRelationshipFlavor(...args);
-                    }
-                    
-                    return m; // Return unchanged if function not found
-                });
-                
-                // Replace {*.prop} with value properties
-                processed = processed.replace(/\{\*\.([^}]*)\}/g, (m, prop) => {
-                    // Special case: {*.} means the value itself
-                    if (prop === '') {
-                        return typeof value === 'object' ? JSON.stringify(value) : String(value);
-                    }
-                    
-                    // Special handling for inventory items
-                    if (prop === 'quantity') {
-                        // For inventory, the value itself IS the quantity
-                        if (typeof value === 'number') {
-                            return String(value);
-                        } else if (typeof value === 'object' && value !== null && value.hasOwnProperty('quantity')) {
-                            // If it's an object with quantity property
-                            return String(value.quantity);
-                        }
-                        // Default to the value itself if it's not an object
-                        return String(value);
-                    }
-                    
-                    // For other properties, use normal nested access
-                    const propValue = getNestedField(value, prop);
-                    return propValue !== undefined ? String(propValue) : '';
-                });
-                
-                // Handle nested conditionals within the loop
-                processed = processed.replace(/\{([^?}]+)\?([^}]*)\}/g, (m, condition, condContent) => {
-                    const condValue = condition.startsWith('*.') 
-                        ? getNestedField(value, condition.slice(2))
-                        : getNestedField(this.data, condition);
-                    return this.isTruthy(condValue) ? condContent : '';
-                });
-                
-                // Process any remaining field references
-                const subParser = new TemplateParser(loopData);
-                processed = subParser.parse(processed);
-
-                // Only push non-empty results
-                if (processed.trim()) {
-                    results.push(processed);
-                }
-            }
-            
-            // Join results with the chosen delimiter
-            return results.join(delimiter);
-        }
-        
-        // Process a conditional expression
-        processConditional(fieldPath, content) {
-            const value = getNestedField(this.data, fieldPath.trim());
-            const truthy = this.isTruthy(value);
-            
-            
-            // Check for ternary operator
-            // Need to find the : that's not inside nested braces and not escaped with \
-            let braceDepth = 0;
-            let colonIndex = -1;
-            
-            for (let i = 0; i < content.length; i++) {
-                if (content[i] === '{') {
-                    braceDepth++;
-                } else if (content[i] === '}') {
-                    braceDepth--;
-                } else if (content[i] === ':' && braceDepth === 0) {
-                    // Check if this colon is escaped with a backslash
-                    if (i > 0 && content[i - 1] === '\\') {
-                        // This is an escaped colon, not a ternary separator
-                        continue;
-                    }
-                    colonIndex = i;
-                    break;
-                }
-            }
-            
-            if (colonIndex !== -1) {
-                // Ternary operator
-                const trueContent = content.substring(0, colonIndex);
-                const falseContent = content.substring(colonIndex + 1);
-                
-                
-                const selectedContent = truthy ? trueContent : falseContent;
-                
-                // Process the selected content for nested templates
-                const subParser = new TemplateParser(this.data);
-                return subParser.parse(selectedContent);
-            }
-            
-            // Simple conditional
-            if (truthy) {
-                // Remove escaped colons before parsing
-                const unescapedContent = content.replace(/\\:/g, ':');
-                // Parse the content, which may contain $() or {} expressions
-                const subParser = new TemplateParser(this.data);
-                return subParser.parse(unescapedContent);
-            }
-            
-            return '';
-        }
-        
-        // Process a simple field reference
-        processField(fieldPath) {
-            // Handle function calls like getRelationshipFlavor(value, from, to)
-            if (fieldPath.includes('(') && fieldPath.includes(')')) {
-                const funcMatch = fieldPath.match(/^(\w+)\((.*)\)$/);
-                if (funcMatch) {
-                    const funcName = funcMatch[1];
-                    const argsStr = funcMatch[2];
-                    
-                    // Parse arguments (simple comma split for now)
-                    const args = argsStr ? argsStr.split(',').map(arg => {
-                        arg = arg.trim();
-                        // If arg is a field path, resolve it
-                        if (arg && !arg.startsWith('"') && !arg.startsWith("'") && isNaN(arg)) {
-                            return getNestedField(this.data, arg);
-                        }
-                        // If it's a string literal, remove quotes
-                        if ((arg.startsWith('"') && arg.endsWith('"')) || 
-                            (arg.startsWith("'") && arg.endsWith("'"))) {
-                            return arg.slice(1, -1);
-                        }
-                        // If it's a number, parse it
-                        if (!isNaN(arg)) {
-                            return Number(arg);
-                        }
-                        return arg;
-                    }) : [];
-                    
-                    // Call the function if it exists
-                    if (funcName === 'getRelationshipFlavor' && typeof getRelationshipFlavor === 'function') {
-                        return getRelationshipFlavor(...args);
-                    }
-                    // Add more functions here as needed
-                    
-                    return ''; // Unknown function
-                }
-            }
-            
-            // Handle nested resolution like {character.{name}.location}
-            if (fieldPath.includes('{') && fieldPath.includes('}')) {
-                const innerPattern = /\{([^}]+)\}/;
-                const resolved = fieldPath.replace(innerPattern, (m, innerField) => {
-                    const innerValue = getNestedField(this.data, innerField);
-                    return innerValue || '';
-                });
-                
-                // Now get the value from the resolved path
-                // Check if it's an entity reference (character.Name, Location.Name, etc.)
-                const parts = resolved.split('.');
-                if (parts.length >= 2) {
-                    // Try to load as entity.field path
-                    const entityName = parts[0];
-                    const field = parts.slice(1).join('.');
-                    const entity = get(entityName);
-                    if (entity) {
-                        return field ? getNestedField(entity, field) || '' : JSON.stringify(entity);
-                    }
-                }
-                return getNestedField(this.data, resolved) || '';
-            }
-            
-            // Simple field reference
-            const value = getNestedField(this.data, fieldPath);
-            
-            // Debug logging removed
-            
-            if (value === undefined || value === null) {
-                if (debug && (fieldPath.includes('gender') || fieldPath.includes('level'))) {
-                    console.log(`  Returning empty (undefined/null)`);
-                }
-                return '';
-            }
-            
-            if (typeof value === 'object') {
-                // Don't output raw objects unless it's intentional
-                if (debug && (fieldPath.includes('gender') || fieldPath.includes('level'))) {
-                    console.log(`  Returning empty (object)`);
-                }
-                return '';
-            }
-            
-            const result = String(value);
-            // Debug logging removed
-            return result;
-        }
-    }
+    // Display functions - default implementations that will be replaced by DisplayModule
+    let displayModule = null;
+    let TemplateParser = null;  // This comes from DisplayModule only
+    let buildEntityDisplay = null;
+    let formatTemplateString = null;
+    let evaluateTemplateCondition = null;
     
     // ==========================
     // Inventory Management
     // ==========================
     
+    // Inventory functions moved to InventoryModule
     function getItemQuantity(inventory, itemName) {
+        const inventoryModule = moduleRegistry.modules.InventoryModule;
+        if (inventoryModule && inventoryModule.api) {
+            return inventoryModule.api.getItemQuantity(inventory, itemName);
+        }
+        // Fallback if module not loaded
         if (!inventory || !inventory[itemName]) return 0;
         const item = inventory[itemName];
         return typeof item === 'number' ? item : (item.quantity || 0);
     }
-    
+
     function setItemQuantity(inventory, itemName, quantity) {
+        const inventoryModule = moduleRegistry.modules.InventoryModule;
+        if (inventoryModule && inventoryModule.api) {
+            return inventoryModule.api.setItemQuantity(inventory, itemName, quantity);
+        }
+        // Fallback if module not loaded
         if (!inventory) inventory = {};
-        
         if (quantity <= 0) {
             delete inventory[itemName];
         } else {
-            // Preserve other properties if they exist
             if (typeof inventory[itemName] === 'object') {
                 inventory[itemName].quantity = quantity;
             } else {
@@ -5071,8 +4505,6 @@ function GameState(hook, text) {
         return inventory;
     }
     
-    // REMOVED: create() function was redundant with save()
-    // Use save() directly for all entity storage
     
     // ==========================
     // Player Command Processing
@@ -5080,22 +4512,11 @@ function GameState(hook, text) {
     function processPlayerCommand(text) {
         const command = text.toLowerCase().trim();
         
-        // Handle /GW abort command
+        // Handle /GW abort command - now handled by GenerationWizardModule
         if (command === '/gw abort' || command === '/gw cancel') {
-            gwActive = hasActiveGeneration();
-            if (typeof BlueprintManager !== 'undefined' && gwActive) {
-                BlueprintManager.cancelGeneration();
-                if (debug) console.log(`${MODULE_NAME}: Generation aborted by player`);
-                // Show message to player but hide from LLM
-                return {
-                    handled: true,
-                    output: '\n<<<Generation cancelled>>>\n'
-                };
-            }
-            // If no generation active, show message to player
+            // Let GenerationWizardModule handle this via its own command processor
             return {
-                handled: true,
-                output: '\n<<<No generation in progress>>>\n'
+                handled: false
             };
         }
         
@@ -5594,14 +5015,15 @@ function GameState(hook, text) {
             return false;
         }
 
-        // Ensure entityId is a string and normalize case
-        entityId = normalizeEntityId(String(entityId).trim());
-        if (!entityId) {
+        // Use the entity's own ID if it has one, otherwise use what was passed
+        const actualEntityId = entity.id || String(entityId).trim();
+        if (!actualEntityId) {
             console.log(`${MODULE_NAME}: ERROR - Entity ID cannot be empty!`);
             return false;
         }
 
-        // IMPORTANT: Ensure entity.id matches the entityId we're saving under
+        // IMPORTANT: Always save under the entity's actual ID
+        entityId = actualEntityId;
         entity.id = entityId;
 
         // Ensure aliases is an array (can be empty for temporary entities)
@@ -5633,9 +5055,25 @@ function GameState(hook, text) {
             // Save back using the proper overflow handling
             saveToDataCards(existingData);
 
-            // Add the ID field and update cache
+            // Add the ID field and update cache with normalized key
             entity.id = entityId;
-            dataCache[entityId] = entity;
+            const normalizedId = normalizeEntityId(entityId);
+            if (dataCache && typeof dataCache === 'object') {
+                dataCache[normalizedId] = entity;
+            }
+
+            // Cache all aliases (ensure dataCache exists and is an object)
+            if (entity.aliases && Array.isArray(entity.aliases) && dataCache && typeof dataCache === 'object') {
+                for (const alias of entity.aliases) {
+                    if (alias && typeof alias === 'string') {
+                        try {
+                            dataCache[alias] = entity;
+                        } catch (e) {
+                            console.log(`${MODULE_NAME}: Failed to cache alias '${alias}': ${e.message}`);
+                        }
+                    }
+                }
+            }
 
             return true;
         }
@@ -5643,13 +5081,22 @@ function GameState(hook, text) {
         // Add the ID field to the entity
         entity.id = entityId;
 
-        // Update cache (AFTER duplicate check)
-        dataCache[entityId] = entity;  // Direct entity ID
+        // Update cache with NORMALIZED key (AFTER duplicate check)
+        const normalizedId = normalizeEntityId(entityId);
+        if (dataCache && typeof dataCache === 'object') {
+            dataCache[normalizedId] = entity;
+        }
 
-        // Cache all aliases
-        if (entity.aliases && Array.isArray(entity.aliases)) {
+        // Cache all aliases (ensure dataCache exists and is an object)
+        if (entity.aliases && Array.isArray(entity.aliases) && dataCache && typeof dataCache === 'object') {
             for (const alias of entity.aliases) {
-                dataCache[alias] = entity;
+                if (alias && typeof alias === 'string') {
+                    try {
+                        dataCache[alias] = entity;
+                    } catch (e) {
+                        console.log(`${MODULE_NAME}: Failed to cache alias '${alias}': ${e.message}`);
+                    }
+                }
             }
         }
 
@@ -5724,13 +5171,11 @@ function GameState(hook, text) {
         }
     }
     
-    // ==========================
-    // Tool Processors
-    // ==========================
+    // ========================================
+    // SECTION 12: ENTITY TRACKER & AUTO-GENERATION
+    // ========================================
     // All tools are now provided by individual modules
     // Modules self-register their tools during auto-discovery
-    // Entity Tracking System
-    // ==========================
     function loadEntityTrackerConfig() {
         // Use centralized sectioned config loader
         const sections = Utilities.config.loadSectioned('[SANE:C] Entity Tracker', '# ');
@@ -5755,16 +5200,18 @@ function GameState(hook, text) {
     
     function trackUnknownEntity(entityName, toolName, turnNumber) {
         if (!entityName) return;
-        
-        // Normalize entity name to lowercase for consistent tracking
-        entityName = entityName.toLowerCase();
-        
+
+        // Preserve original case for when entity is created
+        const originalCase = String(entityName).trim();
+        // Normalize for consistent tracking and lookups
+        const normalizedName = entityName.toLowerCase();
+
         // First check if character exists in the loaded character cache
         // This is the most reliable way to check for existing characters
         const allCharacters = queryTags('Character');
-        const existingChar = allCharacters.find(c => c.id.toLowerCase() === entityName);
+        const existingChar = allCharacters.find(c => c.id.toLowerCase() === normalizedName);
         if (existingChar) {
-            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${entityName}`);
+            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${normalizedName}`);
             return;
         }
 
@@ -5772,15 +5219,15 @@ function GameState(hook, text) {
         for (const character of allCharacters) {
             if (character.info && character.info.trigger_name) {
                 // Check if trigger_name matches (could be string or array)
-                const triggers = Array.isArray(character.info.trigger_name) 
-                    ? character.info.trigger_name 
+                const triggers = Array.isArray(character.info.trigger_name)
+                    ? character.info.trigger_name
                     : [character.info.trigger_name];
-                
+
                 const normalizedTriggers = triggers.map(t => String(t).toLowerCase());
-                if (normalizedTriggers.includes(entityName)) {
-                    if (debug) console.log(`${MODULE_NAME}: Skipping tracking - ${entityName} is trigger_name for character: ${character.id}`);
+                if (normalizedTriggers.includes(normalizedName)) {
+                    if (debug) console.log(`${MODULE_NAME}: Skipping tracking - ${normalizedName} is trigger_name for character: ${character.id}`);
                     // Clean up any existing tracking data for this entity
-                    removeFromTracker(entityName);
+                    removeFromTracker(normalizedName);
                     return;
                 }
             }
@@ -5790,7 +5237,7 @@ function GameState(hook, text) {
         
         // Load and check blacklist from config
         const config = loadEntityTrackerConfig();
-        if (config.blacklist && config.blacklist.includes(entityName)) return;
+        if (config.blacklist && config.blacklist.includes(normalizedName)) return;
         
         // Load tracker from config card's description field
         const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
@@ -5809,7 +5256,7 @@ function GameState(hook, text) {
                 for (const line of lines) {
                     if (line.startsWith('# ')) {
                         currentEntity = line.substring(2).trim();
-                        tracker[currentEntity] = { count: 0, uniqueTurns: [], lastTool: '' };
+                        tracker[currentEntity] = { count: 0, uniqueTurns: [], lastTool: '', originalCase: '' };
                     } else if (currentEntity && line.includes(':')) {
                         const [key, value] = line.split(':').map(s => s.trim());
                         if (key === 'turns') {
@@ -5817,6 +5264,8 @@ function GameState(hook, text) {
                             tracker[currentEntity].count = tracker[currentEntity].uniqueTurns.length;
                         } else if (key === 'tool') {
                             tracker[currentEntity].lastTool = value || '';
+                        } else if (key === 'originalCase') {
+                            tracker[currentEntity].originalCase = value || '';
                         }
                     }
                 }
@@ -5846,22 +5295,24 @@ function GameState(hook, text) {
             }
         }
         
-        // Initialize entity tracking if needed
-        if (!tracker[entityName]) {
-            tracker[entityName] = {
+        // Initialize entity tracking if needed - use normalized name for tracking
+        // but store the original case if this is the first time we've seen it
+        if (!tracker[normalizedName]) {
+            tracker[normalizedName] = {
                 count: 0,
                 uniqueTurns: [],
-                lastTool: ''
+                lastTool: '',
+                originalCase: originalCase  // Preserve the first case we saw
             };
         }
-        
+
         // Only track if this is a new turn for this entity
-        if (!tracker[entityName].uniqueTurns.includes(currentTurn)) {
-            tracker[entityName].uniqueTurns.push(currentTurn);
-            tracker[entityName].count++;
+        if (!tracker[normalizedName].uniqueTurns.includes(currentTurn)) {
+            tracker[normalizedName].uniqueTurns.push(currentTurn);
+            tracker[normalizedName].count++;
         }
-        
-        tracker[entityName].lastTool = toolName;
+
+        tracker[normalizedName].lastTool = toolName;
         
         // Save updated tracker to config card's description
         let description = '// Entity tracking data\n';
@@ -5869,6 +5320,9 @@ function GameState(hook, text) {
             description += `# ${name}\n`;
             description += `turns: ${data.uniqueTurns.join(',')}\n`;
             description += `tool: ${data.lastTool}\n`;
+            if (data.originalCase) {
+                description += `originalCase: ${data.originalCase}\n`;
+            }
         }
         
         Utilities.storyCard.update('[SANE:C] Entity Tracker', {
@@ -5876,7 +5330,7 @@ function GameState(hook, text) {
         });
         
         if (debug) {
-            console.log(`${MODULE_NAME}: Tracked unknown entity ${entityName} (unique turns: ${tracker[entityName].uniqueTurns.length})`);
+            console.log(`${MODULE_NAME}: Tracked unknown entity ${originalCase} (normalized: ${normalizedName}, unique turns: ${tracker[normalizedName].uniqueTurns.length})`);
         }
     }
     
@@ -5884,17 +5338,17 @@ function GameState(hook, text) {
         // Load tracker from config card's description field
         const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
         if (!configCard || !configCard.description) return;
-        
+
         let tracker = {};
         try {
             // Parse tracker data from description
             const lines = configCard.description.split('\n');
             let currentEntity = null;
-            
+
             for (const line of lines) {
                 if (line.startsWith('# ')) {
                     currentEntity = line.substring(2).trim();
-                    tracker[currentEntity] = { count: 0, uniqueTurns: [], lastTool: '' };
+                    tracker[currentEntity] = { count: 0, uniqueTurns: [], lastTool: '', originalCase: '' };
                 } else if (currentEntity && line.includes(':')) {
                     const [key, value] = line.split(':').map(s => s.trim());
                     if (key === 'turns') {
@@ -5902,23 +5356,28 @@ function GameState(hook, text) {
                         tracker[currentEntity].count = tracker[currentEntity].uniqueTurns.length;
                     } else if (key === 'tool') {
                         tracker[currentEntity].lastTool = value || '';
+                    } else if (key === 'originalCase') {
+                        tracker[currentEntity].originalCase = value || '';
                     }
                 }
             }
         } catch (e) {
             return;
         }
-        
+
         // Remove the entity from tracker
         if (tracker[entityName]) {
             delete tracker[entityName];
-            
+
             // Save updated tracker to config card's description
             let description = '// Entity tracking data\n';
             for (const [name, data] of Object.entries(tracker)) {
                 description += `# ${name}\n`;
                 description += `turns: ${data.uniqueTurns.join(',')}\n`;
                 description += `tool: ${data.lastTool}\n`;
+                if (data.originalCase) {
+                    description += `originalCase: ${data.originalCase}\n`;
+                }
             }
             
             Utilities.storyCard.update('[SANE:C] Entity Tracker', {
@@ -6006,44 +5465,50 @@ function GameState(hook, text) {
     }
     
     function addToEntityQueue(entityName) {
-        // Normalize entity name
-        entityName = entityName.toLowerCase();
-        
-        // Get entity tracker data to see what tool referenced this entity
+        // Normalize entity name for lookups
+        const normalizedName = entityName.toLowerCase();
+
+        // Get entity tracker data to get the original case and tool
         const configCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
         let lastTool = null;
+        let originalCase = normalizedName; // Default to normalized if not found
+
         if (configCard && configCard.description) {
             try {
                 const lines = configCard.description.split('\n');
                 let currentEntity = null;
+                let entityData = {};
+
                 for (const line of lines) {
                     if (line.startsWith('# ')) {
                         currentEntity = line.substring(2).trim();
-                    } else if (currentEntity === entityName && line.startsWith('tool:')) {
-                        lastTool = line.substring(5).trim();
-                        break;
+                        entityData = {};
+                    } else if (currentEntity === normalizedName && line.includes(':')) {
+                        const [key, value] = line.split(':').map(s => s.trim());
+                        if (key === 'tool') {
+                            lastTool = value;
+                        } else if (key === 'originalCase' && value) {
+                            originalCase = value; // Use preserved original case
+                        }
                     }
                 }
             } catch (e) {
                 // Continue without tool context
             }
         }
-        
-        // Create entity using blueprint system
-        if (debug) console.log(`${MODULE_NAME}: Creating entity via instantiateBlueprint: ${entityName}`);
+
+        // Create entity using blueprint system with the original case
+        if (debug) console.log(`${MODULE_NAME}: Creating entity via instantiateBlueprint: ${originalCase} (normalized: ${normalizedName})`);
         const entityId = instantiateBlueprint('Character', {
+            id: originalCase,  // Use the original case for the entity ID
             info: {
-                trigger_name: entityName
+                trigger_name: normalizedName  // Keep trigger_name normalized for lookups
             }
         });
         if (entityId) {
             if (debug) console.log(`${MODULE_NAME}: Created character ${entityId} via instantiateBlueprint`);
 
-            // If BlueprintManager is loaded, it will handle generation
-            // Otherwise entity exists but fields won't auto-generate
-            if (typeof BlueprintManager !== 'undefined') {
-                if (debug) console.log(`${MODULE_NAME}: BlueprintManager will handle field generation`);
-            }
+            // GenerationWizardModule will handle field generation if loaded
             return;
         }
 
@@ -6468,6 +5933,14 @@ function GameState(hook, text) {
                 const result = moduleRegistry.tools[normalizedToolName](params);
                 return result;
             } catch (e) {
+                // Check if this is a display/rendering error that shouldn't affect tool status
+                if (e.message && e.message.includes('replace')) {
+                    if (debug) {
+                        console.log(`${MODULE_NAME}: Display rendering error in tool ${normalizedToolName}: ${e.message}`);
+                        console.log(`${MODULE_NAME}: Tool executed successfully despite display error`);
+                    }
+                    return 'executed'; // Tool worked, just display issue
+                }
                 if (debug) {
                     console.log(`${MODULE_NAME}: Error in module tool ${normalizedToolName}: ${e.message}`);
                 }
@@ -6488,9 +5961,6 @@ function GameState(hook, text) {
             }
         }
 
-        // Built-in tools removed - all tools now in modules or runtime
-
-        // Legacy toolProcessors removed - all tools now in built-in or runtime
 
         // Check for dynamic core stat tools (update_hp, update_mp, etc)
         if (normalizedToolName.startsWith('update_')) {
@@ -6900,6 +6370,7 @@ function GameState(hook, text) {
 
         // Relationship functions
         getRelationshipFlavor: getRelationshipFlavor,
+        toTitleCase: (str) => Utilities.string.toTitleCase(str),
 
         // Location functions
         getOppositeDirection: getOppositeDirection,
@@ -6927,7 +6398,6 @@ function GameState(hook, text) {
     // Initialize data cache after creating schemas
     initializeDataCache();
 
-    // Built-in tools removed - all tools provided by modules
 
     // Public API
 
@@ -7041,473 +6511,538 @@ function GameState(hook, text) {
         return GameState.setField(characterName, fieldPath, current + delta);
     };
 
-    switch(hook) {
-        case 'input': {
-            try {
-                // Initialize debug logging for this turn
-                if (debug) initDebugLogging();
+    // ========================================
+    // SECTION 23: HOOK PROCESSORS - PIPELINE INFRASTRUCTURE
+    // ========================================
 
-                // Initialize all core systems on first run
-                loadVariableDefinitions();
-
-            // Data cache is already initialized at module load, no need to re-initialize
-
-            // Store original input for logging
-            const originalInput = text;
-            
-            // Load input systems
-            loadInputCommands();
-            loadInputModifier();
-            
-            // Apply INPUT_MODIFIER first
-            if (inputModifier) {
-                try {
-                    text = inputModifier(text);
-                    if (debug) console.log(`${MODULE_NAME}: Applied input modifier`);
-                } catch(e) {
-                    if (debug) console.log(`${MODULE_NAME}: Input modifier error: ${e}`);
-                }
-            }
-            
-            // Check for INPUT_COMMANDS in the text
-            // Pattern: /commandname or /commandname args
-            const commandPattern = /\/([a-z_]+)(?:\s+([^\n/]*))?/gi;
-            let commandResults = [];
-            let match;
-            
-            while ((match = commandPattern.exec(text)) !== null) {
-                const commandName = match[1].toLowerCase();
-                const argsString = match[2] || '';
-                const args = argsString.trim().split(/\s+/).filter(arg => arg);
-                
-                if (debug) console.log(`${MODULE_NAME}: Found command: /${commandName} with args: [${args.join(', ')}]`);
-                
-                // Check debug commands first (only when debug mode is on)
-                if (debug) {
-                    const debugResult = handleDebugCommand(commandName, args);
-                    if (debugResult) {
-                        console.log(`${MODULE_NAME}: Debug command handled: ${commandName}`);
-                        console.log(`${MODULE_NAME}: Debug command result: ${debugResult}`);
-                        commandResults.push(debugResult);
-                        continue;
-                    }
-                }
-                
-                // Check custom commands
-                if (inputCommands[commandName]) {
-                    const result = inputCommands[commandName](args);
-                    if (result !== null && result !== undefined) {
-                        if (debug) console.log(`${MODULE_NAME}: Command /${commandName} returned: ${result}`);
-                        commandResults.push(result);
-                        continue;
-                    }
-                }
-                
-                // Check built-in commands
-                const processed = processPlayerCommand(`/${commandName} ${args.join(' ')}`);
-                if (processed.handled) {
-                    commandResults.push(processed.output);
-                }
-            }
-            
-            // If any commands were processed, return their combined results
-            if (commandResults.length > 0) {
-                const result = commandResults.join('\n');
-
-                // Show debug messages to player via state.message but don't add to context
-                if (result.includes('<<<') && result.includes('>>>')) {
-                    // Debug message - show via state.message but consume the input
-                    if (state) {
-                        state.message = result.replace(/<<<|>>>/g, '').trim();
-                    }
-                    // Return a zero-width space to consume the input without adding to context
-                    currentHash = RewindSystem.quickHash('\u200B');
-                    logTime();
-                    return '\u200B';  // Zero-width space - effectively hides from AI
-                }
-
-                // Regular command output - return as normal
-                currentHash = RewindSystem.quickHash(result);
-                logTime();
-                return result;
-            }
-
-            // Run module input hooks
-            for (const inputHook of moduleRegistry.hooks.input) {
-                try {
-                    const result = inputHook(text);
-                    if (result && result.active) {
-                        // Module consumed the input
-                        text = result.text || '\u200B';
-                        if (debug) console.log(`${MODULE_NAME}: Module input hook consumed input`);
-                        break; // Stop processing after first module that consumes input
-                    } else if (result && result.text) {
-                        // Module modified but didn't consume the input
-                        text = result.text;
-                    }
-                } catch (e) {
-                    console.log(`${MODULE_NAME}: Error in module input hook: ${e.message}`);
-                }
-            }
-
-            // If BlueprintManager is active, delegate to it
-            gwActive = hasActiveGeneration();
-            if (typeof BlueprintManager !== 'undefined' && gwActive) {
-                const result = BlueprintManager.process('input', text);
-                const finalResult = result.active ? '\n' : text;
-                
-                // Log the input turn
-                logDebugTurn('input', originalInput, finalResult, {
-                    commandsProcessed: commandResults.length > 0
-                });
-                
-                // Calculate hash of the final result
-                currentHash = RewindSystem.quickHash(finalResult);
-                logTime();
-                return finalResult;  // Block input if wizard is active
-            }
-            
-            // Log the input turn
-            logDebugTurn('input', originalInput, text, {
-                commandsProcessed: commandResults.length > 0
-            });
-            
-            // Calculate hash of the modified input text (what will be stored in history)
-            currentHash = RewindSystem.quickHash(text);
-
-            logTime();
-            return text;
-            } catch (e) {
-                console.log(`${MODULE_NAME}: Error in input hook:`, e);
-                console.log(`${MODULE_NAME}: Stack trace:`, e.stack);
-                throw e;
-            }
-        }
-
-        case 'context': {
-            // Initialize debug logging for this turn
-            if (debug) initDebugLogging();
-            
-            // Store original context for logging
-            const originalContext = text;
-            
-            // Store context length for debug output
-            if (!state.lastContextLength) {
-                state.lastContextLength = 0;
-            }
-            state.lastContextLength = text ? text.length : 0;
-            
-            // Check for edits in history (RewindSystem)
-            RewindSystem.handleContext();
-            
-            // Load context modifier
-            loadContextModifier();
-            
-            // Remove any hidden message markers from previous turns (including surrounding newlines)
-            let modifiedText = text.replace(/\n*<<<[^>]*>>>\n*/g, '');
-
-            // Run preContext hooks FIRST (for greedy modules like GenerationWizard)
-            let intercepted = false;
-            if (debug && moduleRegistry.hooks.preContext.length > 0) {
-                console.log(`${MODULE_NAME}: Running ${moduleRegistry.hooks.preContext.length} preContext hooks`);
-            }
-            for (const handler of moduleRegistry.hooks.preContext) {
-                try {
-                    const result = handler(modifiedText);
-                    if (result && result.active) {
-                        modifiedText = result.text;
-                        intercepted = true;
-                        if (debug) console.log(`${MODULE_NAME}: preContext hook intercepted context`);
-                        break; // Greedy hook - stop processing
-                    }
-                } catch (e) {
-                    console.log(`${MODULE_NAME}: Error in preContext hook: ${e.message}`);
-                }
-            }
-
-            // Initialize variables for logging (must be accessible outside conditional blocks)
-            let triggerNameMap = {};
-            let gettersReplaced = {};
-
-            // If intercepted by greedy hook, skip normal context building
-            if (!intercepted) {
-                // Move current scene card if it exists (before getters)
-                modifiedText = moveCurrentSceneCard(modifiedText);
-            // Check for universal object getters
-            const hasUniversalGetters = UNIVERSAL_GETTER_PATTERN.test(modifiedText);
-            
-            if (hasUniversalGetters) {
-                // Track which getters are being replaced (count only, not every instance)
-                const universalMatches = modifiedText.match(UNIVERSAL_GETTER_PATTERN) || [];
-                const getterMatches = [...universalMatches];
-                
-                if (getterMatches.length > 0) {
-                    // Check if any getters need character data
-                    let needsCharacters = false;
-                    getterMatches.forEach(match => {
-                        // Check universal getter format
-                        if (match.startsWith('get[')) {
-                            const path = match.match(/get\[([^\]]+)\]/)?.[1];
-                            if (path && path.toLowerCase().includes('character')) {
-                                needsCharacters = true;
-                            }
-                        }
-                        // Check function getter format
-                        const innerMatch = match.match(/get_([a-z]+)/i);
-                        if (innerMatch) {
-                            const getterName = innerMatch[1];
-                            gettersReplaced[getterName] = (gettersReplaced[getterName] || 0) + 1;
-                            
-                            // These getters need character data
-                            if (['location', 'hp', 'level', 'xp', 'name', 'attribute', 'skill', 'inventory', 'stat'].includes(getterName)) {
-                                needsCharacters = true;
-                            }
-                        }
-                    });
-                    
-                    // Pre-load characters if needed
-                    if (needsCharacters) {
-                        const allChars = queryTags('Character');
-                        for (const char of allChars || []) {
-                            const name = char.id.toLowerCase();
-                            // Update to use just entity ID
-                        dataCache[name] = char;  // New way
-                        dataCache[`Character.${name}`] = char;  // Old way
-                        }
-                    }
-                }
-                modifiedText = processGetters(modifiedText);
-            }
-            
-            // Build trigger name to username mapping and replace in tool usages
-            // triggerNameMap already declared above for logging scope
-            const allCharacters = queryTags('Character');
-
-            // Get current action count for cleanup check
-            const currentTurn = info?.actionCount || 0;
-
-            // Build the mapping from character data (info.trigger_name)
-            for (const character of allCharacters || []) {
-                const charName = character.id.toLowerCase();
-                if (character.info?.trigger_name) {
-                    const triggerName = character.info.trigger_name;
-                    const username = character.id.toLowerCase();
-
-                    // Get generation turn if available
-                    const generatedTurn = character.info.generation_turn || 0;
-
-                    // Check if trigger name should be cleaned up (10+ turns old and not in context)
-                    if (generatedTurn > 0 && currentTurn - generatedTurn >= 10) {
-                        // Check if trigger name still exists in the context
-                        const triggerPattern = new RegExp(`\\b${triggerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                        if (!triggerPattern.test(modifiedText)) {
-                            // Remove trigger name from character info
-                            delete character.info.trigger_name;
-                            delete character.info.generation_turn;
-
-                            // Save handles all key regeneration automatically
-                            save(charName, character);
-
-                            if (debug) {
-                                console.log(`${MODULE_NAME}: Cleaned up trigger name "${triggerName}" for ${username} (${currentTurn - generatedTurn} turns old)`);
-                            }
-                            continue; // Skip adding to map since we cleaned it up
-                        }
-                    }
-                    
-                    // Add to mapping if trigger name differs from character name
-                    if (triggerName.toLowerCase() !== username) {
-                        triggerNameMap[triggerName] = username;
-                    }
-                }
-            }
-            
-            // Single pass replacement of all trigger names in tool usages
-            if (Object.keys(triggerNameMap).length > 0) {
-                // Build regex pattern for all trigger names
-                const triggerNames = Object.keys(triggerNameMap).map(name => 
-                    name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                ).join('|');
-                
-                const toolPattern = new RegExp(
-                    `(\\w+\\()(\\s*)(${triggerNames})(\\s*)(,|\\))`,
-                    'gi'
-                );
-                
-                modifiedText = modifiedText.replace(toolPattern, (match, func, space1, triggerName, space2, delimiter) => {
-                    const username = triggerNameMap[triggerName] || triggerName;
-                    if (debug && username !== triggerName) {
-                        console.log(`${MODULE_NAME}: Replaced trigger name "${triggerName}" with "${username}" in tool usage`);
-                    }
-                    return `${func}${space1}${username}${space2}${delimiter}`;
-                });
-            }
-            
-            // Legacy BlueprintManager support removed - GenerationWizardModule handles this via hooks
-            } // End of !intercepted block
-
-            // Run context modifier hooks (unless intercepted by greedy hook)
-            if (!intercepted) {
-                for (const handler of moduleRegistry.hooks.context) {
-                    try {
-                        modifiedText = handler(modifiedText);
-                    } catch (e) {
-                        console.log(`${MODULE_NAME}: Error in context hook: ${e.message}`);
-                    }
-                }
-            }
-
-            // Apply CONTEXT_MODIFIER if available
-            if (!intercepted && contextModifier) {
-                try {
-                    // Create context for the modifier
-                    const context = {
-                        get: get,
-                        set: set,
-                        loadCharacter: function(name) {
-                            const chars = queryTags('Character');
-                            return chars.find(c => c.id.toLowerCase() === name.toLowerCase());
-                        },
-                        Utilities: Utilities,
-                        Calendar: typeof Calendar !== 'undefined' ? Calendar : null
-                    };
-                    
-                    // Apply modifier with context
-                    // If it's already a function, just call it with context
-                    if (typeof contextModifier === 'function') {
-                        modifiedText = contextModifier.call(context, modifiedText);
-                    }
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Applied context modifier`);
-                } catch(e) {
-                    if (debug) console.log(`${MODULE_NAME}: Context modifier error: ${e}`);
-                }
-            }
-            
-            // Log the context turn
-            logDebugTurn('context', originalContext, modifiedText, {
-                // Don't include actual context text to save state space
-                triggerNamesReplaced: Object.keys(triggerNameMap).length,
-                gettersReplaced: gettersReplaced
-            });
-            
-            logTime();
-            return modifiedText;  // Return the fully modified text
-            }
-
-        case 'output': {
-            // Initialize debug logging for this turn
-            if (debug) initDebugLogging();
-            
-            // Store original output for logging
-            const originalOutput = text;
-            
-            
-            // Load output modifier
-            loadOutputModifier();
-
-            // Run output hooks
-            for (const handler of moduleRegistry.hooks.output) {
-                try {
-                    const result = handler(text);
-                    if (result && result.active) {
-                        text = result.text;
-                        // If a greedy output hook intercepts, log and return
-                        logDebugTurn('output', null, null, {
-                            moduleIntercepted: true
-                        });
-                        return text;
-                    }
-                } catch (e) {
-                    console.log(`${MODULE_NAME}: Error in output hook: ${e.message}`);
-                }
-            }
-
-            // Check if BlueprintManager is processing (legacy support)
-            gwActive = hasActiveGeneration();
-            if (typeof BlueprintManager !== 'undefined' && gwActive) {
-                const result = BlueprintManager.process('output', text);
-                if (result.active) {
-                    // Log early return
-                    logDebugTurn('output', null, null, {
-                        generationWizardActive: true
-                    });
-                    return result.text;  // Return wizard's output (hidden message)
-                }
-            }
-
-            // Process tools in LLM's output
-            let modifiedText = text || '';
-            if (text) {
-                // Check if there are any tool patterns first
-                const hasToolPatterns = TOOL_PATTERN.test(text);
-                TOOL_PATTERN.lastIndex = 0; // Reset regex state
-                
-                if (hasToolPatterns) {
-                    loadRuntimeTools();
-                }
-                
-                const result = processTools(text);
-                modifiedText = result.modifiedText;
-                const executedTools = result.executedTools || [];
-                
-                // Calculate hash AFTER tool removal so it matches what gets stored
-                currentHash = RewindSystem.quickHash(modifiedText);
-                
-                // Position should be current history.length
-                const futurePosition = history ? Math.min(history.length, RewindSystem.MAX_HISTORY - 1) : 0;
-                RewindSystem.recordAction(text, executedTools, futurePosition);
-                
-                
-                // Check if BlueprintManager was triggered by any tool or entity generation
-                gwActive = hasActiveGeneration();
-                if (typeof BlueprintManager !== 'undefined' && gwActive) {
-                    // Set message via state instead of adding to text
-                    state.message = 'The GM will use the next turn to think. Use `/GW abort` if undesired.';
-                    // Add zero-width character to preserve text structure
-                    modifiedText += '\u200B';
-                    if (debug) console.log(`${MODULE_NAME}: BlueprintManager activated, adding warning to output`);
-                    modifiedText += '\u200B';
-                    if (debug) console.log(`${MODULE_NAME}: Entity generation triggered, adding warning to output`);
-                }
-                
-                // Apply OUTPUT_MODIFIER if available
-                if (outputModifier) {
-                    try {
-                        modifiedText = outputModifier(modifiedText);
-                        if (debug) console.log(`${MODULE_NAME}: Applied output modifier`);
-                    } catch(e) {
-                        if (debug) console.log(`${MODULE_NAME}: Output modifier error: ${e}`);
-                    }
-                }
-                
-                // Log the output turn with tools executed
-                logDebugTurn('output', null, null, {
-                    toolsExecuted: executedTools,
-                    generationWizardActive: hasActiveGeneration()
-                });
-                
-                // Clear cache after processing
-                dataCache = {};
-                
-            }
-
-            // Return the processed text (or empty string if text was null)
-            logTime();
-            return modifiedText;
-        }
+    // Shared pipeline context for all hooks
+    function createPipelineContext(hookType, text) {
+        return {
+            hook: hookType,
+            original: text,
+            current: text,
+            metadata: {
+                startTime: Date.now(),
+                errors: [],
+                warnings: [],
+                tools: [],
+                commands: [],
+                intercepted: false  // For preContext hooks
+            },
+            // Shared resources
+            dataCache: dataCache,
+            moduleRegistry: moduleRegistry
+        };
     }
 
-    // Make GameState globally available
+    // Run a pipeline with error handling
+    function runPipeline(context, stages) {
+        for (const stage of stages) {
+            try {
+                const result = stage(context);
+
+                // Stage can return new text or modify context directly
+                if (typeof result === 'string') {
+                    context.current = result;
+                } else if (result && typeof result === 'object') {
+                    // Handle special returns like {intercepted: true, text: '...'}
+                    if (result.intercepted) {
+                        context.metadata.intercepted = true;
+                    }
+                    if (result.text !== undefined) {
+                        context.current = result.text;
+                    }
+                    if (result.stop) {
+                        break;  // Stop pipeline processing
+                    }
+                }
+            } catch (e) {
+                context.metadata.errors.push({
+                    stage: stage.name || 'unknown',
+                    error: e.message,
+                    stack: debug ? e.stack : undefined
+                });
+
+                // Only fatal errors should stop the pipeline
+                if (stage.required) {
+                    console.log(`${MODULE_NAME}: Fatal error in ${stage.name}: ${e.message}`);
+                    throw e;
+                }
+
+                if (debug) console.log(`${MODULE_NAME}: Error in ${stage.name}: ${e.message}`);
+            }
+        }
+
+        return context;
+    }
+
+    // ========================================
+    // SECTION 23A: INPUT HOOK PIPELINE
+    // ========================================
+
+    function processInputHook(text) {
+        const context = createPipelineContext('input', text);
+
+        const pipeline = [
+            initializeInputHook,
+            applyInputModifier,
+            processInputCommands,
+            runInputModuleHooks,
+            finalizeInput
+        ];
+
+        runPipeline(context, pipeline);
+
+        // Log debug info
+        if (debug) {
+            logDebugTurn('input', context.original, context.current, {
+                commandsProcessed: context.metadata.commands.length > 0,
+                errors: context.metadata.errors
+            });
+        }
+
+        // Calculate hash for rewind system
+        currentHash = RewindSystem.quickHash(context.current);
+
+        return context.current;
+    }
+
+    // Input pipeline stages
+    function initializeInputHook(context) {
+        if (debug) initDebugLogging();
+
+        // Initialize all core systems on first run
+        loadVariableDefinitions();
+
+        // Load input-specific systems
+        loadInputCommands();
+        loadInputModifier();
+
+        return context.current;
+    }
+
+    function applyInputModifier(context) {
+        if (!inputModifier) return context.current;
+
+        try {
+            context.current = inputModifier(context.current);
+            if (debug) console.log(`${MODULE_NAME}: Applied input modifier`);
+        } catch(e) {
+            if (debug) console.log(`${MODULE_NAME}: Input modifier error: ${e}`);
+            context.metadata.errors.push({stage: 'inputModifier', error: e.message});
+        }
+
+        return context.current;
+    }
+
+    function processInputCommands(context) {
+        const commandPattern = /\/([a-z_]+)(?:\s+([^\n/]*))?/gi;
+        let match;
+        const commandResults = [];
+
+        while ((match = commandPattern.exec(context.current)) !== null) {
+            const commandName = match[1].toLowerCase();
+            const argsString = match[2] || '';
+            const args = argsString.trim().split(/\s+/).filter(arg => arg);
+
+            if (debug) console.log(`${MODULE_NAME}: Found command: /${commandName} with args: [${args.join(', ')}]`);
+
+            // Check debug commands first (only when debug mode is on)
+            if (debug) {
+                const debugResult = handleDebugCommand(commandName, args);
+                if (debugResult) {
+                    console.log(`${MODULE_NAME}: Debug command handled: ${commandName}`);
+                    commandResults.push(debugResult);
+                    context.metadata.commands.push({name: commandName, args: args});
+                    continue;
+                }
+            }
+
+            // Check custom commands
+            if (inputCommands[commandName]) {
+                const result = inputCommands[commandName](args);
+                if (result !== null && result !== undefined) {
+                    if (debug) console.log(`${MODULE_NAME}: Command /${commandName} returned: ${result}`);
+                    commandResults.push(result);
+                    context.metadata.commands.push({name: commandName, args: args});
+                    continue;
+                }
+            }
+
+            // Check built-in commands
+            const processed = processPlayerCommand(`/${commandName} ${args.join(' ')}`);
+            if (processed.handled) {
+                commandResults.push(processed.output);
+                context.metadata.commands.push({name: commandName, args: args});
+            }
+        }
+
+        // If any commands were processed, return their combined results
+        if (commandResults.length > 0) {
+            const result = commandResults.join('\n');
+
+            // Show debug messages to player via state.message but don't add to context
+            if (result.includes('<<<') && result.includes('>>>')) {
+                // Debug message - show via state.message but consume the input
+                if (state) {
+                    state.message = result.replace(/<<<|>>>/g, '').trim();
+                }
+                // Return a zero-width space to consume the input without adding to context
+                return '\u200B';  // Zero-width space - effectively hides from AI
+            }
+
+            return result;
+        }
+
+        return context.current;
+    }
+
+    function runInputModuleHooks(context) {
+        // Run module input hooks
+        for (const inputHook of moduleRegistry.hooks.input) {
+            try {
+                const result = inputHook(context.current);
+                if (result && result.active) {
+                    // Module consumed the input
+                    context.current = result.text || '\u200B';
+                    if (debug) console.log(`${MODULE_NAME}: Module input hook consumed input`);
+                    return {stop: true, text: context.current}; // Stop processing
+                } else if (result && result.text) {
+                    // Module modified but didn't consume the input
+                    context.current = result.text;
+                }
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error in module input hook: ${e.message}`);
+                context.metadata.errors.push({stage: 'moduleInputHook', error: e.message});
+            }
+        }
+
+        return context.current;
+    }
+
+    function finalizeInput(context) {
+        // GenerationWizardModule handles via hooks if active
+
+        logTime();
+        return context.current;
+    }
+
+    // ========================================
+    // SECTION 23B: CONTEXT HOOK PIPELINE
+    // ========================================
+
+    function processContextHook(text) {
+        const context = createPipelineContext('context', text);
+
+        const pipeline = [
+            initializeContextHook,
+            cleanHiddenMarkers,
+            runPreContextHooks,  // Greedy hooks that might intercept
+            checkInterception,   // Stop if intercepted
+            applyContextModifier,
+            processContextGetters,
+            moveCurrentScene,
+            runContextModuleHooks,
+            finalizeContext
+        ];
+
+        runPipeline(context, pipeline);
+
+        // Log debug info
+        if (debug) {
+            logDebugTurn('context', context.original, context.current, {
+                intercepted: context.metadata.intercepted,
+                gettersReplaced: context.metadata.gettersReplaced || 0
+            });
+        }
+
+        return context.current;
+    }
+
+    // Context pipeline stages
+    function initializeContextHook(context) {
+        if (debug) initDebugLogging();
+
+        // Store context length for debug output
+        if (!state.lastContextLength) {
+            state.lastContextLength = 0;
+        }
+        state.lastContextLength = context.current ? context.current.length : 0;
+
+        // Check for edits in history
+        RewindSystem.handleContext();
+
+        // Load context-specific systems
+        loadContextModifier();
+
+        return context.current;
+    }
+
+    function cleanHiddenMarkers(context) {
+        // Remove any hidden message markers from previous turns
+        context.current = context.current.replace(/\n*<<<[^>]*>>>\n*/g, '');
+        return context.current;
+    }
+
+    function runPreContextHooks(context) {
+        // Run preContext hooks FIRST (for greedy modules like GenerationWizard)
+        if (debug && moduleRegistry.hooks.preContext.length > 0) {
+            console.log(`${MODULE_NAME}: Running ${moduleRegistry.hooks.preContext.length} preContext hooks`);
+        }
+
+        for (const handler of moduleRegistry.hooks.preContext) {
+            try {
+                const result = handler(context.current);
+                if (result && result.active) {
+                    context.current = result.text;
+                    context.metadata.intercepted = true;
+                    if (debug) console.log(`${MODULE_NAME}: preContext hook intercepted context`);
+                    return {intercepted: true, text: context.current};
+                }
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error in preContext hook: ${e.message}`);
+                context.metadata.errors.push({stage: 'preContextHook', error: e.message});
+            }
+        }
+
+        return context.current;
+    }
+
+    function checkInterception(context) {
+        if (context.metadata.intercepted) {
+            return {stop: true};  // Stop processing if intercepted
+        }
+        return context.current;
+    }
+
+    function applyContextModifier(context) {
+        if (!contextModifier) return context.current;
+
+        try {
+            // Create context for the modifier
+            const modifierContext = {
+                get: get,
+                set: set,
+                save: save,
+                Utilities: Utilities,
+                Calendar: typeof Calendar !== 'undefined' ? Calendar : null,
+                RewindSystem: RewindSystem
+            };
+
+            context.current = contextModifier.call(modifierContext, context.current);
+            if (debug) console.log(`${MODULE_NAME}: Applied context modifier`);
+        } catch(e) {
+            if (debug) console.log(`${MODULE_NAME}: Context modifier error: ${e}`);
+            context.metadata.errors.push({stage: 'contextModifier', error: e.message});
+        }
+
+        return context.current;
+    }
+
+    function processContextGetters(context) {
+        // Process getters and track replacements
+        let gettersReplaced = 0;
+
+        context.current = processGetters(context.current);
+
+        // Count getter replacements (simplified - would need actual tracking)
+        const getterMatches = context.original.match(/get\[[^\]]+\]/g) || [];
+        gettersReplaced = getterMatches.length;
+
+        context.metadata.gettersReplaced = gettersReplaced;
+
+        return context.current;
+    }
+
+    function moveCurrentScene(context) {
+        // Move [CURRENT SCENE] card if needed
+        context.current = moveCurrentSceneCard(context.current);
+        return context.current;
+    }
+
+    function runContextModuleHooks(context) {
+        // Run context modifier hooks (unless intercepted by greedy hook)
+        for (const handler of moduleRegistry.hooks.context) {
+            try {
+                context.current = handler(context.current);
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error in context hook: ${e.message}`);
+                context.metadata.errors.push({stage: 'contextHook', error: e.message});
+            }
+        }
+
+        return context.current;
+    }
+
+    function finalizeContext(context) {
+        logTime();
+        return context.current;
+    }
+
+    // ========================================
+    // SECTION 23C: OUTPUT HOOK PIPELINE
+    // ========================================
+
+    function processOutputHook(text) {
+        const context = createPipelineContext('output', text);
+
+        const pipeline = [
+            initializeOutputHook,
+            runOutputModuleHooks,
+            checkForTools,
+            processOutputTools,
+            checkGenerationTrigger,
+            applyOutputModifier,
+            finalizeOutput
+        ];
+
+        runPipeline(context, pipeline);
+
+        // Log debug info
+        if (debug) {
+            logDebugTurn('output', context.original, context.current, {
+                toolsExecuted: context.metadata.tools,
+                generationWizardActive: gwActive
+            });
+        }
+
+        return context.current;
+    }
+
+    // Output pipeline stages
+    function initializeOutputHook(context) {
+        if (debug) initDebugLogging();
+
+        // Load output-specific systems
+        loadOutputModifier();
+
+        return context.current;
+    }
+
+    function runOutputModuleHooks(context) {
+        // Run module output hooks first
+        for (const handler of moduleRegistry.hooks.output) {
+            try {
+                const result = handler(context.current);
+                if (result && result.active) {
+                    context.current = result.text;
+                }
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error in output hook: ${e.message}`);
+                context.metadata.errors.push({stage: 'outputHook', error: e.message});
+            }
+        }
+
+        return context.current;
+    }
+
+    function checkForTools(context) {
+        if (!context.current) return context.current;
+
+        // Check if there are any tool patterns first
+        const hasToolPatterns = TOOL_PATTERN.test(context.current);
+        TOOL_PATTERN.lastIndex = 0; // Reset regex state
+
+        if (hasToolPatterns) {
+            loadRuntimeTools();
+        }
+
+        context.metadata.hasTools = hasToolPatterns;
+        return context.current;
+    }
+
+    function processOutputTools(context) {
+        if (!context.metadata.hasTools) return context.current;
+
+        const result = processTools(context.current);
+        context.current = result.modifiedText;
+        context.metadata.tools = result.executedTools || [];
+
+        // Calculate hash AFTER tool removal
+        currentHash = RewindSystem.quickHash(context.current);
+
+        // Record action for rewind system
+        const futurePosition = history ? Math.min(history.length, RewindSystem.MAX_HISTORY - 1) : 0;
+        RewindSystem.recordAction(context.original, context.metadata.tools, futurePosition);
+
+        return context.current;
+    }
+
+    function checkGenerationTrigger(context) {
+        // Check if GenerationWizard was triggered
+        gwActive = hasActiveGeneration();
+        if (gwActive) {
+            // Set message via state
+            state.message = 'The GM will use the next turn to think. Use `/GW abort` if undesired.';
+            // Add zero-width character to preserve text structure
+            context.current += '\u200B';
+            if (debug) console.log(`${MODULE_NAME}: Entity generation triggered, adding warning to output`);
+        }
+
+        return context.current;
+    }
+
+    function applyOutputModifier(context) {
+        if (!outputModifier) return context.current;
+
+        try {
+            context.current = outputModifier(context.current);
+            if (debug) console.log(`${MODULE_NAME}: Applied output modifier`);
+        } catch(e) {
+            if (debug) console.log(`${MODULE_NAME}: Output modifier error: ${e}`);
+            context.metadata.errors.push({stage: 'outputModifier', error: e.message});
+        }
+
+        return context.current;
+    }
+
+    function finalizeOutput(context) {
+        // Clear cache after processing
+        dataCache = {};
+
+        logTime();
+        return context.current;
+    }
+
+    // ========================================
+    // SECTION 23D: MAIN HOOK ROUTER
+    // ========================================
+
+    // Use pipeline approach for clearer processing flow
+    switch(hook) {
+        case 'input':
+            return processInputHook(text);
+
+        case 'context':
+            return processContextHook(text);
+
+        case 'output':
+            return processOutputHook(text);
+
+        default:
+            console.log(`${MODULE_NAME}: Unknown hook: ${hook}`);
+            return text;
+    }
+
+    // Make GameState and helper functions globally available
     if (typeof global !== 'undefined') {
         global.GameState = GameState;
-    } 
+        global.getRelationshipFlavor = getRelationshipFlavor;
+    }
+    if (typeof window !== 'undefined') {
+        window.GameState = GameState;
+        window.getRelationshipFlavor = getRelationshipFlavor;
+    }
+    // For AI Dungeon environment - set on this context
+    this.GameState = GameState;
+    this.getRelationshipFlavor = getRelationshipFlavor;
 
     // Log execution time before returning
     logTime();
     return GameState;
-}
-// Export for Node.js testing
+}  // End of GameState function
+
 if (typeof module !== 'undefined' && module.exports) {
     module.exports = GameState;
 }
+

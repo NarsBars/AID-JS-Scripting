@@ -335,11 +335,15 @@ function GenerationWizardModule() {
                 // Don't clear generations - it contains the configuration
                 // GameState.set(`${tempId}.generationwizard.generations`, {});
 
+                // Activate display when generation is complete
+                GameState.set(`${tempId}.display.active`, true);
+
                 // Clean up temporary data that's no longer needed
-                if (entity.generationwizard.fields_collected) {
+                // Use GameState.get to check current state, not the old entity object
+                if (GameState.get(`${tempId}.generationwizard.fields_collected`)) {
                     GameState.del(`${tempId}.generationwizard.fields_collected`);
                 }
-                if (entity.generationwizard.trigger) {
+                if (GameState.get(`${tempId}.generationwizard.trigger`)) {
                     GameState.del(`${tempId}.generationwizard.trigger`);
                 }
 
@@ -2265,12 +2269,6 @@ function GenerationWizardModule() {
             if (player && player.info && player.info.currentLocation) {
                 const currentLocation = GameState.get(player.info.currentLocation);
                 if (currentLocation) {
-                    // Add pathway from current location to new location
-                    const dir = direction || 'path';  // Default to generic 'path' if no direction specified
-
-                    // Set up pathways - will be saved after blueprint instantiation
-                    entityData.pathways = {};
-
                     // Determine opposite direction
                     const opposites = {
                         'north': 'south',
@@ -2283,13 +2281,26 @@ function GenerationWizardModule() {
                         'outside': 'inside'
                     };
 
-                    // Add reverse pathway
-                    const reverseDir = opposites[dir] || player.info.currentLocation;
-                    entityData.pathways[reverseDir] = player.info.currentLocation;
+                    // If no direction specified, pick a random one
+                    let dir = direction;
+                    if (!dir) {
+                        const directions = Object.keys(opposites);
+                        dir = directions[Math.floor(Math.random() * directions.length)];
+                        if (debug) console.log(`${MODULE_NAME}: No direction specified, randomly selected: ${dir}`);
+                    }
+
+                    // Set up pathways - will be saved after blueprint instantiation
+                    entityData.pathways = {};
+
+                    // Add reverse pathway only if there's a valid opposite direction
+                    const reverseDir = opposites[dir];
+                    if (reverseDir) {
+                        entityData.pathways[reverseDir] = { destination: player.info.currentLocation };
+                    }
 
                     // Update current location's pathways to include new location
                     if (!currentLocation.pathways) currentLocation.pathways = {};
-                    currentLocation.pathways[dir] = entityData.id;
+                    currentLocation.pathways[dir] = { destination: entityData.id };
                     GameState.save(player.info.currentLocation, currentLocation);
 
                     if (debug) console.log(`${MODULE_NAME}: Connecting ${player.info.currentLocation} -${dir}-> ${entityData.id}`);
@@ -2315,7 +2326,7 @@ function GenerationWizardModule() {
 
         // Random NPCs who might give quests
         const questGivers = [
-            'Argo', 'Village Elder', 'Merchant', 'Guard Captain',
+            'Village Elder', 'Merchant', 'Guard Captain',
             'Innkeeper', 'Blacksmith', 'Mysterious Traveler', 'Farmer',
             'Town Mayor', 'Guild Master', 'Priest', 'Scholar'
         ];
@@ -2387,29 +2398,9 @@ function GenerationWizardModule() {
         return 'malformed';
     }
 
-    // gw_item removed - items don't need generation wizard
-
     function gw_abort(params) {
         const result = cancelGeneration();
         return result ? 'executed' : 'malformed';
-    }
-
-    function gw_status(params) {
-        const status = getQueueStatus();
-        if (state && state.message) {
-            state.message = JSON.stringify(status);
-        }
-        return 'executed';
-    }
-
-    function gw_retry(params) {
-        // Retry last failed generation
-        const activeGen = findActiveGenerator();
-        if (activeGen) {
-            activeGen.retryCount = 0;
-            return 'executed';
-        }
-        return 'malformed';
     }
 
     // ==========================
@@ -2439,8 +2430,6 @@ function GenerationWizardModule() {
             gw_location: gw_location,
             gw_quest: gw_quest,
             gw_abort: gw_abort,
-            gw_status: gw_status,
-            gw_retry: gw_retry
         },
 
         // Hook processors

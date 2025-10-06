@@ -9,17 +9,11 @@ function BlueprintModule() {
 
     // Create default blueprints for common entity types
     function createDefaultBlueprints() {
-        // Check if blueprints already exist
+        // Check if blueprints already exist - if they do, skip creation
         const characterCard = Utilities.storyCard.get('[SANE:BP] Character');
         if (characterCard) {
-            // For now, always update to ensure latest structure
-            if (debug) console.log(`${MODULE_NAME}: Updating blueprints to latest structure...`);
-
-            // Remove old blueprints
-            Utilities.storyCard.remove('[SANE:BP] Character');
-            Utilities.storyCard.remove('[SANE:BP] Location');
-            Utilities.storyCard.remove('[SANE:BP] Quest');
-            Utilities.storyCard.remove('[SANE:BP] Item');
+            // Blueprints already exist, no need to recreate them
+            return;
         }
 
         if (debug) console.log(`${MODULE_NAME}: Creating default blueprints...`);
@@ -40,70 +34,90 @@ function BlueprintModule() {
                     gender: null,
                     currentLocation: 'Unknown',
                     description: null,
-                    appearance: null,
-                    display: [
-                        { line: "nameline", priority: 10, format: "## **{displayname}**" },
-                        { line: "nameline", priority: 11, format: " [{realname}]", condition: "{realname}" },
-                        { line: "infoline", priority: 10, format: "Gender: {gender}" },
-                        { line: "infoline", priority: 50, format: "Location: {currentLocation}" },
-                        { line: "section", priority: 60, format: "**Appearance**\n{appearance}", condition: "{appearance}" },
-                        { line: "section", priority: 70, format: "**Background**\n{description}", condition: "{description}" }
-                    ]
+                    appearance: null
                 },
 
                 stats: {
                     level: { value: 1, xp: { current: 0, max: 500 } },
-                    hp: { current: 100, max: 100 },
-                    display: [
-                        { line: "infoline", priority: 30, format: "Level {level.value} ({level.xp.current}/{level.xp.max} XP)" },
-                        { line: "infoline", priority: 40, format: "HP: {hp.current}/{hp.max}" }
-                    ]
+                    hp: { current: 100, max: 100 }
                 },
 
-                skills: {
-                    display: [
-                        {
-                            line: "section",
-                            priority: 30,
-                            format: "**Skills**\n{*: • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
-                            condition: "Object.keys(skills).length > 0"
-                        }
-                    ]
-                },
+                skills: {},  // Skills are added dynamically
 
                 attributes: {
                     STRENGTH: { value: 10 },
                     AGILITY: { value: 10 },
                     VITALITY: { value: 10 },
-                    DEXTERITY: { value: 10 },
-                    display: [
-                        {
-                            line: "section",
-                            priority: 25,
-                            format: "**Attributes**\nSTR: {STRENGTH.value} | AGI: {AGILITY.value} | VIT: {VITALITY.value} | DEX: {DEXTERITY.value}"
-                        }
-                    ]
+                    DEXTERITY: { value: 10 }
                 },
 
-                inventory: {
-                    display: [
-                        {
-                            line: "section",
-                            priority: 40,
-                            format: "**Inventory**\n{*: • {*} x{*.quantity}}",
-                            condition: "Object.keys(inventory).length > 0"
-                        }
-                    ]
-                },
+                inventory: {},  // Items are added dynamically
 
-                relationships: {},
+                relationships: {},  // Relationships are added dynamically
 
                 display: {
                     active: false,  // Will be set to true when generation completes
-                    separators: {
-                        nameline: " ",
-                        infoline: " | ",
-                        section: "\n"
+                    sections: {
+                        header: {
+                            line: "nameline",
+                            priority: 10,
+                            template: "## **{info.displayname}**",
+                            condition: "info.displayname"
+                        },
+                        realname: {
+                            line: "nameline",
+                            priority: 11,
+                            template: " [{info.realname}]",
+                            condition: "info.realname"
+                        },
+                        infoline: {
+                            line: "infoline",
+                            priority: 10,
+                            template: "Gender: {info.gender} | Level: {stats.level.value} ({stats.level.xp.current}/{stats.level.xp.max}) | HP: {stats.hp.current}/{stats.hp.max} | Location: {info.currentLocation}",
+                            condition: "info.gender"
+                        },
+                        attributes: {
+                            line: "section",
+                            priority: 20,
+                            template: "**Attributes**\nVITALITY: {attributes.VITALITY.value} | STRENGTH: {attributes.STRENGTH.value} | DEXTERITY: {attributes.DEXTERITY.value} | AGILITY: {attributes.AGILITY.value}",
+                            condition: "attributes"
+                        },
+                        appearance: {
+                            line: "section",
+                            priority: 30,
+                            template: "**Appearance**\n{info.appearance}",
+                            condition: "info.appearance"
+                        },
+                        personality: {
+                            line: "section",
+                            priority: 40,
+                            template: "**Personality**\n{info.personality}",
+                            condition: "info.personality"
+                        },
+                        background: {
+                            line: "section",
+                            priority: 50,
+                            template: "**Background**\n{info.description}",
+                            condition: "info.description"
+                        },
+                        skills: {
+                            line: "section",
+                            priority: 60,
+                            template: "**Skills**\n{skills.*→ • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
+                            condition: "skills"
+                        },
+                        inventory: {
+                            line: "section",
+                            priority: 70,
+                            template: "**Inventory**\n{inventory.*→ • {*} x{*.quantity}}",
+                            condition: "inventory"
+                        },
+                        relationships: {
+                            line: "section",
+                            priority: 80,
+                            template: "**Relationships**\n{relationships.*→ • {*} ({*.value}): {$relFlavor:info.displayname,*.value}}",
+                            condition: "relationships"
+                        }
                     }
                 },
 
@@ -214,27 +228,39 @@ function BlueprintModule() {
                     displayname: null,  // The location's display name
                     description: null,
                     atmosphere: null,
-                    features: [],
-                    display: [
-                        { line: "nameline", priority: 10, format: "## **{displayname}**" },
-                        { line: "section", priority: 20, format: "**Description**\n{description}", condition: "{description}" },
-                        { line: "section", priority: 25, format: "**Atmosphere**\n{atmosphere}", condition: "{atmosphere}" }
-                    ]
+                    features: []
                 },
 
-                pathways: {
-                    display: [
-                        {
-                            line: "section",
-                            priority: 30,
-                            format: "**Pathways**\n{*→ • {*}: to {*}}",
-                            condition: "Object.keys(pathways).length > 0"
-                        }
-                    ]
-                }, // Connections to other locations
+                pathways: {},  // Connections to other locations: { "west": { "destination": "location_id" } }
 
                 display: {
-                    active: false
+                    active: false,
+                    sections: {
+                        header: {
+                            line: "nameline",
+                            priority: 10,
+                            template: "## **{info.displayname}**",
+                            condition: "info.displayname"
+                        },
+                        description: {
+                            line: "section",
+                            priority: 20,
+                            template: "**Description**\n{info.description}",
+                            condition: "info.description"
+                        },
+                        atmosphere: {
+                            line: "section",
+                            priority: 25,
+                            template: "**Atmosphere**\n{info.atmosphere}",
+                            condition: "info.atmosphere"
+                        },
+                        pathways: {
+                            line: "section",
+                            priority: 30,
+                            template: "**Connections**\n{pathways.*→ • {*}: {*.destination}}",
+                            condition: "pathways"
+                        }
+                    }
                 },
 
                 // Generation wizard configuration (if used)
@@ -315,48 +341,59 @@ function BlueprintModule() {
 
                 info: {
                     displayname: null,  // The quest's display name
-                    description: null,  // The quest's description
-                    display: [
-                        { line: "nameline", priority: 10, format: "## **{displayname}**" },
-                        { line: "section", priority: 20, format: "**Description**\n{description}", condition: "{description}" }
-                    ]
+                    description: null   // The quest's description
                 },
 
                 quest: {
                     giver: null,
-                    type: 'Side',
-                    display: [
-                        { line: "infoline", priority: 15, format: "Given by: {giver}", condition: "{giver}" },
-                        { line: "infoline", priority: 16, format: "Type: {type}" },
-                        { line: "infoline", priority: 17, format: "Current Stage: {objectives.current}/{objectives.total}" }
-                    ]
+                    type: 'Side'
                 },
 
                 objectives: {
                     stages: {},  // Will be populated based on quest type
                     current: 1,
-                    total: null,  // Will be set to match stage count
-                    display: [
-                        { line: "section", priority: 30, format: "**Objectives** ({current}/{total})\n{stages.*→ • Stage {*}: {*.description}}", condition: "Object.keys(stages).length > 0" }
-                    ]
+                    total: null  // Will be set to match stage count
                 },
 
                 rewards: {
                     xp: null,
                     col: null,  // Using col for SAO currency
-                    items: {},
-                    display: [
-                        { line: "section", priority: 40, format: "**Rewards**\nXP: {xp} | Col: {col}", condition: "{xp} || {col}" },
-                        { line: "section", priority: 41, format: "Items:\n{items.*→ • {*} x{*.quantity}}", condition: "Object.keys(items).length > 0" }
-                    ]
+                    items: {}
                 },
 
                 display: {
                     active: false,
-                    separators: {
-                        nameline: " ",
-                        infoline: " | ",
-                        section: "\n"
+                    sections: {
+                        header: {
+                            line: "nameline",
+                            priority: 10,
+                            template: "## **{info.displayname}**",
+                            condition: "info.displayname"
+                        },
+                        questInfo: {
+                            line: "infoline",
+                            priority: 10,
+                            template: "Type: {quest.type} | Given by: {quest.giver} | Stage: {objectives.current}/{objectives.total}",
+                            condition: "quest"
+                        },
+                        description: {
+                            line: "section",
+                            priority: 20,
+                            template: "**Description**\n{info.description}",
+                            condition: "info.description"
+                        },
+                        objectives: {
+                            line: "section",
+                            priority: 30,
+                            template: "**Objectives** ({objectives.current}/{objectives.total})\n{objectives.stages.*→ • Stage {*}: {*.description}}",
+                            condition: "objectives.stages"
+                        },
+                        rewards: {
+                            line: "section",
+                            priority: 40,
+                            template: "**Rewards**\nXP: {rewards.xp} | Col: {rewards.col}\n{rewards.items.*→ • {*} x{*.quantity}}",
+                            condition: "rewards"
+                        }
                     }
                 },
 
@@ -546,8 +583,8 @@ function BlueprintModule() {
         init: function(api) {
             GameState = api;
 
-            // Create default blueprints on initialization
-            createDefaultBlueprints();
+            // Note: Blueprints should be created through tools or loaded from Story Cards
+            // Not automatically created during module initialization
         }
     };
 }

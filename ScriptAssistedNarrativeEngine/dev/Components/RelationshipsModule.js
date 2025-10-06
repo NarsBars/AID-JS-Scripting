@@ -28,11 +28,60 @@ function RelationshipsModule() {
 
     // Helper function to get relationship flavor text
     function getRelationshipFlavor(value, fromName, toName) {
+        // Debug logging to identify the issue
+        if (debug) {
+            console.log(`${MODULE_NAME}: getRelationshipFlavor called with:`, {
+                value: value,
+                fromName: fromName,
+                toName: toName,
+                fromNameType: typeof fromName,
+                toNameType: typeof toName
+            });
+        }
+
+        // Safety check for undefined names
+        if (fromName === undefined || fromName === null || toName === undefined || toName === null) {
+            console.log(`${MODULE_NAME}: ERROR: getRelationshipFlavor called with undefined/null names - from: ${fromName}, to: ${toName}`);
+            return `Unknown relationship`;
+        }
+
+        // Ensure names are strings
+        fromName = String(fromName);
+        toName = String(toName);
+
+        // Additional safety check after string conversion
+        if (!fromName || !toName) {
+            console.log(`${MODULE_NAME}: ERROR: Names are empty after string conversion - from: '${fromName}', to: '${toName}'`);
+            return `Unknown relationship`;
+        }
+
+        // Validate value is a number
+        if (typeof value !== 'number' || isNaN(value)) {
+            console.log(`${MODULE_NAME}: ERROR: Invalid value type - value: ${value}, type: ${typeof value}`);
+            return `${fromName} has an indescribable relationship with ${toName}`;
+        }
+
         for (const threshold of THRESHOLDS) {
             if (value >= threshold.min && value <= threshold.max) {
-                return threshold.flavor
-                    .replace('{from}', fromName)
-                    .replace('{to}', toName);
+                // Check if threshold.flavor exists and is a string
+                if (!threshold.flavor || typeof threshold.flavor !== 'string') {
+                    console.log(`${MODULE_NAME}: ERROR: Threshold missing or invalid flavor text for range ${threshold.min}-${threshold.max}`);
+                    console.log(`${MODULE_NAME}: threshold object:`, threshold);
+                    return `${fromName} has an indescribable relationship with ${toName}`;
+                }
+
+                try {
+                    // Ensure we're working with strings
+                    const flavorText = String(threshold.flavor);
+                    return flavorText
+                        .replace('{from}', fromName)
+                        .replace('{to}', toName);
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: ERROR in replace:`, e.message);
+                    console.log(`${MODULE_NAME}: threshold.flavor type:`, typeof threshold.flavor);
+                    console.log(`${MODULE_NAME}: threshold.flavor value:`, threshold.flavor);
+                    return `${fromName} has an indescribable relationship with ${toName}`;
+                }
             }
         }
         return `${fromName} has an indescribable relationship with ${toName}`;
@@ -43,7 +92,8 @@ function RelationshipsModule() {
         schemas: {
             relationships: {
                 id: 'relationships',
-                thresholds: THRESHOLDS
+                thresholds: THRESHOLDS,
+                defaults: {}  // Relationships are added dynamically, no defaults needed
             }
         },
 
@@ -54,9 +104,9 @@ function RelationshipsModule() {
 
                 if (!name1 || !name2) return 'malformed';
 
-                // Convert to strings for lookup
-                const char1Name = String(name1);
-                const char2Name = String(name2);
+                // Convert to strings and normalize for lookup
+                const char1Name = String(name1).toLowerCase();
+                const char2Name = String(name2).toLowerCase();
 
                 // Validate change amount
                 const changeStr = String(changeAmount).trim();
@@ -76,12 +126,12 @@ function RelationshipsModule() {
                 const char1 = GameState.get(char1Name);
                 const char2 = GameState.get(char2Name);
 
-                // Track unknown entities
+                // Track unknown entities - pass original case names for tracking
                 if (!char1 && GameState.trackUnknownEntity) {
-                    GameState.trackUnknownEntity(char1Name, 'update_relationship');
+                    GameState.trackUnknownEntity(name1, 'update_relationship');
                 }
                 if (!char2 && GameState.trackUnknownEntity) {
-                    GameState.trackUnknownEntity(char2Name, 'update_relationship');
+                    GameState.trackUnknownEntity(name2, 'update_relationship');
                 }
 
                 if (!char1 || !char2) {
@@ -91,118 +141,65 @@ function RelationshipsModule() {
                     return 'executed';
                 }
 
+                // Ensure entities have ID fields (entities should always have IDs from GameState)
+                if (!char1.id) {
+                    console.log(`${MODULE_NAME}: Warning: Entity missing ID field, using normalized name: ${char1Name}`);
+                    // Try to use original input name if available, otherwise use normalized
+                    char1.id = name1 || char1Name;
+                }
+                if (!char2.id) {
+                    console.log(`${MODULE_NAME}: Warning: Entity missing ID field, using normalized name: ${char2Name}`);
+                    // Try to use original input name if available, otherwise use normalized
+                    char2.id = name2 || char2Name;
+                }
+
                 // Ensure relationships component exists
                 if (!char1.relationships) char1.relationships = {};
                 if (!char2.relationships) char2.relationships = {};
 
+                // Use the actual entity IDs for relationship keys (preserves case)
+                // Ensure IDs are valid strings
+                const char2Id = String(char2.id || name2);
+                const char1Id = String(char1.id || name1);
+
                 // Initialize relationship values if needed
-                if (!char1.relationships[char2Name]) {
-                    char1.relationships[char2Name] = 0;
+                if (!char1.relationships[char2Id]) {
+                    char1.relationships[char2Id] = { value: 0 };
                 }
-                if (!char2.relationships[char1Name]) {
-                    char2.relationships[char1Name] = 0;
+                if (!char2.relationships[char1Id]) {
+                    char2.relationships[char1Id] = { value: 0 };
                 }
 
                 // Update bidirectional relationships
-                char1.relationships[char2Name] += change;
-                char2.relationships[char1Name] += change;
+                char1.relationships[char2Id].value += change;
+                char2.relationships[char1Id].value += change;
 
-                const value1 = char1.relationships[char2Name];
-                const value2 = char2.relationships[char1Name];
+                const value1 = char1.relationships[char2Id].value;
+                const value2 = char2.relationships[char1Id].value;
 
-                const flavorText1 = getRelationshipFlavor(value1, char1.id || char1Name, char2.id || char2Name);
-                const flavorText2 = getRelationshipFlavor(value2, char2.id || char2Name, char1.id || char1Name);
+                let flavorText1, flavorText2;
+                try {
+                    flavorText1 = getRelationshipFlavor(value1, char1.id, char2.id);
+                    flavorText2 = getRelationshipFlavor(value2, char2.id, char1.id);
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Error getting flavor text: ${e.message}`);
+                    flavorText1 = `${value1} points`;
+                    flavorText2 = `${value2} points`;
+                }
 
-                // Save both characters
-                GameState.save(char1Name, char1);
-                GameState.save(char2Name, char2);
+                // Save both characters using their actual IDs
+                try {
+                    GameState.save(char1.id, char1);
+                    GameState.save(char2.id, char2);
+                } catch (e) {
+                    console.log(`${MODULE_NAME}: Error saving entities: ${e.message}`);
+                    console.log(`${MODULE_NAME}: Error stack:`, e.stack);
+                    throw e; // Re-throw to make tool malformed
+                }
 
                 if (debug) {
                     console.log(`${MODULE_NAME}: ${char1Name}→${char2Name}: ${value1} (${flavorText1})`);
                     console.log(`${MODULE_NAME}: ${char2Name}→${char1Name}: ${value2} (${flavorText2})`);
-                }
-
-                return 'executed';
-            },
-
-            set_relationship: function(params) {
-                const [name1, name2, value] = params;
-
-                if (!name1 || !name2) return 'malformed';
-
-                // Convert to strings for lookup
-                const char1Name = String(name1);
-                const char2Name = String(name2);
-
-                // Validate value
-                const valueStr = String(value).trim();
-                if (!/^-?\d+$/.test(valueStr)) {
-                    if (debug) console.log(`${MODULE_NAME}: Invalid value format: ${value}`);
-                    return 'malformed';
-                }
-                const newValue = parseInt(valueStr);
-
-                if (isNaN(newValue)) {
-                    if (debug) console.log(`${MODULE_NAME}: Invalid relationship value: ${newValue}`);
-                    return 'malformed';
-                }
-
-                // Get both characters
-                const char1 = GameState.get(char1Name);
-                const char2 = GameState.get(char2Name);
-
-                if (!char1 || !char2) {
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: One or both characters not found: ${char1Name}, ${char2Name}`);
-                    }
-                    return 'executed';
-                }
-
-                // Ensure relationships component exists
-                if (!char1.relationships) char1.relationships = {};
-                if (!char2.relationships) char2.relationships = {};
-
-                // Set bidirectional relationships to the same value
-                char1.relationships[char2Name] = newValue;
-                char2.relationships[char1Name] = newValue;
-
-                const flavorText1 = getRelationshipFlavor(newValue, char1.id || char1Name, char2.id || char2Name);
-                const flavorText2 = getRelationshipFlavor(newValue, char2.id || char2Name, char1.id || char1Name);
-
-                // Save both characters
-                GameState.save(char1Name, char1);
-                GameState.save(char2Name, char2);
-
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Set ${char1Name}↔${char2Name} relationship to ${newValue}`);
-                    console.log(`${MODULE_NAME}: ${flavorText1}`);
-                    console.log(`${MODULE_NAME}: ${flavorText2}`);
-                }
-
-                return 'executed';
-            },
-
-            get_relationship: function(params) {
-                const [name1, name2] = params;
-
-                if (!name1 || !name2) return 'malformed';
-
-                const char1Name = String(name1);
-                const char2Name = String(name2);
-
-                // Get first character
-                const char1 = GameState.get(char1Name);
-                if (!char1) {
-                    if (debug) console.log(`${MODULE_NAME}: Character ${char1Name} not found`);
-                    return 'executed';
-                }
-
-                // Check if relationship exists
-                const value = char1.relationships?.[char2Name] || 0;
-                const flavorText = getRelationshipFlavor(value, char1.id || char1Name, char2Name);
-
-                if (debug) {
-                    console.log(`${MODULE_NAME}: ${char1Name}→${char2Name}: ${value} (${flavorText})`);
                 }
 
                 return 'executed';
@@ -212,7 +209,25 @@ function RelationshipsModule() {
         // Module initialization
         init: function(api) {
             GameState = api;
-        }
+
+            // Register the getRelationshipFlavor function with GameState
+            if (api && api.registerFunction) {
+                api.registerFunction('getRelationshipFlavor', getRelationshipFlavor);
+            } else {
+                // Fallback: make it globally available for template processing
+                if (typeof window !== 'undefined') {
+                    window.getRelationshipFlavor = getRelationshipFlavor;
+                } else if (typeof global !== 'undefined') {
+                    global.getRelationshipFlavor = getRelationshipFlavor;
+                } else {
+                    // For the AI Dungeon environment
+                    this.getRelationshipFlavor = getRelationshipFlavor;
+                }
+            }
+        },
+
+        // Expose the helper function for external use
+        getRelationshipFlavor: getRelationshipFlavor
     };
 }
 RelationshipsModule.isSANEModule = true;

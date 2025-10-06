@@ -9,11 +9,108 @@ function SkillsModule() {
 
     // Helper functions
     function calculateLevelXPRequirement(level) {
+        // Try to get formula from schema first
+        if (GameState && GameState.Utilities) {
+            const statsComp = GameState.Utilities.storyCard.get('[SANE:S] stats');
+            if (statsComp && statsComp.description) {
+                try {
+                    const schema = JSON.parse(statsComp.description);
+                    if (schema.level_progression) {
+                        // Check for level override first
+                        if (schema.level_progression.xp_overrides && schema.level_progression.xp_overrides[String(level)]) {
+                            return schema.level_progression.xp_overrides[String(level)];
+                        }
+                        // Use formula: level * (level - 1) * 500
+                        if (schema.level_progression.xp_formula === "level * (level - 1) * 500") {
+                            return level * (level - 1) * 500;
+                        }
+                    }
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to parse stats schema`);
+                }
+            }
+        }
+        // Fallback formula
         return level * (level - 1) * 500;
     }
 
     function calculateMaxHP(level) {
-        return 100 + (level - 1) * 50;
+        // Try to get formula from schema first
+        if (GameState && GameState.Utilities) {
+            const statsComp = GameState.Utilities.storyCard.get('[SANE:S] stats');
+            if (statsComp && statsComp.description) {
+                try {
+                    const schema = JSON.parse(statsComp.description);
+                    if (schema.hp_progression) {
+                        const base = schema.hp_progression.base || 100;
+                        const perLevel = schema.hp_progression.per_level || 20;
+                        return base + ((level - 1) * perLevel);
+                    }
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to parse stats schema`);
+                }
+            }
+        }
+        // Fallback: 100 + 20 per level
+        return 100 + ((level - 1) * 20);
+    }
+
+    function calculateSkillXPRequirement(skillName, level) {
+        // Check skills component for formula
+        if (GameState && GameState.Utilities) {
+            const skillsComp = GameState.Utilities.storyCard.get('[SANE:S] skills');
+            if (skillsComp && skillsComp.description) {
+                try {
+                    const schema = JSON.parse(skillsComp.description);
+                    if (schema.skill_progression && schema.skill_progression.xp_formula) {
+                        // Simple eval replacement for safety - supports basic formula
+                        if (schema.skill_progression.xp_formula === "level * 100") {
+                            return level * 100;
+                        }
+                    }
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to parse skills schema`);
+                }
+            }
+        }
+        // Fallback: level * 100
+        return level * 100;
+    }
+
+    function getSkillRegistry() {
+        // Try to get registry from schema
+        if (GameState && GameState.Utilities) {
+            const skillsComp = GameState.Utilities.storyCard.get('[SANE:S] skills');
+            if (skillsComp && skillsComp.description) {
+                try {
+                    const schema = JSON.parse(skillsComp.description);
+                    if (schema.registry && Array.isArray(schema.registry)) {
+                        return schema.registry;
+                    }
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to parse skills schema`);
+                }
+            }
+        }
+        // Fallback to default registry
+        return ["One_Handed_Sword", "Two_Handed_Sword", "Rapier", "Shield", "Parry",
+                "Battle_Healing", "Searching", "Tracking", "Hiding", "Night_Vision",
+                "Sprint", "Acrobatics", "Cooking", "Fishing", "Blacksmithing",
+                "Tailoring", "Alchemy", "Medicine_Mixing"];
+    }
+
+    function levelUpSkill(character, skill) {
+        if (!skill || !skill.xp) return;
+
+        // Process any skill level ups
+        while (skill.xp.current >= skill.xp.max) {
+            skill.xp.current -= skill.xp.max;
+            skill.level = (skill.level || 0) + 1;
+
+            // Calculate next level XP requirement
+            const xpNeeded = calculateSkillXPRequirement('', skill.level + 1);
+            skill.xp.max = xpNeeded;
+        }
     }
 
     function processLevelUp(character) {
@@ -72,11 +169,7 @@ function SkillsModule() {
                 id: 'stats',
                 defaults: {
                     level: { value: 1, xp: { current: 0, max: 500 } },
-                    hp: { current: 100, max: 100 },
-                    display: [
-                        { line: "infoline", priority: 30, format: "Level {level.value} ({level.xp.current}/{level.xp.max} XP)" },
-                        { line: "infoline", priority: 40, format: "HP: {hp.current}/{hp.max}" }
-                    ]
+                    hp: { current: 100, max: 100 }
                 },
                 level_progression: {
                     xp_formula: "level * (level - 1) * 500"
@@ -85,16 +178,7 @@ function SkillsModule() {
 
             skills: {
                 id: 'skills',
-                defaults: {
-                    display: [
-                        {
-                            line: "section",
-                            priority: 30,
-                            format: "**Skills**\n{*→ • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
-                            condition: "Object.keys(skills).length > 0"
-                        }
-                    ]
-                },
+                defaults: {},  // Skills are added dynamically via unlock_newskill
                 registry: ["One_Handed_Sword", "Two_Handed_Sword", "Rapier", "Shield", "Parry",
                           "Battle_Healing", "Searching", "Tracking", "Hiding", "Night_Vision",
                           "Sprint", "Acrobatics", "Cooking", "Fishing", "Blacksmithing",
@@ -107,14 +191,7 @@ function SkillsModule() {
                     STRENGTH: { value: 10 },
                     AGILITY: { value: 10 },
                     VITALITY: { value: 10 },
-                    DEXTERITY: { value: 10 },
-                    display: [
-                        {
-                            line: "section",
-                            priority: 25,
-                            format: "**Attributes**\nSTR: {STRENGTH.value} | AGI: {AGILITY.value} | VIT: {VITALITY.value} | DEX: {DEXTERITY.value}"
-                        }
-                    ]
+                    DEXTERITY: { value: 10 }
                 },
                 registry: ["STRENGTH", "AGILITY", "VITALITY", "DEXTERITY", "INTELLIGENCE", "WISDOM", "CHARISMA", "LUCK"]
             }
@@ -347,6 +424,17 @@ function SkillsModule() {
                 GameState.save(charName, character);
                 return 'executed';
             }
+        },
+
+        // API functions exposed to GameState and other modules
+        api: {
+            calculateLevelXPRequirement: calculateLevelXPRequirement,
+            calculateMaxHP: calculateMaxHP,
+            calculateSkillXPRequirement: calculateSkillXPRequirement,
+            getSkillRegistry: getSkillRegistry,
+            levelUpSkill: levelUpSkill,
+            processLevelUp: processLevelUp,
+            processSkillLevelUp: processSkillLevelUp
         },
 
         // Module initialization
