@@ -1,6 +1,6 @@
 function SANE(hook, text) {
+    // zzz an attempt to give something I lack
     'use strict';
-
     // ========================================
     // TABLE OF CONTENTS
     // ========================================
@@ -14,7 +14,6 @@ function SANE(hook, text) {
     //   2F: Query System
     //   2G: Schema Management
     // SECTION 3: REGISTRATION SYSTEM
-    // SECTION 4: RUNTIME CONFIGURATION LOADING
     // SECTION 5: COMPONENT MODULES
     // SECTION 6: TOOL PROCESSING
     // SECTION 7: COMMAND PROCESSING
@@ -39,13 +38,13 @@ function SANE(hook, text) {
     // Validate hook and text parameters
     if (!hook || !text) {
         console.log(`${MODULE_NAME}: Invalid parameters - hook: ${hook}, text length: ${text?.length}`);
-        return text || '\u200B';  // Return zero-width character if text is empty
+        return text || '\u200B';  // WHY WOULD IT EVER BE EMPTY THO
     }
 
     // Optional dependencies
     const Calendar = typeof globalThis.Calendar !== 'undefined' ? globalThis.Calendar : null;
 
-    // AI Dungeon integration
+    // AI Dungeon sandbox <3
     const state = globalThis.state || {};
     const history = globalThis.history || [];
 
@@ -145,18 +144,9 @@ function SANE(hook, text) {
     //#region SECTION 2
 
     // ========================================
-    // SECTION 2A: DATA CACHE & STORAGE
+    // SECTION 2A: UNIVERSAL DATA ACCESS
     // ========================================
     //#region SECTION 2A
-
-    // Note: dataCache, entityAliasMap, and Library initialized above
-
-    //#endregion SECTION 2A
-
-    // ========================================
-    // SECTION 2B: UNIVERSAL DATA ACCESS
-    // ========================================
-    //#region SECTION 2B
 
     // Normalize entity ID for case-insensitive operations
     function normalizeEntityId(entityId) {
@@ -349,7 +339,7 @@ function SANE(hook, text) {
         return true;
     }
 
-    //#endregion SECTION 2B
+    //#endregion SECTION 2A
 
     // ========================================
     // SECTION 2C: ENTITY MANAGEMENT
@@ -929,14 +919,11 @@ function SANE(hook, text) {
         }
     }
 
-    // ========================================
-    // SECTION 4: [REMOVED - Runtime configuration moved to after API creation]
-    // ========================================
-
-    // ========================================
-    // SECTION 5: COMPONENT MODULES (DRAG & DROP ZONE)
-    // ========================================
-    // Modules are pasted directly here - they execute immediately
+    // ============================
+    // SECTION 5: COMPONENT MODULES 
+    // ============================
+    // ======== START OF MODULES ========
+    //#region SECTION 5
     // To add a module: paste its code below
     // To remove a module: delete its code block
 
@@ -995,8 +982,7 @@ function SANE(hook, text) {
         debugLog, getDebugLog
     };
 
-    // ======== START OF MODULES ========
-    //#region SECTION 5
+
 
     // ========================================
     // SHARED MODULE CONFIGURATION & HELPERS
@@ -1930,17 +1916,31 @@ function SANE(hook, text) {
                 return '';
             }
 
-            const sections = {
-                header: [],
-                infoline: [],
-                section: [],
-                footer: []
-            };
+            const sections = {};
 
             // Process display sections if defined
             if (entity.display.sections) {
                 for (const [sectionName, sectionConfig] of Object.entries(entity.display.sections)) {
                     if (!sectionConfig || !sectionConfig.template) continue;
+
+                    // Check condition if specified
+                    if (sectionConfig.condition) {
+                        // Handle wildcard patterns like "inventory.*" or "relationships.*"
+                        if (sectionConfig.condition.endsWith('.*')) {
+                            const basePath = sectionConfig.condition.slice(0, -2);
+                            const value = getFieldValue(entity, basePath);
+                            // Skip if the object doesn't exist or has no properties
+                            if (!value || typeof value !== 'object' || Object.keys(value).length === 0) {
+                                continue;
+                            }
+                        } else {
+                            // Normal condition - check if field exists and is truthy
+                            const value = getFieldValue(entity, sectionConfig.condition);
+                            if (!value) {
+                                continue;
+                            }
+                        }
+                    }
 
                     // Parse the template
                     const output = parseTemplate(sectionConfig.template, entity);
@@ -1959,6 +1959,17 @@ function SANE(hook, text) {
                 }
             }
 
+            // Get separators and order
+            const separators = entity.display?.separators || {
+                nameline: ' ',
+                infoline: ' | ',
+                section: '\n',
+                footer: '\n'
+            };
+
+            const order = entity.display?.order || ['prefixline', 'nameline', 'infoline', 'section', 'footer'];
+            const lineSeparator = separators.section || '\n';
+
             // Build output
             let result = [];
 
@@ -1967,62 +1978,21 @@ function SANE(hook, text) {
                 result.push(parseTemplate(entity.display.prefix, entity));
             }
 
-            // Add header sections
-            if (sections.header.length > 0) {
-                sections.header.sort((a, b) => a.priority - b.priority);
-                result.push(...sections.header.map(s => s.text));
-            }
+            // Process lines in the defined order
+            for (const lineName of order) {
+                if (sections[lineName] && sections[lineName].length > 0) {
+                    // Sort by priority
+                    sections[lineName].sort((a, b) => a.priority - b.priority);
 
-            // Add name (always present) - using default format if no name section defined
-            if (!entity.display?.sections?.name) {
-                const nameFormat = entity.info?.displayname || entity.id;
-                result.push(`## **${nameFormat}**`);
+                    // Get separator for this line type
+                    const separator = separators[lineName] || '';
 
-                // Add realname if present
-                if (entity.info?.realname && entity.info.realname !== entity.info?.displayname) {
-                    result.push(`[${entity.info.realname}]`);
-                }
-            }
-
-            // Add infoline sections
-            const separators = entity.display?.separators || {
-                infoline: ' | ',
-                section: '\n'
-            };
-
-            if (sections.infoline.length > 0) {
-                sections.infoline.sort((a, b) => a.priority - b.priority);
-                const texts = sections.infoline.map(s => s.text).filter(t => t);
-                if (texts.length > 0) {
-                    result.push(texts.join(separators.infoline));
-                }
-            }
-
-            // Add main sections
-            if (sections.section.length > 0) {
-                sections.section.sort((a, b) => a.priority - b.priority);
-                for (const section of sections.section) {
-                    // Check condition if present
-                    if (section.condition) {
-                        // Check if field exists and has content
-                        const conditionValue = getFieldValue(entity, section.condition);
-
-                        // For objects, check if they have any properties
-                        if (typeof conditionValue === 'object' && conditionValue !== null && !Array.isArray(conditionValue)) {
-                            if (Object.keys(conditionValue).length === 0) continue;
-                        } else if (!conditionValue) {
-                            // For other types, just check if truthy
-                            continue;
-                        }
+                    // Join all items on this line with the line's separator
+                    const texts = sections[lineName].map(s => s.text).filter(t => t);
+                    if (texts.length > 0) {
+                        result.push(texts.join(separator));
                     }
-                    result.push(section.text);
                 }
-            }
-
-            // Add footer sections
-            if (sections.footer.length > 0) {
-                sections.footer.sort((a, b) => a.priority - b.priority);
-                result.push(...sections.footer.map(s => s.text));
             }
 
             // Add footer if defined
@@ -2030,7 +2000,7 @@ function SANE(hook, text) {
                 result.push(parseTemplate(entity.display.footer, entity));
             }
 
-            return result.join(separators.section);
+            return result.join(lineSeparator);
         }
 
         // Register the functions in the API
@@ -2152,20 +2122,18 @@ function SANE(hook, text) {
                         // Try to parse "Direction: Destination" format
                         const colonMatch = cleanLine.match(/^([^:]+):(.+)$/);
                         if (colonMatch) {
-                            const direction = colonMatch[1].trim();
+                            const direction = colonMatch[1].trim().toLowerCase();
                             const destination = colonMatch[2].trim();
-                            const pathId = direction.toLowerCase().replace(/\s+/g, '_');
 
-                            pathways[pathId] = {
-                                direction: direction,
+                            // Store pathway keyed by direction
+                            pathways[direction] = {
                                 destination: destination,
                                 description: null
                             };
                         } else {
-                            // Just a direction name
-                            const pathId = `path_${index + 1}`;
-                            pathways[pathId] = {
-                                direction: cleanLine,
+                            // Just a direction name - use as key with Unknown destination
+                            const direction = cleanLine.toLowerCase();
+                            pathways[direction] = {
                                 destination: 'Unknown',
                                 description: null
                             };
@@ -2894,9 +2862,16 @@ function SANE(hook, text) {
                 }
             };
 
-            // Add location if provided
+            // Add location - use provided location or player's current location
             if (location) {
                 entityData.info.currentLocation = location;
+            } else {
+                // Try to get player's current location
+                const player = ModuleAPI.get('player');
+                if (player && player.info && player.info.currentLocation) {
+                    entityData.info.currentLocation = player.info.currentLocation;
+                    console.log(`${MODULE_NAME}: Using player's current location: ${player.info.currentLocation}`);
+                }
             }
 
             // Instantiate from Character blueprint
@@ -2925,6 +2900,10 @@ function SANE(hook, text) {
             // Structure data for blueprint
             const entityData = {
                 id: locationId,
+                info: {
+                    displayname: displayName,  // Set the displayname directly
+                    trigger_name: displayName
+                },
                 generationwizard: {
                     trigger: displayName
                 }
@@ -3144,7 +3123,8 @@ function SANE(hook, text) {
                         gender: null,
                         currentLocation: 'Unknown',
                         description: null,
-                        appearance: null
+                        appearance: null,
+                        personality: null
                     },
 
                     stats: {
@@ -3166,6 +3146,7 @@ function SANE(hook, text) {
                     relationships: {},  // Relationships are added dynamically
                     display: {
                         active: false,  // Will be set to true when generation completes
+                        prefix: "<$# Character>",
                         sections: {
                             header: {
                                 line: "nameline",
@@ -3176,7 +3157,7 @@ function SANE(hook, text) {
                             realname: {
                                 line: "nameline",
                                 priority: 11,
-                                template: " [{info.realname}]",
+                                template: "[{info.realname}]",
                                 condition: "info.realname"
                             },
                             infoline: {
@@ -3219,13 +3200,13 @@ function SANE(hook, text) {
                                 line: "section",
                                 priority: 70,
                                 template: "**Inventory**\n{inventory.*→ • {*} x{*.quantity}}",
-                                condition: "inventory"
+                                condition: "inventory.*"
                             },
                             relationships: {
                                 line: "section",
                                 priority: 80,
                                 template: "**Relationships**\n{relationships.*→ • {*} ({*.value}): {$relFlavor:info.displayname,*.value}}",
-                                condition: "relationships"
+                                condition: "relationships.*"
                             }
                         }
                     },
@@ -3280,9 +3261,18 @@ function SANE(hook, text) {
                                         maps_to: "*.info.description",
                                         key: "BACKGROUND",
                                         prompt: {
-                                            uncollected: "BACKGROUND: [Their real-world life - occupation, interests, personality traits. Do NOT mention SAO or why they joined]",
+                                            uncollected: "BACKGROUND: [Their real-world life - occupation, interests. Do NOT mention SAO or why they joined]",
                                             known: "Background: $(value)",
                                             priority: 50
+                                        }
+                                    },
+                                    personality: {
+                                        maps_to: "*.info.personality",
+                                        key: "PERSONALITY",
+                                        prompt: {
+                                            uncollected: "PERSONALITY: [Their personality traits - how they act, think, and interact with others]",
+                                            known: "Personality: $(value)",
+                                            priority: 55
                                         }
                                     }
                                 },
@@ -3332,14 +3322,15 @@ function SANE(hook, text) {
                         type: null,
                         danger_level: null
                     },
-                    pathways: {},  // Pathways added dynamically
+                    pathways: {},  // Format: { "north": { destination: "location_id", description: "optional desc" } }
                     display: {
                         active: false,  // Will be set to true when generation completes
+                        prefix: "<$# World Map><$## Floor One>",
                         sections: {
                             header: {
                                 line: "nameline",
                                 priority: 10,
-                                template: "## **{info.displayname}**",
+                                template: "### **{info.displayname}**",
                                 condition: "info.displayname"
                             },
                             atmosphere: {
@@ -3369,8 +3360,8 @@ function SANE(hook, text) {
                             pathways: {
                                 line: "section",
                                 priority: 20,
-                                template: "**Exits:**\n{pathways.*→ • {*.direction}: {*.destination} {*.description ? '(' + *.description + ')' : ''}}",
-                                condition: "$hasContent(pathways)"
+                                template: "**Paths:**\n{pathways.*→ • {*}: {*.destination}}",
+                                condition: "pathways.*"
                             }
                         }
                     },
@@ -3384,16 +3375,6 @@ function SANE(hook, text) {
                                 stage: "collecting_fields",
                                 promptTemplate: "embedded",
                                 fields: {
-                                    displayname: {
-                                        maps_to: "*.info.displayname",
-                                        required: true,
-                                        key: "NAME",
-                                        prompt: {
-                                            uncollected: "NAME: [Create a memorable location name]",
-                                            known: "Name: $(value)",
-                                            priority: 10
-                                        }
-                                    },
                                     description: {
                                         maps_to: "*.info.description",
                                         required: true,
@@ -3451,7 +3432,7 @@ function SANE(hook, text) {
                                                 priority: 0
                                             },
                                             {
-                                                text: "\nA new location needs to be generated for the game world.",
+                                                text: "\nThe location \"$(trigger_name)\" needs to be generated for the game world.",
                                                 priority: 1
                                             },
                                             {
@@ -4936,18 +4917,6 @@ function SANE(hook, text) {
                     if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Created backup: ${backupReason}`);
                 }
 
-                // Delete existing cards
-                let cardNum = 1;
-                while (true) {
-                    const cardTitle = cardNum === 1
-                        ? RewindSystem.STORAGE_CARD_PREFIX
-                        : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
-
-                    if (!Utilities.storyCard.get(cardTitle)) break;
-                    Utilities.storyCard.remove(cardTitle);
-                    cardNum++;
-                }
-
                 // Split entries across multiple cards if needed
                 const cardsToSave = [];
                 let currentCard = { entries: [], position: data.position };
@@ -4972,18 +4941,30 @@ function SANE(hook, text) {
                     cardsToSave.push(currentCard);
                 }
 
-                // Save all cards
+                // Update or create cards using upsert
                 for (let i = 0; i < cardsToSave.length; i++) {
                     const cardTitle = i === 0
                         ? RewindSystem.STORAGE_CARD_PREFIX
                         : `${RewindSystem.STORAGE_CARD_PREFIX} ${i + 1}`;
 
-                    Utilities.storyCard.add({
+                    Utilities.storyCard.upsert({
                         title: cardTitle,
                         value: `# Rewind System Data - Part ${i + 1}/${cardsToSave.length}\nTracks tool execution history.`,
                         description: JSON.stringify(cardsToSave[i]),
                         type: 'data'
                     });
+                }
+
+                // Remove any extra cards that are no longer needed
+                let cardNum = cardsToSave.length + 1;
+                while (true) {
+                    const cardTitle = cardNum === 1
+                        ? RewindSystem.STORAGE_CARD_PREFIX
+                        : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
+
+                    if (!Utilities.storyCard.get(cardTitle)) break;
+                    Utilities.storyCard.remove(cardTitle);
+                    cardNum++;
                 }
             },
 
@@ -5453,9 +5434,9 @@ function SANE(hook, text) {
                     }
                 }
 
-                // If an edit was found, revert everything from current position back to the edit
+                // If an edit was found, revert everything from current position back to AND INCLUDING the edit
                 if (editedPosition >= 0) {
-                    // Step 1: Revert ALL tools from current position back to edited position (reverse order)
+                    // Step 1: Revert ALL tools from current position back to AND INCLUDING edited position (reverse order)
                     for (let i = checkLength - 1; i >= editedPosition; i--) {
                         if (!data.entries[i]) continue;
 
