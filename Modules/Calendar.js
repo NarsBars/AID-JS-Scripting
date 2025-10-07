@@ -28,6 +28,9 @@ function Calendar(hook, text) {
     //     - Relative: Event Name: Nth Weekday of Month
     //     - Time ranges: @ HH:MM-HH:MM
     //     - Multi-day: lasting N days
+    //     - Card modifications:
+    //       titles: {"Card Title 1", "Card Title 2"}
+    //       keys: {"Card Title 1": "key1, key2", "Card Title 2": override "key3"}
     //
     // TIME SYSTEM:
     //   - Uses dayProgress (0.0 to 1.0) for position in day
@@ -83,6 +86,12 @@ function Calendar(hook, text) {
     //   clearConfigCache()      Force reload time configuration
     //   clearAllCaches()        Clear all cached data
     //
+    // CARD MODIFICATION METHODS:
+    //   getModifiedCardsState() Returns current modified cards state
+    //   clearModifiedCards()    Revert all modified cards to original
+    //   applyEventCards(name)   Manually apply event's card modifications
+    //   revertEventCards(name)  Manually revert event's card modifications
+    //
     // EVENT PROPERTIES:
     //   Calendar.events         Array of events that occurred this turn
     //                          Types: 'dayChanged', 'seasonChanged', 'timeOfDayChanged',
@@ -118,17 +127,33 @@ function Calendar(hook, text) {
     //     }
     //   }
     //
+    // Card Modifications:
+    //   // In [CALENDAR] Event Days card:
+    //   // Market Day: Wednesday @ 8:00-14:00
+    //   // titles: {"Town Square", "Merchant"}
+    //   // keys: {"Town Square": "busy, crowded", "Merchant": override "available"}
+    //
+    //   // The Town Square card's keys will be temporarily changed during market hours
+    //   // The Merchant card's keys will be permanently set to "available"
+    //
+    //   // Manual control:
+    //   Calendar.applyEventCards("Market Day");   // Apply modifications
+    //   Calendar.revertEventCards("Market Day");  // Revert (except overrides)
+    //   Calendar.clearModifiedCards();            // Revert all modifications
+    //
     // =====================================
     
     // Configuration Card Names
     const CONFIG_CARD = '[CALENDAR] Time Configuration';
     const STATE_CARD = '[CALENDAR] Time State';
     const EVENT_CARD_PREFIX = '[CALENDAR] Event Days';
-    
+    const MODIFIED_CARDS_STATE = '[CALENDAR] Modified Cards State';
+
     // Module-level cache (valid for this turn only)
     let eventCache = null;
     let configCache = null;
     let timeDataCache = null;
+    let modifiedCardsCache = null;
     
     // ==========================
     // Core Functions
@@ -137,21 +162,25 @@ function Calendar(hook, text) {
     function loadConfiguration() {
         if (configCache !== null) return configCache;
         
-        const configCard = Utilities.storyCard.get(CONFIG_CARD);
-        if (!configCard) {
-            if (debug) console.log(`${MODULE_NAME}: No configuration found`);
-            return null;
+        // Use centralized config loader with custom parser
+        configCache = Utilities.config.load(
+            CONFIG_CARD,
+            parseConfigurationCard,  // Custom parser for Calendar format
+            null,  // No auto-create function
+            false  // Don't cache in Utilities (we cache locally)
+        );
+        
+        if (!configCache && debug) {
+            console.log(`${MODULE_NAME}: No configuration found`);
         }
         
-        configCache = parseConfigurationCard(configCard);
         return configCache;
     }
     
-    function parseConfigurationCard(configCard) {
-        const configText = configCard.entry || '';
-        if (!configText) return null;
+    function parseConfigurationCard(fullText) {
+        if (!fullText) return null;
         
-        const lines = configText.split('\n');
+        const lines = fullText.split('\n');
         const config = {};
         
         // Parse basic configuration values
@@ -181,7 +210,7 @@ function Calendar(hook, text) {
         }
         
         // Parse sections using Utilities
-        const sections = Utilities.plainText.parseSections(configText);
+        const sections = Utilities.plainText.parseSections(fullText);
         
         config.timePeriods = parseTimePeriods(sections['Time Periods'] || sections['time periods']);
         config.seasons = parseSeasons(sections['Seasons'] || sections['seasons']);
@@ -427,7 +456,7 @@ function Calendar(hook, text) {
                     state.startingTimeApplied = true;
                 }
                 
-                if (debug) console.log(`${MODULE_NAME}: Starting at ${hour}:${String(minute).padStart(2, '0')} (one-time only)`);
+                if (debug) console.log(`${MODULE_NAME}: Starting at ${Utilities.format.formatTime(hour, minute)} (one-time only)`);
             }
         }
         
@@ -526,7 +555,7 @@ function Calendar(hook, text) {
         const totalMinutes = Math.floor(progress * hoursPerDay * 60);
         const hour = Math.floor(totalMinutes / 60) % hoursPerDay;
         const minute = totalMinutes % 60;
-        return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+        return Utilities.format.formatTime(hour, minute);
     }
     
     function calculateDate(totalDays, startDateStr, config) {
@@ -942,7 +971,7 @@ function Calendar(hook, text) {
             adjustments.push({
                 turn: currentAction !== null ? currentAction : timeData.lastProcessedAction,
                 type: 'setTime',
-                description: `${hour}:${String(minute).padStart(2, '0')}`,
+                description: Utilities.format.formatTime(hour, minute),
                 amount: progressDiff
             });
             
@@ -1044,17 +1073,56 @@ function Calendar(hook, text) {
             eventCache = null;
             return true;
         };
-        
+
         Calendar.clearConfigCache = () => {
             configCache = null;
             return true;
         };
-        
+
         Calendar.clearAllCaches = () => {
             eventCache = null;
             configCache = null;
             timeDataCache = null;
+            modifiedCardsCache = null;
             return true;
+        };
+
+        // Refresh events from all sources (including story cards)
+        Calendar.refreshEvents = () => {
+            eventCache = null;
+            const events = loadEventDays();
+            if (debug) {
+                console.log(`${MODULE_NAME}: Events refreshed - found ${events.length} total events`);
+            }
+            return events;
+        };
+
+        // Card Modification Methods
+        Calendar.getModifiedCardsState = () => loadModifiedCardsState();
+
+        Calendar.clearModifiedCards = () => {
+            clearAllModifiedCards();
+            return true;
+        };
+
+        Calendar.applyEventCards = (eventName) => {
+            const events = Calendar.getAllEvents();
+            const event = events.find(e => e.name === eventName);
+            if (event) {
+                applyEventCardModifications(event);
+                return true;
+            }
+            return false;
+        };
+
+        Calendar.revertEventCards = (eventName) => {
+            const events = Calendar.getAllEvents();
+            const event = events.find(e => e.name === eventName);
+            if (event) {
+                revertEventCardModifications(event);
+                return true;
+            }
+            return false;
         };
     }
     
@@ -1064,30 +1132,35 @@ function Calendar(hook, text) {
     
     function loadEventDays() {
         if (eventCache !== null) return eventCache;
-        
+
         try {
             const eventsList = [];
             let cardNumber = 1;
             let cardTitle = EVENT_CARD_PREFIX;
-            
+
+            // Load events from dedicated event cards
             while (true) {
                 if (cardNumber > 1) {
                     cardTitle = `${EVENT_CARD_PREFIX} ${cardNumber}`;
                 }
-                
+
                 const eventCard = Utilities.storyCard.get(cardTitle);
                 if (!eventCard) break;
-                
+
                 const entryEvents = parseEventList(eventCard.entry || '');
                 const descEvents = parseEventList(eventCard.description || '');
-                
+
                 eventsList.push(...entryEvents, ...descEvents);
-                
+
                 cardNumber++;
                 if (cardNumber > 10) break;
             }
-            
+
+
             const uniqueEvents = removeDuplicateEvents(eventsList);
+            if (debug) {
+                console.log(`${MODULE_NAME}: Loaded ${uniqueEvents.length} unique events from ${cardNumber - 1} card(s)`);
+            }
             eventCache = uniqueEvents;
             return uniqueEvents;
         } catch (error) {
@@ -1096,23 +1169,105 @@ function Calendar(hook, text) {
             return [];
         }
     }
+
     
     function parseEventList(text) {
         if (!text || typeof text !== 'string') return [];
-        
+
         const eventsList = [];
         const lines = text.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
+
+        for (let i = 0; i < lines.length; i++) {
+            const trimmed = lines[i].trim();
             if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
             if (trimmed.startsWith('##')) continue;
-            
+
             const event = parseEventLine(trimmed);
-            if (event) eventsList.push(event);
+            if (event) {
+                // Check for titles and keys on following lines
+                let titlesFound = false;
+                let keysFound = false;
+
+                for (let j = i + 1; j < lines.length; j++) {
+                    const nextLine = lines[j].trim();
+
+                    // Stop if we hit another event or section
+                    if (nextLine && !nextLine.startsWith('titles:') && !nextLine.startsWith('keys:') &&
+                        !nextLine.startsWith('//')) {
+                        // Check if it's another event line
+                        const possibleEvent = parseEventLine(nextLine);
+                        if (possibleEvent) break;
+                    }
+
+                    if (nextLine.startsWith('titles:')) {
+                        const titlesStr = nextLine.substring(7).trim();
+                        event.cardTitles = parseTitlesArray(titlesStr);
+                        titlesFound = true;
+                    } else if (nextLine.startsWith('keys:')) {
+                        const keysStr = nextLine.substring(5).trim();
+                        event.cardKeys = parseKeysObject(keysStr);
+                        keysFound = true;
+                    }
+
+                    // If we found both, we can stop looking
+                    if (titlesFound && keysFound) break;
+                }
+
+                eventsList.push(event);
+            }
         }
-        
+
         return eventsList;
+    }
+
+    function parseTitlesArray(titlesStr) {
+        // Parse format: {"Title 1", "Title 2", "Title 3"}
+        try {
+            // Remove curly braces and split by comma
+            const cleaned = titlesStr.replace(/^\{|\}$/g, '').trim();
+            if (!cleaned) return [];
+
+            // Split by comma and clean up quotes
+            const titles = cleaned.split(',').map(t => {
+                return t.trim().replace(/^["']|["']$/g, '');
+            }).filter(t => t.length > 0);
+
+            return titles;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error parsing titles: ${e.message}`);
+            return [];
+        }
+    }
+
+    function parseKeysObject(keysStr) {
+        // Parse format: {"Title": "key1, key2", "Title2": override "key3, key4"}
+        try {
+            const keysObj = {};
+
+            // Remove outer curly braces
+            const cleaned = keysStr.replace(/^\{|\}$/g, '').trim();
+            if (!cleaned) return keysObj;
+
+            // Match pattern: "Title": "keys" or "Title": override "keys"
+            const regex = /["']([^"']+)["']\s*:\s*(override\s+)?["']([^"']+)["']/g;
+            let match;
+
+            while ((match = regex.exec(cleaned)) !== null) {
+                const title = match[1];
+                const isOverride = !!match[2];
+                const keys = match[3];
+
+                keysObj[title] = {
+                    keys: keys,
+                    override: isOverride
+                };
+            }
+
+            return keysObj;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error parsing keys: ${e.message}`);
+            return {};
+        }
     }
     
     function parseEventLine(line) {
@@ -1335,17 +1490,22 @@ function Calendar(hook, text) {
     
     function checkEventDay(month, day, year, eventsList, config = null) {
         const todayEvents = [];
-        
+
         try {
             if (!config) {
                 config = loadConfiguration();
                 if (!config) return todayEvents;
             }
-            
+
             const daysInMonth = getDaysInMonth(month, year, config);
             if (day > daysInMonth) return todayEvents;
-            
+
             const dayOfWeekIndex = getDayOfWeekForDate(month, day, year, config);
+
+            if (debug) {
+                const monthName = config.months[month];
+                console.log(`${MODULE_NAME}: Checking events for ${monthName} ${day}, ${year} (${config.daysOfWeek[dayOfWeekIndex]})`);
+            }
             
             for (const event of eventsList) {
                 if (event.type === 'daily') {
@@ -1403,7 +1563,11 @@ function Calendar(hook, text) {
         } catch (error) {
             if (debug) console.log(`${MODULE_NAME}: Error checking events:`, error.message);
         }
-        
+
+        if (debug && todayEvents.length > 0) {
+            console.log(`${MODULE_NAME}: Found ${todayEvents.length} event(s) for today:`, todayEvents.map(e => e.name).join(', '));
+        }
+
         return todayEvents;
     }
     
@@ -1523,7 +1687,165 @@ function Calendar(hook, text) {
         
         return totalDays;
     }
-    
+
+    // ==========================
+    // Card Modification System
+    // ==========================
+
+    function loadModifiedCardsState() {
+        if (modifiedCardsCache !== null) return modifiedCardsCache;
+
+        const stateCard = Utilities.storyCard.get(MODIFIED_CARDS_STATE);
+        if (!stateCard) {
+            modifiedCardsCache = {};
+            return modifiedCardsCache;
+        }
+
+        try {
+            // Parse the JSON from the card entry
+            const state = JSON.parse(stateCard.entry);
+            modifiedCardsCache = state;
+            return state;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error loading modified cards state: ${e.message}`);
+            modifiedCardsCache = {};
+            return {};
+        }
+    }
+
+    function saveModifiedCardsState(state) {
+        const stateJson = JSON.stringify(state, null, 2);
+
+        Utilities.storyCard.upsert({
+            title: MODIFIED_CARDS_STATE,
+            entry: stateJson,
+            description: `Tracks original card keys for active Calendar events. Do not modify manually.`
+        });
+
+        modifiedCardsCache = state;
+    }
+
+    function generateDefaultKeys() {
+        // Default keys: a-z plus common punctuation
+        return 'a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,!,?,.';
+    }
+
+    function applyEventCardModifications(event) {
+        if (!event.cardTitles || event.cardTitles.length === 0) {
+            if (debug) console.log(`${MODULE_NAME}: No card titles defined for event "${event.name}"`);
+            return;
+        }
+
+        if (debug) {
+            console.log(`${MODULE_NAME}: Applying card modifications for event "${event.name}" (${event.cardTitles.length} card(s))`);
+        }
+
+        const modifiedState = loadModifiedCardsState();
+        const eventKey = `${event.name}_${event.type}`;
+
+        if (!modifiedState[eventKey]) {
+            modifiedState[eventKey] = {
+                originalKeys: {},
+                modifiedTitles: []
+            };
+        }
+
+        for (const title of event.cardTitles) {
+            const card = Utilities.storyCard.get(title);
+            if (!card) {
+                if (debug) console.log(`${MODULE_NAME}: Card "${title}" not found for event "${event.name}"`);
+                continue;
+            }
+
+            // Check if we need to apply keys
+            let newKeys = null;
+            let isOverride = false;
+
+            if (event.cardKeys && event.cardKeys[title]) {
+                newKeys = event.cardKeys[title].keys;
+                isOverride = event.cardKeys[title].override;
+            } else {
+                // Use default alphanumeric keys for titles not specified
+                newKeys = generateDefaultKeys();
+                if (debug) console.log(`${MODULE_NAME}: Using default keys for "${title}"`);
+            }
+
+            // Save original keys only if not override and not already saved
+            if (!isOverride && !modifiedState[eventKey].originalKeys[title]) {
+                modifiedState[eventKey].originalKeys[title] = card.keys || '';
+                if (debug) console.log(`${MODULE_NAME}: Saved original keys for "${title}": "${card.keys || '(empty)'}"`);
+            }
+
+            // Apply new keys
+            Utilities.storyCard.update(title, { keys: newKeys });
+
+            // Track this title was modified
+            if (!modifiedState[eventKey].modifiedTitles.includes(title)) {
+                modifiedState[eventKey].modifiedTitles.push(title);
+            }
+
+            if (debug) {
+                console.log(`${MODULE_NAME}: Applied keys to "${title}" for event "${event.name}"${isOverride ? ' (permanent)' : ''}: "${newKeys}"`);
+            }
+        }
+
+        saveModifiedCardsState(modifiedState);
+    }
+
+    function revertEventCardModifications(event) {
+        if (!event.cardTitles || event.cardTitles.length === 0) return;
+
+        const modifiedState = loadModifiedCardsState();
+        const eventKey = `${event.name}_${event.type}`;
+
+        if (!modifiedState[eventKey]) {
+            if (debug) console.log(`${MODULE_NAME}: No modifications to revert for event "${event.name}"`);
+            return;
+        }
+
+        const eventState = modifiedState[eventKey];
+
+        for (const title of eventState.modifiedTitles) {
+            // Skip if this was an override (permanent change)
+            if (event.cardKeys && event.cardKeys[title] && event.cardKeys[title].override) {
+                if (debug) console.log(`${MODULE_NAME}: Skipping revert for "${title}" (permanent override)`);
+                continue;
+            }
+
+            // Restore original keys if we have them
+            if (eventState.originalKeys[title] !== undefined) {
+                const card = Utilities.storyCard.get(title);
+                if (card) {
+                    Utilities.storyCard.update(title, { keys: eventState.originalKeys[title] });
+                    if (debug) {
+                        console.log(`${MODULE_NAME}: Restored original keys for "${title}"`);
+                    }
+                }
+            }
+        }
+
+        // Clean up the event from state
+        delete modifiedState[eventKey];
+        saveModifiedCardsState(modifiedState);
+    }
+
+    function clearAllModifiedCards() {
+        const modifiedState = loadModifiedCardsState();
+
+        // Revert all active modifications
+        for (const [eventKey, eventState] of Object.entries(modifiedState)) {
+            for (const [title, originalKeys] of Object.entries(eventState.originalKeys)) {
+                const card = Utilities.storyCard.get(title);
+                if (card) {
+                    Utilities.storyCard.update(title, { keys: originalKeys });
+                }
+            }
+        }
+
+        // Clear the state
+        saveModifiedCardsState({});
+    }
+
     // ==========================
     // Default Configuration
     // ==========================
@@ -1623,16 +1945,16 @@ function Calendar(hook, text) {
     
     function createDefaultEventDays() {
         const eventText = (
-            `\n// Format: Event Name: MM/DD [modifiers]` +
+            `// Format: Event Name: MM/DD [modifiers]` +
             `\n// Format: Event Name: Nth Weekday of Month` +
             `\n// Format: Event Name: Weekday (for weekly)` +
             `\n// Format: Event Name: daily (for every day)` +
             `\n// Add @ HH:MM-HH:MM for time ranges` +
             `\n// Add "lasting N days" for multi-day events` +
             `\n//` +
-            `\n// State card will show:` +
-            `\n// Today's Events: All events scheduled for today` +
-            `\n// Active Events: Only events currently in progress` +
+            `\n// Card Modifications:` +
+            `\n// titles: {"Card Title 1", "Card Title 2"}` +
+            `\n// keys: {"Card Title 1": "key1, key2", "Card Title 2": override "permanent keys"}` +
             `\n` +
             `\n## Annual Events` +
             `\n- New Year: 1/1` +
@@ -1659,11 +1981,15 @@ function Calendar(hook, text) {
             `\n` +
             `\n## Weekly Events` +
             `\n- Monday Meeting: Monday @ 9:00-10:00` +
-            `\n- Trash Pickup: Tuesday @ 8:00-8:30` +
             `\n- Market Day: Wednesday @ 8:00-14:00` +
+            `\ntitles: {"Town Square", "Merchant", "Guard Post"}` +
+            `\nkeys: {"Town Square": "bustling, crowded, merchants", "Merchant": override "available, eager"}` +
+            `\n// Town Square and Guard Post keys revert after market closes` +
+            `\n// Merchant keys are permanently changed` +
             `\n- Happy Hour: Friday @ 17:00-19:00` +
-            `\n- Boss Raid: Sunday @ 20:00-22:00` +
-            `\n` +
+            `\ntitles: {"Tavern"}` +
+            `\n// Tavern gets default alphabetic keys during happy hour` +
+
             `\n## Multi-Day Events` +
             `\n- Spring Conference: 3/15 lasting 3 days @ 9:00-17:00` +
             `\n- Summer Festival: 2nd Friday of July lasting 3 days @ 10:00-22:00` +
@@ -1908,13 +2234,18 @@ function Calendar(hook, text) {
     const eventDispatcher = {
         events: [],
         dispatchedDays: new Set(),
-        
+
         dispatch(eventType, data) {
             this.events.push({
                 type: eventType,
                 data: data
             });
-            
+
+            if (debug) {
+                const eventName = data.event ? data.event.name : '';
+                console.log(`${MODULE_NAME}: Event dispatched: ${eventType}${eventName ? ` for "${eventName}"` : ''}`);
+            }
+
             if (eventType === 'eventDay' && data.timeData) {
                 this.dispatchedDays.add(data.timeData.day);
             }
@@ -1939,7 +2270,7 @@ function Calendar(hook, text) {
     switch(hook) {
         case 'context':
             // Full context processing
-            const config = loadConfiguration();
+            let config = loadConfiguration();
             if (!config) {
                 if (debug) console.log(`${MODULE_NAME}: Time system requires configuration to function`);
                 createDefaultConfiguration();
@@ -1949,8 +2280,9 @@ function Calendar(hook, text) {
                 }
                 
                 // Try to load again after creation
-                const newConfig = loadConfiguration();
-                if (!newConfig) {
+                config = loadConfiguration();
+                if (!config) {
+                    if (debug) console.log(`${MODULE_NAME}: Failed to load configuration after creation`);
                     initializeAPI();
                     return;
                 }
@@ -2025,23 +2357,60 @@ function Calendar(hook, text) {
                             const currTime = checkEventTimeRange(event, currProgress, config.hoursPerDay);
                             
                             if (!prevTime.active && currTime.active) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Time range started for "${event.name}" @ ${currTime.currentRange.start.hour}:${String(currTime.currentRange.start.minute).padStart(2, '0')}-${currTime.currentRange.end.hour}:${String(currTime.currentRange.end.minute).padStart(2, '0')}`);
+                                }
+
+                                // Check story cards before applying modifications
+                                if (event.cardTitles && event.cardTitles.length > 0) {
+                                    if (debug) {
+                                        console.log(`${MODULE_NAME}: Time-range event "${event.name}" declares cards: ${event.cardTitles.join(', ')}`);
+                                    }
+
+                                    // Check existence
+                                    for (const cardTitle of event.cardTitles) {
+                                        if (Utilities && Utilities.storyCard) {
+                                            const card = Utilities.storyCard.get(cardTitle);
+                                            if (card) {
+                                                if (debug) {
+                                                    console.log(`${MODULE_NAME}: Story card "${cardTitle}" exists and will be activated`);
+                                                }
+                                            } else {
+                                                if (debug) {
+                                                    console.log(`${MODULE_NAME}: WARNING: Story card "${cardTitle}" not found`);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Apply card modifications when time range starts
+                                applyEventCardModifications(event);
                                 eventDispatcher.dispatch('timeRangeEventStarted', {
                                     event: event,
                                     timeRange: currTime.currentRange,
                                     timeData: actionResult.timeData
                                 });
                             }
-                            
-                            if (currTime.active && currTime.minutesRemaining <= 5 && 
+
+                            if (currTime.active && currTime.minutesRemaining <= 5 &&
                                 prevTime.active && prevTime.minutesRemaining > 5) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Time range ending soon for "${event.name}" (${currTime.minutesRemaining} minutes remaining)`);
+                                }
                                 eventDispatcher.dispatch('timeRangeEventEnding', {
                                     event: event,
                                     minutesRemaining: currTime.minutesRemaining,
                                     timeData: actionResult.timeData
                                 });
                             }
-                            
+
                             if (prevTime.active && !currTime.active) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Time range ended for "${event.name}"`);
+                                }
+                                // Revert card modifications when time range ends
+                                revertEventCardModifications(event);
                                 eventDispatcher.dispatch('timeRangeEventEnded', {
                                     event: event,
                                     timeData: actionResult.timeData
@@ -2056,16 +2425,138 @@ function Calendar(hook, text) {
             const currentTimeData = loadTimeState();
             if (currentTimeData && !eventDispatcher.hasDispatchedForDay(currentTimeData.day)) {
                 const eventsList = loadEventDays();
+                let todayEvents = [];
+
                 if (eventsList.length > 0) {
                     const dateInfo = calculateDateInfo(currentTimeData.day, config.startDate, config);
-                    const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-                    
+                    todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
+
                     if (todayEvents.length > 0) {
+                        if (debug) {
+                            console.log(`${MODULE_NAME}: Processing ${todayEvents.length} event(s) for day ${currentTimeData.day}`);
+                        }
+
+                        // Check story cards for ALL today's events (both all-day and time-range)
+                        const eventsWithStoryCards = [];
+
+                        for (const event of todayEvents) {
+                            // Check which story cards this event declares
+                            if (event.cardTitles && event.cardTitles.length > 0) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Event "${event.name}" declares cards: ${event.cardTitles.join(', ')}`);
+                                }
+
+                                // Check if these story cards actually exist
+                                for (const cardTitle of event.cardTitles) {
+                                    if (Utilities && Utilities.storyCard) {
+                                        const card = Utilities.storyCard.get(cardTitle);
+                                        if (card) {
+                                            if (debug) {
+                                                console.log(`${MODULE_NAME}: Story card "${cardTitle}" exists for event "${event.name}"`);
+                                            }
+                                            eventsWithStoryCards.push({
+                                                event: event,
+                                                cardTitle: cardTitle,
+                                                card: card
+                                            });
+                                        } else {
+                                            if (debug) {
+                                                console.log(`${MODULE_NAME}: WARNING: Story card "${cardTitle}" not found for event "${event.name}"`);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Event "${event.name}" has no cards declared`);
+                                }
+                            }
+
+                            // Apply modifications for all-day events (events without time ranges)
+                            if (!event.timeRanges) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Applying all-day event "${event.name}"`);
+                                }
+                                applyEventCardModifications(event);
+                            } else {
+                                // For time-range events, check if they're currently active
+                                const timeRange = checkEventTimeRange(event, currentTimeData.dayProgress, config.hoursPerDay);
+                                if (timeRange.active) {
+                                    if (debug) {
+                                        if (timeRange.currentRange) {
+                                            console.log(`${MODULE_NAME}: Event "${event.name}" is currently active (${timeRange.currentRange.start.hour}:${String(timeRange.currentRange.start.minute).padStart(2, '0')}-${timeRange.currentRange.end.hour}:${String(timeRange.currentRange.end.minute).padStart(2, '0')})`);
+                                        } else {
+                                            console.log(`${MODULE_NAME}: Event "${event.name}" is currently active`);
+                                        }
+                                    }
+                                    // Apply modifications for currently active time-range events
+                                    applyEventCardModifications(event);
+                                } else if (debug) {
+                                    console.log(`${MODULE_NAME}: Event "${event.name}" is not currently active`);
+                                }
+                            }
+                        }
+
                         eventDispatcher.dispatch('eventDay', {
                             events: todayEvents,
+                            eventsWithStoryCards: eventsWithStoryCards,
                             date: calculateDate(currentTimeData.day, config.startDate, config),
                             timeData: currentTimeData
                         });
+                    }
+                }
+
+                // Also check for events from previous day to revert
+                if (currentTimeData.day > 0) {
+                    const prevDateInfo = calculateDateInfo(currentTimeData.day - 1, config.startDate, config);
+                    const prevDayEvents = checkEventDay(prevDateInfo.month, prevDateInfo.day, prevDateInfo.year, eventsList, config);
+
+                    if (prevDayEvents.length > 0) {
+                        if (debug) {
+                            console.log(`${MODULE_NAME}: Checking ${prevDayEvents.length} event(s) from previous day to revert`);
+                        }
+
+                        // Check ALL previous day's events for active modifications
+                        const modifiedState = loadModifiedCardsState();
+
+                        for (const event of prevDayEvents) {
+                            const eventKey = `${event.name}_${event.type}`;
+
+                            // Check if this event has any active modifications
+                            if (modifiedState[eventKey] && modifiedState[eventKey].modifiedTitles &&
+                                modifiedState[eventKey].modifiedTitles.length > 0) {
+
+                                if (!event.timeRanges) {
+                                    // All-day event from yesterday
+                                    if (debug) {
+                                        console.log(`${MODULE_NAME}: Reverting all-day event "${event.name}" from previous day`);
+                                    }
+                                    revertEventCardModifications(event);
+                                } else {
+                                    // Time-range event from yesterday - check if it's still active today
+                                    const todayEvent = todayEvents.find(e => e.name === event.name);
+                                    if (!todayEvent) {
+                                        // Event doesn't occur today, safe to revert
+                                        if (debug) {
+                                            console.log(`${MODULE_NAME}: Reverting time-range event "${event.name}" from previous day (not active today)`);
+                                        }
+                                        revertEventCardModifications(event);
+                                    } else {
+                                        // Event occurs today too - check if it's currently active
+                                        const timeRange = checkEventTimeRange(todayEvent, currentTimeData.dayProgress, config.hoursPerDay);
+                                        if (!timeRange.active) {
+                                            // Not currently active, revert the modifications
+                                            if (debug) {
+                                                console.log(`${MODULE_NAME}: Reverting time-range event "${event.name}" from previous day (not currently active)`);
+                                            }
+                                            revertEventCardModifications(event);
+                                        } else if (debug) {
+                                            console.log(`${MODULE_NAME}: Keeping modifications for "${event.name}" (still active today)`);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }

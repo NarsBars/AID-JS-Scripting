@@ -20,7 +20,7 @@ const Utilities = (function() {
      * - format: Number and string formatting utilities
      * 
      * AI Dungeon Specific:
-     * - storyCard: Story Card operations (get, find, add, update, remove, upsert)
+     * - storyCard: Story Card operations (get, find, add, update, remove, upsert, position)
      * - history: Access and search action history
      * - context: Extract and parse context information
      * 
@@ -603,6 +603,11 @@ const Utilities = (function() {
      * upsert(cardData: Object) -> boolean
      *   Updates existing card or creates new one if not found
      *   Example: Utilities.storyCard.upsert({title: '[STATE] Current', entry: '90 Volts'})
+     *   
+     * position(card: string|Object, position: number) -> boolean
+     *   Move a card to a specific position in the array (0 = first, -1 = last)
+     *   Example: Utilities.storyCard.position('[PLAYER] Alice', 0)  // Move to top
+     *   Example: Utilities.storyCard.position('Old Card', -1)       // Move to end
      */
     
     /**
@@ -881,6 +886,15 @@ const Utilities = (function() {
                 return evaluator;
             } catch (error) {
                 console.log('[Expression] Parse error:', error.message);
+                console.log('[Expression] Failed expression:', expression);
+                // Log stack trace to find where this is being called from
+                if (typeof Error !== 'undefined') {
+                    const stack = new Error().stack;
+                    if (stack) {
+                        const lines = stack.split('\n').slice(1, 4); // Skip first line and get next 3
+                        console.log('[Expression] Called from:', lines.join('\n'));
+                    }
+                }
                 return null;
             }
         },
@@ -2713,15 +2727,82 @@ const Utilities = (function() {
         
         rotate(array, positions) {
             if (array.length === 0) return [];
-            
+
             const n = positions % array.length;
             if (n === 0) return [...array];
-            
+
             if (n > 0) {
                 return [...array.slice(-n), ...array.slice(0, -n)];
             } else {
                 return [...array.slice(-n), ...array.slice(0, -n)];
             }
+        },
+
+        deepMerge(target, source, arrayStrategy = 'replace') {
+            // Deep merge source into target with configurable array strategy
+            // arrayStrategy options: 'replace' (default), 'concat', 'merge'
+            if (!source) return target;
+            if (!target) return source;
+
+            // Handle primitives
+            if (typeof target !== 'object' || target === null ||
+                typeof source !== 'object' || source === null) {
+                return source;
+            }
+
+            // Handle arrays at root level
+            if (Array.isArray(source)) {
+                if (!Array.isArray(target)) return source;
+
+                if (arrayStrategy === 'concat') {
+                    return [...target, ...source];
+                } else if (arrayStrategy === 'merge') {
+                    // Merge by index
+                    const result = [...target];
+                    source.forEach((item, index) => {
+                        result[index] = item;
+                    });
+                    return result;
+                } else {
+                    // Default: replace
+                    return source;
+                }
+            }
+
+            const output = Object.assign({}, target);
+
+            Object.keys(source).forEach(key => {
+                if (typeof source[key] === 'object' && source[key] !== null) {
+                    if (Array.isArray(source[key])) {
+                        // Handle arrays based on strategy
+                        if (!target[key]) {
+                            output[key] = source[key];
+                        } else if (arrayStrategy === 'concat') {
+                            output[key] = [...(target[key] || []), ...source[key]];
+                        } else if (arrayStrategy === 'merge') {
+                            // Merge by index
+                            output[key] = [...(target[key] || [])];
+                            source[key].forEach((item, index) => {
+                                output[key][index] = item;
+                            });
+                        } else {
+                            // Default: replace
+                            output[key] = source[key];
+                        }
+                    } else {
+                        // Recursive merge for objects
+                        if (key in target) {
+                            output[key] = this.deepMerge(target[key], source[key], arrayStrategy);
+                        } else {
+                            output[key] = source[key];
+                        }
+                    }
+                } else {
+                    output[key] = source[key];
+                }
+            });
+
+            return output;
         }
     };
     
@@ -3262,6 +3343,16 @@ const Utilities = (function() {
                 return this._findByPredicate(query, getAll);
             }
             
+            // Check if it's a simple title string (not an expression)
+            // Titles starting with '[' should be treated as literals, not expressions
+            if (typeof query === 'string' && !query.includes(' && ') && !query.includes(' || ') && 
+                !query.includes('.') && !query.includes('==') && !query.includes('!=')) {
+                // Simple title match
+                const titlePredicate = (card) => card && card.title === query;
+                return this._findByPredicateWithCaching(titlePredicate, getAll);
+            }
+            
+            // Parse complex expression queries
             const predicate = ExpressionParser.parseObjectQuery(query, 'card');
             if (!predicate) {
                 const titlePredicate = (card) => card && card.title === query;
@@ -3283,7 +3374,16 @@ const Utilities = (function() {
                 return this._removeByPredicate(titlePredicate, removeAll);
             }
             
-            // Parse ALL string queries through the expression parser
+            // Check if it's a simple title string (not an expression)
+            // Titles starting with '[' should be treated as literals, not expressions
+            if (typeof query === 'string' && !query.includes(' && ') && !query.includes(' || ') && 
+                !query.includes('.') && !query.includes('==') && !query.includes('!=')) {
+                // Simple title match
+                const titlePredicate = (card) => card && card.title === query;
+                return this._removeByPredicate(titlePredicate, removeAll);
+            }
+            
+            // Parse complex expression queries
             const predicate = ExpressionParser.parseObjectQuery(query, 'card');
             if (!predicate) {
                 // Fallback: treat as simple title match
@@ -3464,6 +3564,50 @@ const Utilities = (function() {
                 return Object.seal(card);
             }
             throw new Error('An unexpected error occurred with buildCard');
+        },
+        
+        position(card, position) {
+            if (!storyCards || !Array.isArray(storyCards)) {
+                return false;
+            }
+            
+            try {
+                let cardObj = null;
+                let currentIndex = -1;
+                
+                if (typeof card === 'string') {
+                    cardObj = this.get(card);
+                    if (cardObj) {
+                        currentIndex = storyCards.indexOf(cardObj);
+                    }
+                } else if (card && typeof card === 'object') {
+                    currentIndex = storyCards.indexOf(card);
+                    if (currentIndex !== -1) {
+                        cardObj = card;
+                    }
+                }
+                
+                if (!cardObj || currentIndex === -1) {
+                    return false;
+                }
+                
+                storyCards.splice(currentIndex, 1);
+                
+                let targetIndex = position;
+                if (targetIndex < 0) {
+                    targetIndex = Math.max(0, storyCards.length + targetIndex + 1);
+                } else {
+                    targetIndex = Math.min(targetIndex, storyCards.length);
+                }
+                
+                storyCards.splice(targetIndex, 0, cardObj);
+                
+                return true;
+                
+            } catch (e) {
+                console.error('[StoryCard] Error positioning card:', e.message);
+                return false;
+            }
         }
     };
     
