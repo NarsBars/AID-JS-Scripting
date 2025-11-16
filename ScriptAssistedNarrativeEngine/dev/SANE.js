@@ -338,7 +338,8 @@ function SANE(hook, text) {
             current[lastPart] = value;
         }
 
-        // Mark entity as modified (would trigger save in full implementation)
+        // Mark entity as modified and queue for save
+        modifiedEntities.add(resolvedId);
         return true;
     }
 
@@ -1161,8 +1162,9 @@ function SANE(hook, text) {
             if (match) {
                 const [, varName, type, defaultValue, description] = match;
 
-                // Set default value if not already set
-                if (defaultValue && !dataCache.global[varName]) {
+                // Only set default value if variable doesn't exist yet (undefined)
+                // If it's null, 0, false, or empty string, those are valid runtime values
+                if (defaultValue && dataCache.global[varName] === undefined) {
                     let value = defaultValue.trim();
                     // Convert based on type
                     if (type === 'integer' || type === 'number') {
@@ -1179,9 +1181,15 @@ function SANE(hook, text) {
 
                     dataCache.global[varName] = value;
                     varCount++;
-                    if (debug) console.log(`${MODULE_NAME}: Set Global.${varName} = ${value}`);
+                    if (debug) console.log(`${MODULE_NAME}: Initialized Global.${varName} = ${value} (first time)`);
                 }
             }
+        }
+
+        // If any variables were loaded, save Global entity to ensure persistence
+        if (varCount > 0) {
+            saveToDataCard('Global', dataCache.global);
+            if (debug) console.log(`${MODULE_NAME}: Saved Global entity with ${varCount} variables to [SANE:D] Data`);
         }
 
         if (debug) console.log(`${MODULE_NAME}: Loaded ${varCount} variable definitions`);
@@ -1191,11 +1199,9 @@ function SANE(hook, text) {
     // Load schemas first
     const schemaCount = loadSchemasFromCards();
 
-    // Load variable definitions
-    loadVariableDefinitions();
-
-    // Then load entities
+    // Load entities and variable definitions
     loadAllEntities();
+    loadVariableDefinitions();
     if (debug) {
         const entityCount = Object.keys(dataCache).filter(k => !k.startsWith('schema.') && !k.startsWith('function.')).length;
     }
@@ -3382,7 +3388,7 @@ function SANE(hook, text) {
                     relationships: {},  // Relationships are added dynamically
                     display: {
                         active: false,  // Will be set to true when generation completes
-                        prefix: "<$# Character>",
+                        prefix: "<$# Characters>",
                         sections: {
                             header: {
                                 line: "nameline",
@@ -5774,7 +5780,7 @@ function SANE(hook, text) {
         ModuleAPI.registerAPI('RewindSystem', RewindSystem);
 
         // The main output hook will handle recording actions with executed tools
-        // Position tracking happens in context hook via handleContext, not in input
+        // Position tracking happens in context hook via handleContext
 
     }
     //#endregion RewindModule
