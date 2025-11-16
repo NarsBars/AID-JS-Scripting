@@ -3643,7 +3643,6 @@ const Utilities = (function() {
     return UtilitiesAPI;
 })();
 
-// optional but built in functionality
 function Calendar(hook, text) {
     'use strict';
     
@@ -3674,6 +3673,9 @@ function Calendar(hook, text) {
     //     - Relative: Event Name: Nth Weekday of Month
     //     - Time ranges: @ HH:MM-HH:MM
     //     - Multi-day: lasting N days
+    //     - Card modifications:
+    //       titles: {"Card Title 1", "Card Title 2"}
+    //       keys: {"Card Title 1": "key1, key2", "Card Title 2": override "key3"}
     //
     // TIME SYSTEM:
     //   - Uses dayProgress (0.0 to 1.0) for position in day
@@ -3729,6 +3731,12 @@ function Calendar(hook, text) {
     //   clearConfigCache()      Force reload time configuration
     //   clearAllCaches()        Clear all cached data
     //
+    // CARD MODIFICATION METHODS:
+    //   getModifiedCardsState() Returns current modified cards state
+    //   clearModifiedCards()    Revert all modified cards to original
+    //   applyEventCards(name)   Manually apply event's card modifications
+    //   revertEventCards(name)  Manually revert event's card modifications
+    //
     // EVENT PROPERTIES:
     //   Calendar.events         Array of events that occurred this turn
     //                          Types: 'dayChanged', 'seasonChanged', 'timeOfDayChanged',
@@ -3764,17 +3772,33 @@ function Calendar(hook, text) {
     //     }
     //   }
     //
+    // Card Modifications:
+    //   // In [CALENDAR] Event Days card:
+    //   // Market Day: Wednesday @ 8:00-14:00
+    //   // titles: {"Town Square", "Merchant"}
+    //   // keys: {"Town Square": "busy, crowded", "Merchant": override "available"}
+    //
+    //   // The Town Square card's keys will be temporarily changed during market hours
+    //   // The Merchant card's keys will be permanently set to "available"
+    //
+    //   // Manual control:
+    //   Calendar.applyEventCards("Market Day");   // Apply modifications
+    //   Calendar.revertEventCards("Market Day");  // Revert (except overrides)
+    //   Calendar.clearModifiedCards();            // Revert all modifications
+    //
     // =====================================
     
     // Configuration Card Names
     const CONFIG_CARD = '[CALENDAR] Time Configuration';
     const STATE_CARD = '[CALENDAR] Time State';
     const EVENT_CARD_PREFIX = '[CALENDAR] Event Days';
-    
+    const MODIFIED_CARDS_STATE = '[CALENDAR] Modified Cards State';
+
     // Module-level cache (valid for this turn only)
     let eventCache = null;
     let configCache = null;
     let timeDataCache = null;
+    let modifiedCardsCache = null;
     
     // ==========================
     // Core Functions
@@ -4694,17 +4718,56 @@ function Calendar(hook, text) {
             eventCache = null;
             return true;
         };
-        
+
         Calendar.clearConfigCache = () => {
             configCache = null;
             return true;
         };
-        
+
         Calendar.clearAllCaches = () => {
             eventCache = null;
             configCache = null;
             timeDataCache = null;
+            modifiedCardsCache = null;
             return true;
+        };
+
+        // Refresh events from all sources (including story cards)
+        Calendar.refreshEvents = () => {
+            eventCache = null;
+            const events = loadEventDays();
+            if (debug) {
+                console.log(`${MODULE_NAME}: Events refreshed - found ${events.length} total events`);
+            }
+            return events;
+        };
+
+        // Card Modification Methods
+        Calendar.getModifiedCardsState = () => loadModifiedCardsState();
+
+        Calendar.clearModifiedCards = () => {
+            clearAllModifiedCards();
+            return true;
+        };
+
+        Calendar.applyEventCards = (eventName) => {
+            const events = Calendar.getAllEvents();
+            const event = events.find(e => e.name === eventName);
+            if (event) {
+                applyEventCardModifications(event);
+                return true;
+            }
+            return false;
+        };
+
+        Calendar.revertEventCards = (eventName) => {
+            const events = Calendar.getAllEvents();
+            const event = events.find(e => e.name === eventName);
+            if (event) {
+                revertEventCardModifications(event);
+                return true;
+            }
+            return false;
         };
     }
     
@@ -4714,30 +4777,35 @@ function Calendar(hook, text) {
     
     function loadEventDays() {
         if (eventCache !== null) return eventCache;
-        
+
         try {
             const eventsList = [];
             let cardNumber = 1;
             let cardTitle = EVENT_CARD_PREFIX;
-            
+
+            // Load events from dedicated event cards
             while (true) {
                 if (cardNumber > 1) {
                     cardTitle = `${EVENT_CARD_PREFIX} ${cardNumber}`;
                 }
-                
+
                 const eventCard = Utilities.storyCard.get(cardTitle);
                 if (!eventCard) break;
-                
+
                 const entryEvents = parseEventList(eventCard.entry || '');
                 const descEvents = parseEventList(eventCard.description || '');
-                
+
                 eventsList.push(...entryEvents, ...descEvents);
-                
+
                 cardNumber++;
                 if (cardNumber > 10) break;
             }
-            
+
+
             const uniqueEvents = removeDuplicateEvents(eventsList);
+            if (debug) {
+                console.log(`${MODULE_NAME}: Loaded ${uniqueEvents.length} unique events from ${cardNumber - 1} card(s)`);
+            }
             eventCache = uniqueEvents;
             return uniqueEvents;
         } catch (error) {
@@ -4746,23 +4814,105 @@ function Calendar(hook, text) {
             return [];
         }
     }
+
     
     function parseEventList(text) {
         if (!text || typeof text !== 'string') return [];
-        
+
         const eventsList = [];
         const lines = text.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
+
+        for (let i = 0; i < lines.length; i++) {
+            const trimmed = lines[i].trim();
             if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
             if (trimmed.startsWith('##')) continue;
-            
+
             const event = parseEventLine(trimmed);
-            if (event) eventsList.push(event);
+            if (event) {
+                // Check for titles and keys on following lines
+                let titlesFound = false;
+                let keysFound = false;
+
+                for (let j = i + 1; j < lines.length; j++) {
+                    const nextLine = lines[j].trim();
+
+                    // Stop if we hit another event or section
+                    if (nextLine && !nextLine.startsWith('titles:') && !nextLine.startsWith('keys:') &&
+                        !nextLine.startsWith('//')) {
+                        // Check if it's another event line
+                        const possibleEvent = parseEventLine(nextLine);
+                        if (possibleEvent) break;
+                    }
+
+                    if (nextLine.startsWith('titles:')) {
+                        const titlesStr = nextLine.substring(7).trim();
+                        event.cardTitles = parseTitlesArray(titlesStr);
+                        titlesFound = true;
+                    } else if (nextLine.startsWith('keys:')) {
+                        const keysStr = nextLine.substring(5).trim();
+                        event.cardKeys = parseKeysObject(keysStr);
+                        keysFound = true;
+                    }
+
+                    // If we found both, we can stop looking
+                    if (titlesFound && keysFound) break;
+                }
+
+                eventsList.push(event);
+            }
         }
-        
+
         return eventsList;
+    }
+
+    function parseTitlesArray(titlesStr) {
+        // Parse format: {"Title 1", "Title 2", "Title 3"}
+        try {
+            // Remove curly braces and split by comma
+            const cleaned = titlesStr.replace(/^\{|\}$/g, '').trim();
+            if (!cleaned) return [];
+
+            // Split by comma and clean up quotes
+            const titles = cleaned.split(',').map(t => {
+                return t.trim().replace(/^["']|["']$/g, '');
+            }).filter(t => t.length > 0);
+
+            return titles;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error parsing titles: ${e.message}`);
+            return [];
+        }
+    }
+
+    function parseKeysObject(keysStr) {
+        // Parse format: {"Title": "key1, key2", "Title2": override "key3, key4"}
+        try {
+            const keysObj = {};
+
+            // Remove outer curly braces
+            const cleaned = keysStr.replace(/^\{|\}$/g, '').trim();
+            if (!cleaned) return keysObj;
+
+            // Match pattern: "Title": "keys" or "Title": override "keys"
+            const regex = /["']([^"']+)["']\s*:\s*(override\s+)?["']([^"']+)["']/g;
+            let match;
+
+            while ((match = regex.exec(cleaned)) !== null) {
+                const title = match[1];
+                const isOverride = !!match[2];
+                const keys = match[3];
+
+                keysObj[title] = {
+                    keys: keys,
+                    override: isOverride
+                };
+            }
+
+            return keysObj;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error parsing keys: ${e.message}`);
+            return {};
+        }
     }
     
     function parseEventLine(line) {
@@ -4985,17 +5135,22 @@ function Calendar(hook, text) {
     
     function checkEventDay(month, day, year, eventsList, config = null) {
         const todayEvents = [];
-        
+
         try {
             if (!config) {
                 config = loadConfiguration();
                 if (!config) return todayEvents;
             }
-            
+
             const daysInMonth = getDaysInMonth(month, year, config);
             if (day > daysInMonth) return todayEvents;
-            
+
             const dayOfWeekIndex = getDayOfWeekForDate(month, day, year, config);
+
+            if (debug) {
+                const monthName = config.months[month];
+                console.log(`${MODULE_NAME}: Checking events for ${monthName} ${day}, ${year} (${config.daysOfWeek[dayOfWeekIndex]})`);
+            }
             
             for (const event of eventsList) {
                 if (event.type === 'daily') {
@@ -5053,7 +5208,11 @@ function Calendar(hook, text) {
         } catch (error) {
             if (debug) console.log(`${MODULE_NAME}: Error checking events:`, error.message);
         }
-        
+
+        if (debug && todayEvents.length > 0) {
+            console.log(`${MODULE_NAME}: Found ${todayEvents.length} event(s) for today:`, todayEvents.map(e => e.name).join(', '));
+        }
+
         return todayEvents;
     }
     
@@ -5173,7 +5332,165 @@ function Calendar(hook, text) {
         
         return totalDays;
     }
-    
+
+    // ==========================
+    // Card Modification System
+    // ==========================
+
+    function loadModifiedCardsState() {
+        if (modifiedCardsCache !== null) return modifiedCardsCache;
+
+        const stateCard = Utilities.storyCard.get(MODIFIED_CARDS_STATE);
+        if (!stateCard) {
+            modifiedCardsCache = {};
+            return modifiedCardsCache;
+        }
+
+        try {
+            // Parse the JSON from the card entry
+            const state = JSON.parse(stateCard.entry);
+            modifiedCardsCache = state;
+            return state;
+        } catch (e) {
+            if (debug) console.log(`${MODULE_NAME}: Error loading modified cards state: ${e.message}`);
+            modifiedCardsCache = {};
+            return {};
+        }
+    }
+
+    function saveModifiedCardsState(state) {
+        const stateJson = JSON.stringify(state, null, 2);
+
+        Utilities.storyCard.upsert({
+            title: MODIFIED_CARDS_STATE,
+            entry: stateJson,
+            description: `Tracks original card keys for active Calendar events. Do not modify manually.`
+        });
+
+        modifiedCardsCache = state;
+    }
+
+    function generateDefaultKeys() {
+        // Default keys: a-z plus common punctuation
+        return 'a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,!,?,.';
+    }
+
+    function applyEventCardModifications(event) {
+        if (!event.cardTitles || event.cardTitles.length === 0) {
+            if (debug) console.log(`${MODULE_NAME}: No card titles defined for event "${event.name}"`);
+            return;
+        }
+
+        if (debug) {
+            console.log(`${MODULE_NAME}: Applying card modifications for event "${event.name}" (${event.cardTitles.length} card(s))`);
+        }
+
+        const modifiedState = loadModifiedCardsState();
+        const eventKey = `${event.name}_${event.type}`;
+
+        if (!modifiedState[eventKey]) {
+            modifiedState[eventKey] = {
+                originalKeys: {},
+                modifiedTitles: []
+            };
+        }
+
+        for (const title of event.cardTitles) {
+            const card = Utilities.storyCard.get(title);
+            if (!card) {
+                if (debug) console.log(`${MODULE_NAME}: Card "${title}" not found for event "${event.name}"`);
+                continue;
+            }
+
+            // Check if we need to apply keys
+            let newKeys = null;
+            let isOverride = false;
+
+            if (event.cardKeys && event.cardKeys[title]) {
+                newKeys = event.cardKeys[title].keys;
+                isOverride = event.cardKeys[title].override;
+            } else {
+                // Use default alphanumeric keys for titles not specified
+                newKeys = generateDefaultKeys();
+                if (debug) console.log(`${MODULE_NAME}: Using default keys for "${title}"`);
+            }
+
+            // Save original keys only if not override and not already saved
+            if (!isOverride && !modifiedState[eventKey].originalKeys[title]) {
+                modifiedState[eventKey].originalKeys[title] = card.keys || '';
+                if (debug) console.log(`${MODULE_NAME}: Saved original keys for "${title}": "${card.keys || '(empty)'}"`);
+            }
+
+            // Apply new keys
+            Utilities.storyCard.update(title, { keys: newKeys });
+
+            // Track this title was modified
+            if (!modifiedState[eventKey].modifiedTitles.includes(title)) {
+                modifiedState[eventKey].modifiedTitles.push(title);
+            }
+
+            if (debug) {
+                console.log(`${MODULE_NAME}: Applied keys to "${title}" for event "${event.name}"${isOverride ? ' (permanent)' : ''}: "${newKeys}"`);
+            }
+        }
+
+        saveModifiedCardsState(modifiedState);
+    }
+
+    function revertEventCardModifications(event) {
+        if (!event.cardTitles || event.cardTitles.length === 0) return;
+
+        const modifiedState = loadModifiedCardsState();
+        const eventKey = `${event.name}_${event.type}`;
+
+        if (!modifiedState[eventKey]) {
+            if (debug) console.log(`${MODULE_NAME}: No modifications to revert for event "${event.name}"`);
+            return;
+        }
+
+        const eventState = modifiedState[eventKey];
+
+        for (const title of eventState.modifiedTitles) {
+            // Skip if this was an override (permanent change)
+            if (event.cardKeys && event.cardKeys[title] && event.cardKeys[title].override) {
+                if (debug) console.log(`${MODULE_NAME}: Skipping revert for "${title}" (permanent override)`);
+                continue;
+            }
+
+            // Restore original keys if we have them
+            if (eventState.originalKeys[title] !== undefined) {
+                const card = Utilities.storyCard.get(title);
+                if (card) {
+                    Utilities.storyCard.update(title, { keys: eventState.originalKeys[title] });
+                    if (debug) {
+                        console.log(`${MODULE_NAME}: Restored original keys for "${title}"`);
+                    }
+                }
+            }
+        }
+
+        // Clean up the event from state
+        delete modifiedState[eventKey];
+        saveModifiedCardsState(modifiedState);
+    }
+
+    function clearAllModifiedCards() {
+        const modifiedState = loadModifiedCardsState();
+
+        // Revert all active modifications
+        for (const [eventKey, eventState] of Object.entries(modifiedState)) {
+            for (const [title, originalKeys] of Object.entries(eventState.originalKeys)) {
+                const card = Utilities.storyCard.get(title);
+                if (card) {
+                    Utilities.storyCard.update(title, { keys: originalKeys });
+                }
+            }
+        }
+
+        // Clear the state
+        saveModifiedCardsState({});
+    }
+
     // ==========================
     // Default Configuration
     // ==========================
@@ -5273,16 +5590,16 @@ function Calendar(hook, text) {
     
     function createDefaultEventDays() {
         const eventText = (
-            `\n// Format: Event Name: MM/DD [modifiers]` +
+            `// Format: Event Name: MM/DD [modifiers]` +
             `\n// Format: Event Name: Nth Weekday of Month` +
             `\n// Format: Event Name: Weekday (for weekly)` +
             `\n// Format: Event Name: daily (for every day)` +
             `\n// Add @ HH:MM-HH:MM for time ranges` +
             `\n// Add "lasting N days" for multi-day events` +
             `\n//` +
-            `\n// State card will show:` +
-            `\n// Today's Events: All events scheduled for today` +
-            `\n// Active Events: Only events currently in progress` +
+            `\n// Card Modifications:` +
+            `\n// titles: {"Card Title 1", "Card Title 2"}` +
+            `\n// keys: {"Card Title 1": "key1, key2", "Card Title 2": override "permanent keys"}` +
             `\n` +
             `\n## Annual Events` +
             `\n- New Year: 1/1` +
@@ -5309,11 +5626,15 @@ function Calendar(hook, text) {
             `\n` +
             `\n## Weekly Events` +
             `\n- Monday Meeting: Monday @ 9:00-10:00` +
-            `\n- Trash Pickup: Tuesday @ 8:00-8:30` +
             `\n- Market Day: Wednesday @ 8:00-14:00` +
+            `\ntitles: {"Town Square", "Merchant", "Guard Post"}` +
+            `\nkeys: {"Town Square": "bustling, crowded, merchants", "Merchant": override "available, eager"}` +
+            `\n// Town Square and Guard Post keys revert after market closes` +
+            `\n// Merchant keys are permanently changed` +
             `\n- Happy Hour: Friday @ 17:00-19:00` +
-            `\n- Boss Raid: Sunday @ 20:00-22:00` +
-            `\n` +
+            `\ntitles: {"Tavern"}` +
+            `\n// Tavern gets default alphabetic keys during happy hour` +
+
             `\n## Multi-Day Events` +
             `\n- Spring Conference: 3/15 lasting 3 days @ 9:00-17:00` +
             `\n- Summer Festival: 2nd Friday of July lasting 3 days @ 10:00-22:00` +
@@ -5558,13 +5879,18 @@ function Calendar(hook, text) {
     const eventDispatcher = {
         events: [],
         dispatchedDays: new Set(),
-        
+
         dispatch(eventType, data) {
             this.events.push({
                 type: eventType,
                 data: data
             });
-            
+
+            if (debug) {
+                const eventName = data.event ? data.event.name : '';
+                console.log(`${MODULE_NAME}: Event dispatched: ${eventType}${eventName ? ` for "${eventName}"` : ''}`);
+            }
+
             if (eventType === 'eventDay' && data.timeData) {
                 this.dispatchedDays.add(data.timeData.day);
             }
@@ -5676,23 +6002,60 @@ function Calendar(hook, text) {
                             const currTime = checkEventTimeRange(event, currProgress, config.hoursPerDay);
                             
                             if (!prevTime.active && currTime.active) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Time range started for "${event.name}" @ ${currTime.currentRange.start.hour}:${String(currTime.currentRange.start.minute).padStart(2, '0')}-${currTime.currentRange.end.hour}:${String(currTime.currentRange.end.minute).padStart(2, '0')}`);
+                                }
+
+                                // Check story cards before applying modifications
+                                if (event.cardTitles && event.cardTitles.length > 0) {
+                                    if (debug) {
+                                        console.log(`${MODULE_NAME}: Time-range event "${event.name}" declares cards: ${event.cardTitles.join(', ')}`);
+                                    }
+
+                                    // Check existence
+                                    for (const cardTitle of event.cardTitles) {
+                                        if (Utilities && Utilities.storyCard) {
+                                            const card = Utilities.storyCard.get(cardTitle);
+                                            if (card) {
+                                                if (debug) {
+                                                    console.log(`${MODULE_NAME}: Story card "${cardTitle}" exists and will be activated`);
+                                                }
+                                            } else {
+                                                if (debug) {
+                                                    console.log(`${MODULE_NAME}: WARNING: Story card "${cardTitle}" not found`);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Apply card modifications when time range starts
+                                applyEventCardModifications(event);
                                 eventDispatcher.dispatch('timeRangeEventStarted', {
                                     event: event,
                                     timeRange: currTime.currentRange,
                                     timeData: actionResult.timeData
                                 });
                             }
-                            
-                            if (currTime.active && currTime.minutesRemaining <= 5 && 
+
+                            if (currTime.active && currTime.minutesRemaining <= 5 &&
                                 prevTime.active && prevTime.minutesRemaining > 5) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Time range ending soon for "${event.name}" (${currTime.minutesRemaining} minutes remaining)`);
+                                }
                                 eventDispatcher.dispatch('timeRangeEventEnding', {
                                     event: event,
                                     minutesRemaining: currTime.minutesRemaining,
                                     timeData: actionResult.timeData
                                 });
                             }
-                            
+
                             if (prevTime.active && !currTime.active) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Time range ended for "${event.name}"`);
+                                }
+                                // Revert card modifications when time range ends
+                                revertEventCardModifications(event);
                                 eventDispatcher.dispatch('timeRangeEventEnded', {
                                     event: event,
                                     timeData: actionResult.timeData
@@ -5707,16 +6070,138 @@ function Calendar(hook, text) {
             const currentTimeData = loadTimeState();
             if (currentTimeData && !eventDispatcher.hasDispatchedForDay(currentTimeData.day)) {
                 const eventsList = loadEventDays();
+                let todayEvents = [];
+
                 if (eventsList.length > 0) {
                     const dateInfo = calculateDateInfo(currentTimeData.day, config.startDate, config);
-                    const todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
-                    
+                    todayEvents = checkEventDay(dateInfo.month, dateInfo.day, dateInfo.year, eventsList, config);
+
                     if (todayEvents.length > 0) {
+                        if (debug) {
+                            console.log(`${MODULE_NAME}: Processing ${todayEvents.length} event(s) for day ${currentTimeData.day}`);
+                        }
+
+                        // Check story cards for ALL today's events (both all-day and time-range)
+                        const eventsWithStoryCards = [];
+
+                        for (const event of todayEvents) {
+                            // Check which story cards this event declares
+                            if (event.cardTitles && event.cardTitles.length > 0) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Event "${event.name}" declares cards: ${event.cardTitles.join(', ')}`);
+                                }
+
+                                // Check if these story cards actually exist
+                                for (const cardTitle of event.cardTitles) {
+                                    if (Utilities && Utilities.storyCard) {
+                                        const card = Utilities.storyCard.get(cardTitle);
+                                        if (card) {
+                                            if (debug) {
+                                                console.log(`${MODULE_NAME}: Story card "${cardTitle}" exists for event "${event.name}"`);
+                                            }
+                                            eventsWithStoryCards.push({
+                                                event: event,
+                                                cardTitle: cardTitle,
+                                                card: card
+                                            });
+                                        } else {
+                                            if (debug) {
+                                                console.log(`${MODULE_NAME}: WARNING: Story card "${cardTitle}" not found for event "${event.name}"`);
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Event "${event.name}" has no cards declared`);
+                                }
+                            }
+
+                            // Apply modifications for all-day events (events without time ranges)
+                            if (!event.timeRanges) {
+                                if (debug) {
+                                    console.log(`${MODULE_NAME}: Applying all-day event "${event.name}"`);
+                                }
+                                applyEventCardModifications(event);
+                            } else {
+                                // For time-range events, check if they're currently active
+                                const timeRange = checkEventTimeRange(event, currentTimeData.dayProgress, config.hoursPerDay);
+                                if (timeRange.active) {
+                                    if (debug) {
+                                        if (timeRange.currentRange) {
+                                            console.log(`${MODULE_NAME}: Event "${event.name}" is currently active (${timeRange.currentRange.start.hour}:${String(timeRange.currentRange.start.minute).padStart(2, '0')}-${timeRange.currentRange.end.hour}:${String(timeRange.currentRange.end.minute).padStart(2, '0')})`);
+                                        } else {
+                                            console.log(`${MODULE_NAME}: Event "${event.name}" is currently active`);
+                                        }
+                                    }
+                                    // Apply modifications for currently active time-range events
+                                    applyEventCardModifications(event);
+                                } else if (debug) {
+                                    console.log(`${MODULE_NAME}: Event "${event.name}" is not currently active`);
+                                }
+                            }
+                        }
+
                         eventDispatcher.dispatch('eventDay', {
                             events: todayEvents,
+                            eventsWithStoryCards: eventsWithStoryCards,
                             date: calculateDate(currentTimeData.day, config.startDate, config),
                             timeData: currentTimeData
                         });
+                    }
+                }
+
+                // Also check for events from previous day to revert
+                if (currentTimeData.day > 0) {
+                    const prevDateInfo = calculateDateInfo(currentTimeData.day - 1, config.startDate, config);
+                    const prevDayEvents = checkEventDay(prevDateInfo.month, prevDateInfo.day, prevDateInfo.year, eventsList, config);
+
+                    if (prevDayEvents.length > 0) {
+                        if (debug) {
+                            console.log(`${MODULE_NAME}: Checking ${prevDayEvents.length} event(s) from previous day to revert`);
+                        }
+
+                        // Check ALL previous day's events for active modifications
+                        const modifiedState = loadModifiedCardsState();
+
+                        for (const event of prevDayEvents) {
+                            const eventKey = `${event.name}_${event.type}`;
+
+                            // Check if this event has any active modifications
+                            if (modifiedState[eventKey] && modifiedState[eventKey].modifiedTitles &&
+                                modifiedState[eventKey].modifiedTitles.length > 0) {
+
+                                if (!event.timeRanges) {
+                                    // All-day event from yesterday
+                                    if (debug) {
+                                        console.log(`${MODULE_NAME}: Reverting all-day event "${event.name}" from previous day`);
+                                    }
+                                    revertEventCardModifications(event);
+                                } else {
+                                    // Time-range event from yesterday - check if it's still active today
+                                    const todayEvent = todayEvents.find(e => e.name === event.name);
+                                    if (!todayEvent) {
+                                        // Event doesn't occur today, safe to revert
+                                        if (debug) {
+                                            console.log(`${MODULE_NAME}: Reverting time-range event "${event.name}" from previous day (not active today)`);
+                                        }
+                                        revertEventCardModifications(event);
+                                    } else {
+                                        // Event occurs today too - check if it's currently active
+                                        const timeRange = checkEventTimeRange(todayEvent, currentTimeData.dayProgress, config.hoursPerDay);
+                                        if (!timeRange.active) {
+                                            // Not currently active, revert the modifications
+                                            if (debug) {
+                                                console.log(`${MODULE_NAME}: Reverting time-range event "${event.name}" from previous day (not currently active)`);
+                                            }
+                                            revertEventCardModifications(event);
+                                        } else if (debug) {
+                                            console.log(`${MODULE_NAME}: Keeping modifications for "${event.name}" (still active today)`);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -6208,10908 +6693,6722 @@ function GiveMeHeaders(text) {
     }
 }
 
-function GenerationWizard(hook, text) {
+function SANE(hook, text) {
+    // zzz an attempt to give something I lack
     'use strict';
-    
-    const debug = false;
-    const MODULE_NAME = 'GenerationWizard';
-    
-    // ==========================
-    // Constants
-    // ==========================
-    const PROGRESS_CARD = '[GW] In Progress';
-    const TEMPLATE_PREFIX = '[GW Template]';
-    const CONFIG_AND_PROMPTS_CARD = '[GENERATION_CONFIG]';
-    const HIDDEN_OUTPUT = '\n<<<The GM is thinking, please hit continue... (Use `/GW abort` if needed, this prompting is still being worked on)>>>\n';
-    const COMPLETION_MESSAGE = '\n<<<Generation Completed, returning to story>>>\n';
-    
-    // Helper to wrap debug output in markers to hide from LLM
-    function wrapDebugOutput(text) {
-        return `\n<<<[DEBUG OUTPUT]\n${text}\n>>>\n`;
-    }
-    // ==========================
-    // Runtime Configuration
-    // ==========================
-    
-    function loadConfig() {
-        // Use centralized config with custom parser
-        return Utilities.config.load(
-            CONFIG_AND_PROMPTS_CARD,
-            parseConfigSection,  // Custom parser for config section only
-            createDefaultConfigAndPrompts,  // Auto-create if missing
-            true  // Cache the result
-        );
-    }
-    
-    function parseConfigSection(fullText) {
-        const config = {
-            debug: false
-        };
-        
-        // Parse config section from entry
-        const lines = fullText.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            
-            // Stop at first section header
-            if (trimmed.startsWith('##')) break;
-            
-            if (trimmed.startsWith('debug:')) {
-                config.debug = trimmed.substring(6).trim().toLowerCase() === 'true';
-            }
-        }
-        
-        return config;
-    }
-    
-    function createDefaultConfigAndPrompts() {
-        Utilities.storyCard.add({
-            title: CONFIG_AND_PROMPTS_CARD,
-            type: 'data',
-            entry: (
-                `# Generation Configuration & Prompts\n` +
-                `debug: false\n` +
-                `\n` +
-                `// Set debug to true to see AI responses during generation\n` +
-                `// Set debug to false to hide intermediate responses\n` +
-                `\n` +
-                `## About This Card\n` +
-                `Edit the description below to customize generation prompts.\n` +
-                `Each ## Section in the description is a different prompt template.\n` +
-                `Use {{VARIABLE}} syntax for replacements.`
-            ),
-            description: (
-                `## Entity Selection\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Generation Override\n\n` +
-                `**What type of entity would you like to create?**\n\n` +
-                `Valid options: NPC, Monster, Boss, Item, Location, Quest\n` +
-                `Respond with exactly one of the above options.\n` +
-                `Do not add any narrative. Only provide the entity type.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Field Collection\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Generation Override\n\n` +
-                `Creating new {{ENTITY_TYPE}}.\n\n` +
-                `==== REQUIRED INFORMATION ====\n` +
-                `{{FIELD_LIST}}\n\n` +
-                `Provide responses in the exact format shown. Do not add narrative.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Quest Combined\n` +
-                `<s>\nCARDINAL SYSTEM - Quest Generation Override\n\n` +
-                `Creating new Quest.\n\n` +
-                `{{CONTEXT_SECTION}}\n` +
-                `==== REQUIRED INFORMATION ====\n` +
-                `{{QUERY_SECTION}}\n` +
-                `Provide responses in the exact format shown. Do not add narrative.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Quest Stages\n` +
-                `<s>\nCARDINAL SYSTEM - Quest Generation Override\n\n` +
-                `**What are the objectives for this quest?**\n\n` +
-                `{{STAGE_LIST}}\n\n` +
-                `Provide clear quest objectives.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Quest Rewards\n` +
-                `<s>\nCARDINAL SYSTEM - Quest Generation Override\n\n` +
-                `**What are the rewards for completing this {{QUEST_TYPE}} quest?**\n\n` +
-                `Experience: [XP amount]\n` +
-                `Col: [currency amount]\n` +
-                `Items: [item rewards or "None"]\n\n` +
-                `Provide appropriate rewards for a {{QUEST_TYPE}} quest.\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Entity Classification\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Classification Override\n\n` +
-                `{{CLASSIFICATION_QUERY}}\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## Entity Details\n` +
-                `<s>\nCARDINAL SYSTEM - Entity Details Override\n\n` +
-                `{{DETAILS_QUERY}}\n</s>\n\n` +
-                `CARDINAL RESPONSE:\n\n` +
-                
-                `## NPC Batch\n` +
-                `<s>\nCARDINAL SYSTEM - NPC Generation Override\n\n` +
-                `The entity "{{NAME}}" was referenced and needs to be created as an NPC.\n\n` +
-                `{{CONTEXT}}` +
-                `==== REQUIRED INFORMATION ====\n` +
-                `Provide the following details:\n\n` +
-                `{{FIELD_LIST}}\n\n` +
-                `Format: KEY: value\n` +
-                `One field per line. Be creative and consistent with the game world.\n` +
-                `Respond ONLY with the requested fields. No narrative or additional text.\n</s>\n\n` +
-                `CARDINAL RESPONSE:`
-            )
-        });
-        
-        if (debug) console.log(`${MODULE_NAME}: Created default configuration and prompts card`);
-    }
-    
-    const config = loadConfig();
-    
-    // ==========================
-    // Template Field Types
-    // ==========================
-    const FieldTypes = {
-        TEXT: 'text',
-        CHOICE: 'choice',
-        RANGE: 'range',
-        NUMBER: 'number',
-        BOOLEAN: 'boolean',
-        LIST: 'list',
-        FORMULA: 'formula',
-        GAMESTATE: 'gamestate'
-    };
-    
-    // ==========================
-    // Generation Control
-    // ==========================
-    
-    function isGenerationActive() {
-        const progressCard = Utilities.storyCard.get(PROGRESS_CARD);
-        return progressCard !== null;
-    }
-    
-    function shouldTakeControl() {
-        if (!isGenerationActive()) return false;
-        
-        const progress = loadProgress();
-        return progress && !progress.completed;
-    }
-    
-    // ==========================
-    // Prompt Template Management
-    // ==========================
-    
-    function loadPromptTemplate(section) {
-        const card = Utilities.storyCard.get(CONFIG_AND_PROMPTS_CARD);
-        if (!card) {
-            createDefaultConfigAndPrompts();
-            return Utilities.storyCard.get(CONFIG_AND_PROMPTS_CARD)?.description || '';
-        }
-        
-        // Extract the specific section from description
-        const description = card.description || '';
-        const sectionRegex = new RegExp(`## ${section}\\s*\\n([^#]+)`, 's');
-        const match = description.match(sectionRegex);
-        
-        return match ? match[1].trim() : '';
-    }
-    
-    function generatePrompt(section, replacements = {}) {
-        let prompt = loadPromptTemplate(section);
-        
-        // Replace all {{VARIABLE}} placeholders
-        for (const [key, value] of Object.entries(replacements)) {
-            const regex = new RegExp(`\\{\\{${key}\\}\\}`, 'g');
-            prompt = prompt.replace(regex, value);
-        }
-        
-        return prompt;
-    }
-    
-    // ==========================
-    // Location Data Transformation
-    // ==========================
-    function createLocationFromData(collectedData, metadata) {
-        const name = collectedData.NAME || 'Unknown_Location';
-        const formattedName = name.replace(/\s+/g, '_');
-        
-        // Create location data with component structure
-        const locationData = {
-            name: formattedName,
-            
-            // Info component
-            info: {
-                type: collectedData.LOCATION_TYPE || 'Unknown',
-                terrain: collectedData.TERRAIN || null,
-                description: collectedData.DESCRIPTION || 'An unexplored location.',
-                features: collectedData.FEATURES || null,
-                floor: collectedData.FLOOR || 1,
-                district: collectedData.DISTRICT || null
-            },
-            
-            // Pathways for connections
-            pathways: {}
-        };
-        
-        // Add return path if we know where we came from
-        if (metadata && metadata.from && metadata.direction) {
-            const oppositeDir = getOppositeDirection(metadata.direction).toLowerCase();
-            locationData.pathways[oppositeDir] = metadata.from;
-        }
-        
-        // Add unexplored paths for other directions
-        const allDirections = ['north', 'south', 'east', 'west'];
-        for (const dir of allDirections) {
-            if (!locationData.pathways[dir]) {
-                locationData.pathways[dir] = '(unexplored)';
-            }
-        }
-        
-        // Dynamically determine location header based on player's floor
-        let locationHeaders = '<$# Locations>';
-        if (typeof GameState !== 'undefined' && GameState.getPlayerName && GameState.loadCharacter) {
-            const playerName = GameState.getPlayerName();
-            if (playerName) {
-                const player = GameState.loadCharacter(playerName);
-                if (player && player.location) {
-                    // Try to extract floor from player's location (e.g., "Floor_2_Town" or check runtime)
-                    const currentFloor = GameState.getRuntimeValue ? 
-                        (GameState.getRuntimeValue('current_floor') || 1) : 1;
-                    
-                    // Convert floor number to words for header
-                    const floorWords = ['Zero', 'One', 'Two', 'Three', 'Four', 'Five', 'Six', 'Seven', 'Eight', 'Nine', 'Ten'];
-                    let floorName;
-                    if (currentFloor >= 0 && currentFloor < floorWords.length) {
-                        floorName = 'Floor ' + floorWords[currentFloor];
-                    } else {
-                        floorName = 'Floor ' + currentFloor;
-                    }
-                    locationHeaders = '<$# Locations>\n<$## ' + floorName + '>';
-                }
-            }
-            
-            // Allow override via runtime variable if set
-            const customHeader = GameState.getRuntimeValue ? GameState.getRuntimeValue('location_header') : null;
-            if (customHeader) {
-                locationHeaders = customHeader; // User override takes precedence
-            }
-        }
-        
-        // Use GameState to save the location if available
-        if (typeof GameState !== 'undefined' && GameState.save) {
-            if (GameState.save('Location', locationData)) {
-                if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName} using GameState`);
-                
-                // Update the connecting location's pathways if needed
-                if (metadata && metadata.from && metadata.direction) {
-                    updateLocationPathway(metadata.from, metadata.direction, formattedName);
-                }
-                
-                // Signal completion if GameState has a handler
-                if (GameState.completeLocationGeneration) {
-                    GameState.completeLocationGeneration(formattedName);
-                }
-                return;
-            }
-        }
-        
-        // Fallback to manual creation if GameState not available
-        // Build display value
-        let displayValue = `<$# Locations>\n## **${name}**\n`;
-        displayValue += `Floor: ${locationData.info.floor || 'Floor One'} | Type: ${locationData.info.type || 'Unknown'}\n`;
-        if (locationData.info.safe_zone) {
-            displayValue += `**Safe Zone** - No damage can occur\n`;
-        }
-        displayValue += `**Description**\n${locationData.info.description}`;
-        
-        // Add connections if any
-        if (locationData.pathways && Object.keys(locationData.pathways).length > 0) {
-            displayValue += '\n**Connections**';
-            for (const [dir, dest] of Object.entries(locationData.pathways)) {
-                if (dest && dest !== '(unexplored)') {
-                    displayValue += `\n• ${dir.charAt(0).toUpperCase() + dir.slice(1)}: ${dest.replace(/_/g, ' ')}`;
-                }
-            }
-        }
-        
-        // Build proper JSON data structure
-        const jsonData = {
-            name: formattedName,
-            type: 'Location',
-            info: locationData.info,
-            pathways: locationData.pathways || {},
-            features: []
-        };
-        
-        const card = {
-            title: `[LOCATION] ${formattedName}`,
-            type: 'location',
-            value: displayValue,
-            description: `<== REAL DATA ==>\n${JSON.stringify(jsonData, null, 2)}\n<== END DATA ==>`
-        };
-        
-        Utilities.storyCard.add(card);
-        
-        if (debug) console.log(`${MODULE_NAME}: Created location ${formattedName} (fallback method)`);
-        
-        // Signal completion if GameState has a handler
-        if (typeof GameState !== 'undefined' && GameState.completeLocationGeneration) {
-            GameState.completeLocationGeneration(formattedName, metadata);
-        }
-    }
-    
-    function getOppositeDirection(direction) {
-        const opposites = {
-            'north': 'South',
-            'south': 'North',
-            'east': 'West',
-            'west': 'East'
-        };
-        return opposites[direction.toLowerCase()] || direction;
-    }
-    
-    function updateLocationPathway(locationName, direction, destinationName) {
-        // Try to update using GameState first
-        if (typeof GameState !== 'undefined' && GameState.load && GameState.save) {
-            const location = GameState.load('Location', locationName);
-            if (location) {
-                // Update pathways (not connections - matching the JSON structure)
-                if (!location.pathways) location.pathways = {};
-                location.pathways[direction.toLowerCase()] = destinationName;
-                
-                // Save the updated location
-                if (GameState.save('Location', location)) {
-                    if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName}`);
-                    return;
-                }
-            }
-        }
-        
-        // Fallback to manual update
-        const card = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
-        if (!card) return;
-        
-        // Update the REAL DATA in description field
-        if (card.description && card.description.includes('<== REAL DATA ==>')) {
-            try {
-                const data = parseEntityData(card.description);
-                if (data) {
-                    if (!data.pathways) data.pathways = {};
-                    data.pathways[direction.toLowerCase()] = destinationName;
-                    
-                    // Rebuild the description with updated data
-                    const newDescription = buildEntityData('Location', data);
-                    Utilities.storyCard.update(card.title, { description: newDescription });
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} to ${destinationName} (fallback)`);
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to update pathway: ${e}`);
-            }
-        }
-    }
-    
-    // Helper function to parse entity data from description
-    function parseEntityData(description) {
-        if (!description) return null;
-        
-        const startMarker = '<== REAL DATA ==>';
-        const endMarker = '<== END DATA ==>';
-        
-        const startIdx = description.indexOf(startMarker);
-        const endIdx = description.indexOf(endMarker);
-        
-        if (startIdx === -1 || endIdx === -1) return null;
-        
-        const dataSection = description.substring(startIdx + startMarker.length, endIdx).trim();
-        
-        // Try to parse as JSON first (new format)
-        try {
-            return JSON.parse(dataSection);
-        } catch (e) {
-            // Fallback to old format parsing if JSON fails
-            const data = {};
-            let currentSection = null;
-            
-            const lines = dataSection.split('\n');
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed) continue;
-                
-                if (trimmed.startsWith('## ')) {
-                    currentSection = trimmed.substring(3).toLowerCase();
-                    if (currentSection === 'identifier') {
-                        currentSection = null; // Parse identifier fields at root level
-                    }
-                } else if (trimmed.includes(':')) {
-                    const colonIdx = trimmed.indexOf(':');
-                    const key = trimmed.substring(0, colonIdx).trim();
-                    const value = trimmed.substring(colonIdx + 1).trim();
-                    
-                    if (currentSection) {
-                        if (!data[currentSection]) data[currentSection] = {};
-                        // Try to parse JSON for objects
-                        if (value.startsWith('{') || value.startsWith('[')) {
-                            try {
-                                data[currentSection] = JSON.parse(value);
-                            } catch {
-                                data[currentSection][key] = value.replace(/^"|"$/g, '');
-                            }
-                        } else {
-                            data[currentSection][key] = value.replace(/^"|"$/g, '');
-                        }
-                    } else {
-                        data[key] = value.replace(/^"|"$/g, '');
-                    }
-                }
-            }
-            
-            return data;
-        }
-    }
-    
-    // Helper function to build entity data for description
-    function buildEntityData(type, data) {
-        // Use JSON format for all new data
-        const jsonData = {
-            name: data.name,
-            type: type,
-            ...data
-        };
-        return `<== REAL DATA ==>\n${JSON.stringify(jsonData, null, 2)}\n<== END DATA ==>`;
-    }
-    
-    // ==========================
-    // Character Data Transformation
-    // ==========================
-    function transformToCharacterData(collectedData, triggerName) {
-        // Create character data with proper component structure
-        const characterData = {
-            name: collectedData.NAME,
-            
-            // Stats component with nested level/xp structure
-            stats: {
-                level: {
-                    value: parseInt(collectedData.LEVEL) || 1,
-                    xp: {
-                        current: 0,
-                        max: parseInt(collectedData.XP_MAX) || 1000
-                    }
-                },
-                hp: {
-                    current: parseInt(collectedData.HP) || parseInt(collectedData.MAX_HP) || 100,
-                    max: parseInt(collectedData.MAX_HP) || parseInt(collectedData.HP) || 100
-                }
-            },
-            
-            // Info component
-            info: {
-                full_name: collectedData.FULL_NAME || null,
-                gender: collectedData.GENDER || '???',
-                race: collectedData.RACE || null,
-                class: collectedData.CLASS || null,
-                location: collectedData.DEFAULT_LOCATION || collectedData.LOCATION || getPlayerLocation() || 'unknown',
-                faction: collectedData.FACTION || null
-            },
-            
-            // Other components (empty by default)
-            attributes: {},
-            skills: {},
-            inventory: {},
-            relationships: {}
-        };
-        
-        // Store trigger name and generation turn in info component if provided
-        if (triggerName) {
-            characterData.info.trigger_name = triggerName;
-            characterData.info.generation_turn = info?.actionCount || 0;
-        }
-        
-        // Combine appearance fields into single field in info component
-        if (collectedData.HAIR || collectedData.EYES || collectedData.BUILD) {
-            const appearanceParts = [];
-            if (collectedData.HAIR) appearanceParts.push(`Hair: ${collectedData.HAIR}`);
-            if (collectedData.EYES) appearanceParts.push(`Eyes: ${collectedData.EYES}`);
-            if (collectedData.BUILD) appearanceParts.push(`Build: ${collectedData.BUILD}`);
-            characterData.info.appearance = appearanceParts.join(' | ');
-        } else if (collectedData.APPEARANCE) {
-            // Fallback to old APPEARANCE field if present
-            characterData.info.appearance = collectedData.APPEARANCE;
-        }
-        
-        // Map personality and background to info component
-        if (collectedData.PERSONALITY) {
-            characterData.info.personality = collectedData.PERSONALITY;
-        }
-        if (collectedData.BACKGROUND || collectedData.BACKSTORY) {
-            characterData.info.background = collectedData.BACKGROUND || collectedData.BACKSTORY;
-        }
-        
-        // HP is now handled via stats.hp.current and stats.hp.max above
-        // No separate hp object needed
-        
-        // Map attributes
-        const attributeNames = ['VITALITY', 'STRENGTH', 'DEXTERITY', 'AGILITY', 'INTELLIGENCE', 'WISDOM', 'CHARISMA', 'LUCK'];
-        for (const attr of attributeNames) {
-            if (collectedData[attr]) {
-                // Use uppercase keys for attributes with proper value structure
-                characterData.attributes[attr] = { value: parseInt(collectedData[attr]) || 10 };
-            }
-        }
-        
-        // If no attributes were provided, set defaults
-        if (Object.keys(characterData.attributes).length === 0) {
-            characterData.attributes = {
-                VITALITY: { value: 10 },
-                STRENGTH: { value: 10 },
-                DEXTERITY: { value: 10 },
-                AGILITY: { value: 10 }
-            };
-        }
-        
-        // Parse skills if provided (format: "skill_name: Level X")
-        if (collectedData.SKILLS) {
-            const skillLines = collectedData.SKILLS.split('\n');
-            for (const line of skillLines) {
-                const match = line.match(/(.+?):\s*Level\s+(\d+)/i);
-                if (match) {
-                    const skillName = match[1].trim().toLowerCase().replace(/\s+/g, '_');
-                    // Skills need level and xp structure
-                    characterData.skills[skillName] = {
-                        level: parseInt(match[2]) || 1,
-                        xp: { current: 0, max: 100 }
-                    };
-                }
-            }
-        }
-        
-        // Parse inventory if provided
-        if (collectedData.INVENTORY) {
-            // Handle both {item:qty} format and plain list
-            const invText = collectedData.INVENTORY.replace(/[{}]/g, '').trim();
-            if (invText) {
-                const items = invText.split(',').map(i => i.trim());
-                for (const item of items) {
-                    const parts = item.split(':');
-                    if (parts.length === 2) {
-                        const itemName = parts[0].trim().toLowerCase().replace(/\s+/g, '_');
-                        const qty = parseInt(parts[1]) || 1;
-                        // Use proper {quantity: n} format
-                        characterData.inventory[itemName] = { quantity: qty };
-                    }
-                }
-            }
-        }
-        
-        // Add narrative sections
-        if (collectedData.APPEARANCE) {
-            characterData.appearance = collectedData.APPEARANCE;
-        }
-        if (collectedData.PERSONALITY) {
-            characterData.personality = collectedData.PERSONALITY;
-        }
-        if (collectedData.BACKGROUND) {
-            characterData.background = collectedData.BACKGROUND;
-        }
-        
-        // Add any shop inventory as a custom section
-        if (collectedData.SHOP_INVENTORY) {
-            characterData.shop_inventory = collectedData.SHOP_INVENTORY;
-        }
-        
-        // Add quest giver info as a custom section
-        if (collectedData.QUEST_GIVER) {
-            characterData.available_quests = collectedData.QUEST_GIVER;
-        }
-        
-        return characterData;
-    }
-    
-    // ==========================
-    // Template Management
-    // ==========================
-    
-    function loadTemplate(entityType) {
-        const cardTitle = `${TEMPLATE_PREFIX} ${entityType}`;
-        const templateCard = Utilities.storyCard.get(cardTitle);
-        
-        if (!templateCard) {
-            if (debug) console.log(`${MODULE_NAME}: Template not found: ${cardTitle}`);
-            createDefaultTemplates();
-            return Utilities.storyCard.get(cardTitle);
-        }
-        
-        return templateCard;
-    }
-    
-    function parseTemplateFields(description) {
-        const fields = [];
-        const lines = description.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            
-            // Skip comments and empty lines
-            if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
-            
-            // Parse: FIELD_NAME: requirement, type[params], prompt
-            const match = trimmed.match(/^([A-Z_]+):\s*([^,]+),\s*([^,]+)(?:,\s*(.+))?$/);
-            if (!match) continue;
-            
-            const field = {
-                name: match[1],
-                requirement: match[2].trim(),
-                type: null,
-                params: null,
-                prompt: match[4] ? match[4].trim() : null
-            };
-            
-            // Parse type and params
-            const typeMatch = match[3].trim().match(/^([a-z]+)(?:\[([^\]]+)\])?$/);
-            if (typeMatch) {
-                field.type = typeMatch[1];
-                field.params = typeMatch[2] || null;
-            }
-            
-            // Skip formula and gamestate fields from queries
-            if (field.type === FieldTypes.FORMULA || field.type === FieldTypes.GAMESTATE) {
-                continue;
-            }
-            
-            fields.push(field);
-        }
-        
-        return fields;
-    }
-    
-    // ==========================
-    // Generation State Management
-    // ==========================
-    
-    function loadProgress() {
-        const progressCard = Utilities.storyCard.get(PROGRESS_CARD);
-        if (!progressCard) return null;
-        
-        try {
-            const progress = JSON.parse(progressCard.description || '{}');
-            
-            // Load template fields if not cached
-            if (!progress.templateFields && progress.entityType) {
-                const template = loadTemplate(progress.entityType);
-                if (template) {
-                    progress.templateFields = parseTemplateFields(template.description);
-                }
-            }
-            
-            return progress;
-        } catch (e) {
-            if (debug) console.log(`${MODULE_NAME}: Error loading progress: ${e}`);
-            return null;
-        }
-    }
-    
-    function saveProgress(progress) {
-        // Build a preview in the entry
-        let entry = `# Generating ${progress.entityType}\n\n`;
-        
-        const activeFields = progress.templateFields || [];
-        
-        // For quests, we need to count differently since some fields are predefined
-        let completedCount;
-        let totalFields;
-        
-        if (progress.entityType === 'Quest') {
-            // Count only the non-predefined fields that we actually ask for
-            const fieldsToCount = ['DESCRIPTION', 'STAGES', 'REWARDS'];
-            completedCount = fieldsToCount.filter(field => progress.collectedData[field]).length;
-            totalFields = fieldsToCount.length;
-        } else {
-            // For other entities, count all fields except internal ones
-            completedCount = Object.keys(progress.collectedData).filter(key => 
-                key !== 'name' && key !== 'REWARDS_PARSED'
-            ).length;
-            totalFields = activeFields.length;
-        }
-        
-        entry += `**Progress:** ${completedCount} of ${totalFields} fields collected\n\n`;
-        
-        // Show collected data
-        if (completedCount > 0) {
-            entry += `## Collected Data\n`;
-            for (const [key, value] of Object.entries(progress.collectedData)) {
-                if (key === 'STAGES' || key === 'REWARDS') {
-                    entry += `**${key}:**\n${value}\n\n`;
-                } else if (key !== 'REWARDS_PARSED') {
-                    entry += `**${key}:** ${value}\n`;
-                }
-            }
-        }
-        
-        // Show what we're waiting for
-        if (progress.currentBatch && progress.currentBatch.length > 0) {
-            entry += `\n## Waiting For\n`;
-            entry += progress.currentBatch.join(', ');
-        }
-        
-        Utilities.storyCard.upsert({
-            title: PROGRESS_CARD,
-            entry: entry,
-            description: JSON.stringify(progress)
-        });
-    }
-    
-    function clearProgress() {
-        Utilities.storyCard.remove(PROGRESS_CARD);
-        if (debug) console.log(`${MODULE_NAME}: Progress cleared`);
-    }
-    
-    // ==========================
-    // Quest Batch Collection
-    // ==========================
-    
-    function generateQuestBatchPrompt(fields, stageCount, existingStages, questType, collectedData, validationErrors) {
-        // Build the CONTEXT section - what we already know
-        let contextSection = '==== CONTEXT (Already Provided) ====\n';
-        contextSection += '**Quest Information:**\n';
-        contextSection += `Name: ${collectedData.NAME || 'Not specified'}\n`;
-        contextSection += `Giver: ${collectedData.QUEST_GIVER || 'Not specified'}\n`;
-        contextSection += `Type: ${questType || 'Not specified'}\n`;
-        contextSection += `Stages: ${stageCount || 'Not specified'}\n`;
-        
-        // Add collected fields to context
-        if (collectedData.DESCRIPTION) {
-            contextSection += `\nDescription: ${collectedData.DESCRIPTION}\n`;
-        }
-        
-        // Show completed stages in context if any
-        const completedStages = Object.keys(existingStages);
-        if (completedStages.length > 0) {
-            contextSection += '\n**Completed Stages:**\n';
-            for (let i = 1; i <= stageCount; i++) {
-                if (existingStages[i]) {
-                    contextSection += `Stage ${i}: ${existingStages[i]}\n`;
-                }
-            }
-        }
-        
-        // Show rewards in context if collected
-        if (collectedData.REWARDS_PARSED) {
-            const rewards = collectedData.REWARDS_PARSED;
-            contextSection += '\n**Rewards:**\n';
-            contextSection += `Experience: ${rewards.xp} XP\n`;
-            contextSection += `Col: ${rewards.col}\n`;
-            if (rewards.items) {
-                contextSection += `Items: ${rewards.items}\n`;
-            }
-        }
-        
-        // Build the QUERY section - what we still need (ALWAYS at bottom)
-        let querySection = '**Please provide the following information:**\n\n';
-        let queryItems = [];
-        
-        // Collect all uncompleted items
-        for (const field of fields) {
-            if (!collectedData.hasOwnProperty(field.name)) {
-                const fieldPrompt = field.prompt || field.name.replace(/_/g, ' ').toLowerCase();
-                
-                // Check if there's a validation error for this field
-                const validationError = validationErrors && validationErrors[field.name];
-                
-                let typeHint = '';
-                switch(field.type) {
-                    case FieldTypes.CHOICE:
-                        typeHint = field.params ? ` (${field.params.replace(/\|/g, '/')})` : '';
-                        break;
-                    case FieldTypes.RANGE:
-                        if (field.params) {
-                            const [min, max] = field.params.split('-');
-                            typeHint = ` (${min}-${max})`;
-                        }
-                        break;
-                    case FieldTypes.NUMBER:
-                        typeHint = ' (number)';
-                        break;
-                    case FieldTypes.BOOLEAN:
-                        typeHint = ' (yes/no)';
-                        break;
-                    case FieldTypes.LIST:
-                        typeHint = ' (comma-separated)';
-                        break;
-                }
-                
-                let fieldText = `${field.name}: [${fieldPrompt}${typeHint}]`;
-                if (validationError) {
-                    fieldText += `\n  ⚠️ ${validationError}`;
-                }
-                
-                queryItems.push({
-                    type: 'field',
-                    text: fieldText
-                });
-            }
-        }
-        
-        // Check if we need stages
-        const allStagesCollected = Object.keys(existingStages).length === stageCount;
-        if (!allStagesCollected) {
-            for (let i = 1; i <= stageCount; i++) {
-                if (!existingStages[i]) {
-                    queryItems.push({
-                        type: 'stage',
-                        text: `Stage ${i}: [objective]`
-                    });
-                }
-            }
-        }
-        
-        // Check if we need rewards
-        if (!collectedData.REWARDS_PARSED) {
-            queryItems.push({
-                type: 'rewards',
-                text: 'Experience: [XP amount]\nCol: [currency amount]\nItems: [item rewards or "None"]'
-            });
-        }
-        
-        // Build query section with proper grouping
-        let lastType = null;
-        for (const item of queryItems) {
-            // Add spacing between different types
-            if (lastType && lastType !== item.type) {
-                querySection += '\n';
-            }
-            querySection += item.text + '\n';
-            lastType = item.type;
-        }
-        
-        // Use the template from config card
-        return generatePrompt('Quest Combined', {
-            CONTEXT_SECTION: contextSection,
-            QUERY_SECTION: querySection
-        });
-    }
-    
-    // ==========================
-    // Batched Field Collection
-    // ==========================
-    
-    function parseBatchedResponse(response, fields) {
-        const collected = {};
-        const lines = response.split('\n');
-        
-        if (debug) {
-            log(`${MODULE_NAME}: parseBatchedResponse called with ${lines.length} lines`);
-            log(`${MODULE_NAME}: Raw response: "${response}"`);
-            log(`${MODULE_NAME}: Fields to parse: ${fields.map(f => f.name).join(', ')}`);
-        }
-        
-        for (let lineIndex = 0; lineIndex < lines.length; lineIndex++) {
-            const line = lines[lineIndex];
-            
-            if (debug && line.trim()) {
-                log(`${MODULE_NAME}: Line ${lineIndex}: "${line}"`);
-                log(`${MODULE_NAME}: Line length: ${line.length}, trimmed length: ${line.trim().length}`);
-            }
-            
-            // Trim the line before matching to handle leading/trailing spaces
-            const trimmedLine = line.trim();
-            
-            for (const field of fields) {
-                // Look for "FIELD_NAME: value" pattern
-                const regex = new RegExp(`^${field.name}:\\s*(.+)`, 'i');
-                
-                if (debug) {
-                    log(`${MODULE_NAME}: Testing regex /${regex.source}/${regex.flags} against trimmed line`);
-                }
-                
-                const match = trimmedLine.match(regex);
-                
-                if (match) {
-                    collected[field.name] = match[1].trim();
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: MATCHED ${field.name} = "${match[1].trim()}"`);
-                    }
-                    break;
-                } else if (debug && field.name === 'DESCRIPTION') {
-                    // Extra debugging for DESCRIPTION specifically
-                    console.log(`${MODULE_NAME}: DESCRIPTION regex failed. Trimmed line starts with: "${trimmedLine.substring(0, 20)}"`);
-                    console.log(`${MODULE_NAME}: Original line had leading space: ${line[0] === ' '}`);
-                }
-            }
-        }
-        
-        if (debug) {
-            console.log(`${MODULE_NAME}: Collected fields: ${JSON.stringify(collected)}`);
-        }
-        
-        return collected;
-    }
-    
-    // ==========================
-    // Field Validation
-    // ==========================
-    
-    function validateField(field, value) {
-        if (!value || value.trim() === '') {
-            return { valid: false, error: 'Empty response' };
-        }
-        
-        const trimmedValue = value.trim();
-        
-        // Special handling for specific fields
-        if (field.name === 'NAME') {
-            // CRITICAL: Enforce snake_case for all names to prevent system breakage
-            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            
-            if (snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
-                if (debug) console.log(`${MODULE_NAME}: Converting NAME to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
-            }
-            
-            // Check for duplicate usernames using GameState
-            if (typeof GameState !== 'undefined' && GameState.load) {
-                const existingCharacter = GameState.load('Character', snakeCased);
-                if (existingCharacter) {
-                    if (debug) console.log(`${MODULE_NAME}: Name "${snakeCased}" already exists, silently rejecting`);
-                    // Return invalid without error message - AI will just retry
-                    return { 
-                        valid: false
-                    };
-                }
-            } else {
-                // Fallback: check story cards directly
-                const existingCard = Utilities.storyCard.get(`[CHARACTER] ${snakeCased}`) || 
-                                     Utilities.storyCard.get(`[PLAYER] ${snakeCased}`);
-                if (existingCard) {
-                    if (debug) console.log(`${MODULE_NAME}: Name "${snakeCased}" already exists, silently rejecting`);
-                    // Return invalid without error message - AI will just retry
-                    return { 
-                        valid: false
-                    };
-                }
-            }
-            
-            // Return the snake_cased version
-            return { valid: true, value: snakeCased };
-        }
-        
-        // Enforce snake_case for quest givers too
-        if (field.name === 'QUEST_GIVER') {
-            const snakeCased = trimmedValue.toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            if (debug && snakeCased !== trimmedValue.toLowerCase().replace(/[^a-z0-9_]/g, '')) {
-                console.log(`${MODULE_NAME}: Converting QUEST_GIVER to snake_case: "${trimmedValue}" -> "${snakeCased}"`);
-            }
-            return { valid: true, value: snakeCased };
-        }
-        
-        // Validate DESCRIPTION has meaningful content (more than 2 words)
-        if (field.name === 'DESCRIPTION') {
-            const wordCount = trimmedValue.split(/\s+/).filter(word => word.length > 0).length;
-            if (wordCount < 3) {
-                return { valid: false, error: 'Description must be at least 3 words (got "' + trimmedValue + '")' };
-            }
-            return { valid: true, value: trimmedValue };
-        }
-        
-        // Validate STAGES is not just a number or too short
-        if (field.name === 'STAGES') {
-            // Check if it's just a number
-            if (/^\d+$/.test(trimmedValue)) {
-                return { valid: false, error: 'STAGES cannot be just a number (got "' + trimmedValue + '")' };
-            }
-            // Check if it has actual stage content (should have numbered items)
-            const hasStageContent = /\d+[\.\:\-\)]\s*.+/i.test(trimmedValue);
-            if (!hasStageContent) {
-                return { valid: false, error: 'STAGES must contain numbered objectives (got "' + trimmedValue + '")' };
-            }
-            return { valid: true, value: trimmedValue };
-        }
-        
-        if (field.name === 'GENDER') {
-            const normalized = trimmedValue.toLowerCase();
-            // Accept various gender formats
-            if (normalized === 'm' || normalized === 'male' || normalized === 'man' || normalized === 'boy') {
-                return { valid: true, value: 'Male' };
-            }
-            if (normalized === 'f' || normalized === 'female' || normalized === 'woman' || normalized === 'girl') {
-                return { valid: true, value: 'Female' };
-            }
-            if (normalized === 'other' || normalized === 'non-binary' || normalized === 'nb') {
-                return { valid: true, value: 'Other' };
-            }
-            return { valid: false, error: 'Must be Male, Female, or Other' };
-        }
-        
-        if (field.name === 'DOB') {
-            // Accept various date formats and normalize to YYYY-MM-DD
-            // Try to parse common formats
-            const datePatterns = [
-                /^(\d{4})-(\d{1,2})-(\d{1,2})$/,  // YYYY-MM-DD
-                /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/,  // MM/DD/YYYY
-                /^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/,  // Month DD, YYYY
-                /^(\d{1,2})\s+(\w+)\s+(\d{4})$/,  // DD Month YYYY
-            ];
-            
-            for (const pattern of datePatterns) {
-                if (pattern.test(trimmedValue)) {
-                    // For now, just accept the value as-is if it matches a pattern
-                    // Could add more sophisticated date parsing if needed
-                    return { valid: true, value: trimmedValue };
-                }
-            }
-            
-            // If no pattern matches, still accept it if it contains numbers
-            if (/\d/.test(trimmedValue)) {
-                return { valid: true, value: trimmedValue };
-            }
-            return { valid: false, error: 'Invalid date format' };
-        }
-        
-        switch(field.type) {
-            case FieldTypes.CHOICE:
-                if (field.params) {
-                    const options = field.params.split('|').map(o => o.trim().toLowerCase());
-                    const normalized = trimmedValue.toLowerCase();
-                    
-                    if (options.includes(normalized)) {
-                        // Return the properly cased version
-                        const index = options.indexOf(normalized);
-                        const properCase = field.params.split('|')[index].trim();
-                        return { valid: true, value: properCase };
-                    }
-                    return { valid: false, error: 'Not a valid option' };
-                }
-                break;
-                
-            case FieldTypes.RANGE:
-                if (field.params) {
-                    const [min, max] = field.params.split('-').map(n => parseInt(n.trim()));
-                    const num = parseInt(trimmedValue);
-                    
-                    if (isNaN(num)) {
-                        return { valid: false, error: 'Not a number' };
-                    }
-                    if (num < min || num > max) {
-                        return { valid: false, error: `Out of range ${min}-${max}` };
-                    }
-                    return { valid: true, value: num };
-                }
-                break;
-                
-            case FieldTypes.NUMBER:
-                const num = parseFloat(trimmedValue);
-                if (isNaN(num)) {
-                    return { valid: false, error: 'Not a number' };
-                }
-                return { valid: true, value: num };
-                
-            case FieldTypes.BOOLEAN:
-                const lower = trimmedValue.toLowerCase();
-                if (lower === 'true' || lower === 'yes') {
-                    return { valid: true, value: true };
-                }
-                if (lower === 'false' || lower === 'no') {
-                    return { valid: true, value: false };
-                }
-                return { valid: false, error: 'Must be yes or no' };
-                
-            case FieldTypes.LIST:
-                const items = trimmedValue.split(',')
-                    .map(item => item.trim())
-                    .filter(item => item.length > 0);
-                
-                if (items.length === 0) {
-                    return { valid: false, error: 'Empty list' };
-                }
-                return { valid: true, value: items.join(', ') };
-                
-            case FieldTypes.TEXT:
-            default:
-                return { valid: true, value: trimmedValue };
-        }
-        
-        return { valid: true, value: trimmedValue };
-    }
-    
-    // ==========================
-    // Quest Stage Collection
-    // ==========================
-    
-    function parseStageResponse(response, stageCount, existingStages = {}) {
-        const stages = { ...existingStages };
-        const lines = response.split('\n');
-        
-        for (const line of lines) {
-            const match = line.match(/Stage\s+(\d+):\s*(.+)/i);
-            if (match) {
-                const stageNum = parseInt(match[1]);
-                const objective = match[2].trim();
-                
-                if (stageNum >= 1 && stageNum <= stageCount && !stages[stageNum]) {
-                    stages[stageNum] = objective;
-                }
-            }
-        }
-        
-        return stages;
-    }
-    
-    function validateStages(stages, stageCount) {
-        // Check which stages are missing or too short
-        const missingStages = [];
-        
-        for (let i = 1; i <= stageCount; i++) {
-            if (!stages[i] || stages[i].split(' ').length < 2) {  // Changed to 2 words minimum
-                missingStages.push(i);
-                // Remove this stage and all subsequent ones
-                for (let j = i; j <= stageCount; j++) {
-                    delete stages[j];
-                }
-                break;
-            }
-        }
-        
-        return missingStages.length === 0;
-    }
-    
-    function formatStagesForCard(stages, stageCount) {
-        let formatted = '';
-        for (let i = 1; i <= stageCount; i++) {
-            if (stages[i]) {
-                formatted += `${i}. ${stages[i]}\n`;
-            }
-        }
-        return formatted.trim();
-    }
-    
-    // ==========================
-    // Quest Rewards Collection
-    // ==========================
-    
-    function parseRewardsResponse(response) {
-        const rewards = {
-            xp: null,
-            col: null,
-            items: null
-        };
-        
-        const lines = response.split('\n');
-        
-        for (const line of lines) {
-            // Match Experience/XP
-            let match = line.match(/(?:Experience|XP):\s*(\d+)/i);
-            if (match) {
-                rewards.xp = parseInt(match[1]);
-                continue;
-            }
-            
-            // Match Col/Currency
-            match = line.match(/(?:Col|Currency):\s*(\d+)/i);
-            if (match) {
-                rewards.col = parseInt(match[1]);
-                continue;
-            }
-            
-            // Match Items
-            match = line.match(/Items?:\s*(.+)/i);
-            if (match) {
-                const itemText = match[1].trim();
-                if (itemText.toLowerCase() !== 'none' && itemText.length > 0) {
-                    rewards.items = itemText;
-                }
-            }
-        }
-        
-        return rewards;
-    }
-    
-    function formatRewardsForCard(rewards) {
-        let formatted = '';
-        
-        if (rewards.xp) {
-            formatted += `- Experience: ${rewards.xp} XP\n`;
-        }
-        if (rewards.col) {
-            formatted += `- Col: ${rewards.col}\n`;
-        }
-        if (rewards.items) {
-            formatted += `- Items: ${rewards.items}`;
-        }
-        
-        return formatted.trim();
-    }
-    
-    // ==========================
-    // Main Processing
-    // ==========================
-    
-    function processGeneration(hook, text) {
-        const progress = loadProgress();
-        if (!progress) return { active: false };
-        
-        switch(hook) {
-            case 'context':
-                // First check if all fields are already collected but not marked complete
-                if (!progress.completed && progress.templateFields) {
-                    const activeFields = progress.templateFields.filter(field => 
-                        !progress.collectedData.hasOwnProperty(field.name)
-                    );
-                    if (activeFields.length === 0) {
-                        // All fields collected - mark as complete
-                        progress.completed = true;
-                        saveProgress(progress);
-                        if (debug) console.log(`${MODULE_NAME}: Context: All fields collected - marked as complete`);
-                    }
-                }
-                
-                if (progress.completed) {
-                    return { active: true, text: text };
-                }
-                
-                // For quests, NPCs, and Locations, use batched collection
-                if (progress.entityType === 'Quest' || progress.entityType === 'NPC' || progress.entityType === 'Location') {
-                    // Get fields that need to be collected
-                    const activeFields = progress.templateFields.filter(field => 
-                        !progress.collectedData.hasOwnProperty(field.name)
-                    );
-                    
-                    // If no more fields to collect, mark as completed
-                    if (activeFields.length === 0) {
-                        progress.completed = true;
-                        saveProgress(progress);
-                        return { active: true, text: text };
-                    }
-                    
-                    let batchPrompt;
-                    if (progress.entityType === 'NPC') {
-                        // Build field list for NPC with descriptions
-                        let fieldList = '';
-                        for (const field of activeFields) {
-                            // Include the field name and its prompt/description
-                            if (field.prompt) {
-                                fieldList += `${field.name}: [${field.prompt}]\n`;
-                            } else {
-                                // Fallback to just field name if no prompt
-                                fieldList += `${field.name}:\n`;
-                            }
-                        }
-                        
-                        // Build context of already collected data
-                        let context = '';
-                        if (Object.keys(progress.collectedData).length > 0) {
-                            context = '==== CONTEXT (Already Provided) ====\n';
-                            for (const [key, value] of Object.entries(progress.collectedData)) {
-                                context += `${key}: ${value}\n`;
-                            }
-                            context += '\n';
-                        }
-                        
-                        batchPrompt = generatePrompt('NPC Batch', {
-                            NAME: progress.triggerName || progress.collectedData.NAME || 'Unknown',
-                            FIELD_LIST: fieldList.trim(),
-                            CONTEXT: context
-                        });
-                        
-                        progress.expectingBatch = true;
-                    } else if (progress.entityType === 'Quest') {
-                        // Quest logic - ensure stageCollection is initialized
-                        if (!progress.stageCollection) {
-                            progress.stageCollection = {
-                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
-                                stages: {}
-                            };
-                        }
-                        batchPrompt = generateQuestBatchPrompt(
-                            activeFields,
-                            progress.stageCollection.stageCount,
-                            progress.stageCollection.stages,
-                            progress.collectedData.QUEST_TYPE,
-                            progress.collectedData,
-                            progress.validationErrors
-                        );
-                        progress.expectingQuestBatch = true;
-                    } else {
-                        // Other entity types (like Location) - just use field list
-                        let fieldList = '';
-                        for (const field of activeFields) {
-                            let fieldDescription = field.prompt || field.type;
-                            
-                            // If it's a choice field, show the options
-                            if (field.type === 'choice' && field.params) {
-                                fieldDescription = `(${field.params})`;
-                            }
-                            
-                            fieldList += `${field.name}: ${fieldDescription}\n`;
-                        }
-                        
-                        batchPrompt = generatePrompt('Field Collection', {
-                            ENTITY_TYPE: progress.entityType,
-                            FIELD_LIST: fieldList
-                        });
-                        progress.expectingBatch = true;
-                    }
-                    
-                    // Store which fields we're asking about
-                    progress.currentBatch = activeFields.map(f => f.name);
-                    saveProgress(progress);
-                    
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: Adding batch prompt to context for fields: ${activeFields.map(f => f.name).join(', ')}`);
-                        console.log(`${MODULE_NAME}: Full prompt injection:\n${batchPrompt}`);
-                    }
-                    
-                    return {
-                        active: true,
-                        text: text + batchPrompt
-                    };
-                }
-                
-                // Entity classification logic
-                if (progress.entityType === 'EntityClassification') {
-                    const classificationPrompt = generateEntityClassificationPrompt(progress);
-                    return {
-                        active: true,
-                        text: text + classificationPrompt
-                    };
-                }
-                
-                // Handle 'Entity' type - needs to select what kind of entity to create
-                if (progress.entityType === 'Entity' && !progress.branchResolved) {
-                    const entitySelectionPrompt = generatePrompt('Entity Selection', {});
-                    return {
-                        active: true,
-                        text: text + entitySelectionPrompt
-                    };
-                }
-                
-                // Non-quest entities - generate prompts for missing fields
-                const activeFields = getActiveFields(progress.templateFields, progress.collectedData);
-                
-                if (activeFields.length > 0) {
-                    // Build field list for the prompt template
-                    let fieldList = '';
-                    for (const field of activeFields) {
-                        fieldList += `**${field.name}**: ${field.description || `Please provide the ${field.name.toLowerCase().replace(/_/g, ' ')} for this ${progress.entityType}`}\n`;
-                    }
-                    
-                    // Use the Field Collection template
-                    const prompt = generatePrompt('Field Collection', {
-                        ENTITY_TYPE: progress.entityType,
-                        FIELD_LIST: fieldList.trim()
-                    });
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Adding prompt for ${activeFields.length} fields`);
-                    return { active: true, text: text + '\n\n' + prompt };
-                }
-                
-                // All fields collected, mark as completed
-                progress.completed = true;
-                saveProgress(progress);
-                return { active: true, text: text };
-                
-            case 'output':
-                // Check if already completed
-                if (progress.completed) {
-                    clearProgress();
-                    return { active: false };
-                }
-                
-                // Handle batch response for Quest, NPC, or Location
-                if ((progress.entityType === 'Quest' && progress.expectingQuestBatch) || 
-                    (progress.entityType === 'NPC' && progress.expectingBatch) ||
-                    (progress.entityType === 'Location' && progress.expectingBatch)) {
-                    let allFieldsCollected = true;
-                    
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: Processing Quest batch response`);
-                        console.log(`${MODULE_NAME}: Output text: "${text}"`);
-                        console.log(`${MODULE_NAME}: currentBatch: ${JSON.stringify(progress.currentBatch)}`);
-                    }
-                    
-                    // Parse regular fields - use ALL template fields, not just currentBatch
-                    const responses = parseBatchedResponse(text, progress.templateFields);
-                    
-                    if (debug) {
-                        console.log(`${MODULE_NAME}: Parsed responses: ${JSON.stringify(responses)}`);
-                    }
-                    
-                    // Process each field
-                    for (const field of progress.templateFields) {
-                        if (!progress.collectedData.hasOwnProperty(field.name)) {
-                            const response = responses[field.name];
-                            if (response) {
-                                const validation = validateField(field, response);
-                                if (validation.valid) {
-                                    progress.collectedData[field.name] = validation.value;
-                                    // Clear any previous validation errors for this field
-                                    if (progress.validationErrors && progress.validationErrors[field.name]) {
-                                        delete progress.validationErrors[field.name];
-                                    }
-                                    if (debug) console.log(`${MODULE_NAME}: Collected ${field.name}: ${validation.value}`);
-                                } else {
-                                    if (debug) console.log(`${MODULE_NAME}: Validation failed for ${field.name}: ${validation.error}`);
-                                    // Store validation error for display in next prompt
-                                    if (!progress.validationErrors) progress.validationErrors = {};
-                                    progress.validationErrors[field.name] = validation.error;
-                                    if (field.requirement === 'required') {
-                                        allFieldsCollected = false;
-                                    }
-                                }
-                            } else {
-                                if (debug) console.log(`${MODULE_NAME}: No response found for ${field.name}`);
-                                if (field.requirement === 'required') {
-                                    allFieldsCollected = false;
-                                }
-                            }
-                        }
-                    }
-                    
-                    // Parse stages (Quest only) - Special handling to avoid false matches
-                    if (progress.entityType === 'Quest' && !progress.collectedData.STAGES) {
-                        // Ensure stageCollection is initialized
-                        if (!progress.stageCollection) {
-                            progress.stageCollection = {
-                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
-                                stages: {}
-                            };
-                        }
-                        
-                        // Look for the actual STAGES section, not summary lines
-                        // Find where "STAGES:" appears on its own line (not "Stages: 3")
-                        const stagesIndex = text.search(/^STAGES:\s*$/m);
-                        let stageText = text;
-                        
-                        if (stagesIndex !== -1) {
-                            // Extract everything after "STAGES:" line
-                            stageText = text.substring(stagesIndex);
-                            // Stop at "REWARDS:" if present
-                            const rewardsIndex = stageText.search(/^REWARDS:\s*$/m);
-                            if (rewardsIndex > 0) {
-                                stageText = stageText.substring(0, rewardsIndex);
-                            }
-                            if (debug) console.log(`${MODULE_NAME}: Extracted stage section for parsing`);
-                        }
-                        
-                        const stages = parseStageResponse(
-                            stageText,
-                            progress.stageCollection.stageCount,
-                            progress.stageCollection.stages
-                        );
-                        
-                        // Validate stages
-                        const allValid = validateStages(stages, progress.stageCollection.stageCount);
-                        
-                        progress.stageCollection.stages = stages;
-                        
-                        if (allValid) {
-                            const formattedStages = formatStagesForCard(
-                                stages,
-                                progress.stageCollection.stageCount
-                            );
-                            progress.collectedData.STAGES = formattedStages;
-                            if (debug) {
-                                console.log(`${MODULE_NAME}: All ${progress.stageCollection.stageCount} stages collected`);
-                                console.log(`${MODULE_NAME}: Formatted stages:\n${formattedStages}`);
-                            }
-                        } else {
-                            allFieldsCollected = false;
-                            if (debug) console.log(`${MODULE_NAME}: Stage validation failed, will retry`);
-                        }
-                    }
-                    
-                    // Parse rewards (Quest only)
-                    if (progress.entityType === 'Quest' && !progress.collectedData.REWARDS) {
-                        const rewards = parseRewardsResponse(text);
-                        
-                        if (rewards.xp && rewards.col) {
-                            progress.collectedData.REWARDS = formatRewardsForCard(rewards);
-                            progress.collectedData.REWARDS_PARSED = rewards;
-                            if (debug) console.log(`${MODULE_NAME}: Rewards collected: ${rewards.xp} XP, ${rewards.col} Col`);
-                        } else {
-                            allFieldsCollected = false;
-                            if (debug) console.log(`${MODULE_NAME}: Rewards incomplete`);
-                        }
-                    }
-                    
-                    // Check if we have everything
-                    const requiredFields = progress.templateFields.filter(f => f.requirement === 'required');
-                    for (const field of requiredFields) {
-                        if (!progress.collectedData.hasOwnProperty(field.name)) {
-                            allFieldsCollected = false;
-                            if (debug) console.log(`${MODULE_NAME}: Missing required field: ${field.name}`);
-                        }
-                    }
-                    
-                    // Check for stages and rewards specifically
-                    if (!progress.collectedData.STAGES) {
-                        allFieldsCollected = false;
-                        if (debug) console.log(`${MODULE_NAME}: Missing STAGES`);
-                    }
-                    if (!progress.collectedData.REWARDS) {
-                        allFieldsCollected = false;
-                        if (debug) console.log(`${MODULE_NAME}: Missing REWARDS`);
-                    }
-                    
-                    // Check if ALL fields are now collected (not just from this response)
-                    // For quests, we need to check DESCRIPTION, STAGES, and REWARDS specifically
-                    let remainingFields = [];
-                    let remainingFieldNames = '';
-                    
-                    if (progress.entityType === 'Quest') {
-                        // Check the three required quest fields
-                        const requiredQuestFields = ['DESCRIPTION', 'STAGES', 'REWARDS'];
-                        const missingQuestFields = requiredQuestFields.filter(f => !progress.collectedData[f]);
-                        remainingFields = missingQuestFields.map(name => ({ name }));
-                        remainingFieldNames = missingQuestFields.join(', ');
-                    } else {
-                        remainingFields = getActiveFields(progress.templateFields, progress.collectedData);
-                        remainingFieldNames = remainingFields.map(f => f.name).join(', ');
-                    }
-                    
-                    console.log(`${MODULE_NAME}: After batch processing - Remaining fields: ${remainingFields.length}${remainingFields.length > 0 ? ` (${remainingFieldNames})` : ''}`);
-                    console.log(`${MODULE_NAME}: Collected so far: ${JSON.stringify(Object.keys(progress.collectedData))}`);
-                    
-                    if (remainingFields.length === 0) {
-                        progress.completed = true;
-                        progress.expectingQuestBatch = false;
-                        progress.expectingBatch = false;
-                        if (debug) console.log(`${MODULE_NAME}: Quest generation completed!`);
-                        
-                        // Create the entity card immediately
-                        const template = loadTemplate(progress.entityType);
-                        if (template) {
-                            const finalText = processTemplate(template, progress.collectedData);
-                            const dataWithTrigger = { ...progress.collectedData };
-                            if (progress.triggerName) {
-                                dataWithTrigger.triggerName = progress.triggerName;
-                            }
-                            if (progress.metadata) {
-                                dataWithTrigger.metadata = progress.metadata;
-                            }
-                            createEntityCard(progress.entityType, finalText, dataWithTrigger);
-                        }
-                        
-                        // Clear and return completion message
-                        clearProgress();
-                        return { active: true, text: config.debug ? wrapDebugOutput(text) : COMPLETION_MESSAGE };
-                    }
-                    
-                    progress.currentBatch = null;
-                    saveProgress(progress);
-                    return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-                }
-                
-                // Handle entity classification response
-                if (progress.entityType === 'EntityClassification') {
-                    return handleEntityClassification(progress, text, config);
-                }
-                
-                // Handle Entity type selection response
-                if (progress.entityType === 'Entity' && !progress.branchResolved) {
-                    const branchTo = handleEntityBranching(text);
-                    if (branchTo) {
-                        if (debug) console.log(`${MODULE_NAME}: Entity branched to ${branchTo}`);
-                        
-                        // Load the template for the new entity type
-                        const template = loadTemplate(branchTo);
-                        if (!template) {
-                            if (debug) console.log(`${MODULE_NAME}: No template for ${branchTo}`);
-                            clearProgress();
-                            return { active: true, text: 'Failed to find template for ' + branchTo };
-                        }
-                        
-                        // Parse template fields
-                        const templateFields = parseTemplateFields(template.description);
-                        
-                        // Update progress with the actual entity type
-                        progress.entityType = branchTo;
-                        progress.templateFields = templateFields;
-                        progress.branchResolved = true;
-                        
-                        // Initialize Quest-specific fields if branching to Quest
-                        if (branchTo === 'Quest') {
-                            progress.stageCollection = {
-                                stageCount: progress.collectedData?.STAGE_COUNT || 3,
-                                stages: {}
-                            };
-                            progress.expectingQuestBatch = true;
-                        } else if (branchTo === 'NPC' || branchTo === 'Location') {
-                            progress.expectingBatch = true;
-                        }
-                        
-                        saveProgress(progress);
-                        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-                    } else {
-                        if (debug) console.log(`${MODULE_NAME}: Invalid entity type in response: ${text}`);
-                        // Stay in Entity state and will re-prompt on next context
-                        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-                    }
-                }
-                
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-        }
-        
-        return { active: false };
-    }
-    
-    // ==========================
-    // Field Management
-    // ==========================
-    function getActiveFields(templateFields, collectedData) {
-        // Return all fields that aren't already collected
-        if (!templateFields) return [];
-        
-        return templateFields.filter(field => {
-            // Skip if already collected
-            if (collectedData.hasOwnProperty(field.name)) {
-                return false;
-            }
-            
-            // Include all non-conditional fields
-            return field.requirement === 'required' || field.requirement === 'optional';
-        });
-    }
-    
-    // ==========================
-    // Entity Branching (for 'Entity' type)
-    // ==========================
-    function handleEntityBranching(response) {
-        // Valid entity types for branching
-        const validTypes = ['npc', 'monster', 'boss', 'item', 'location', 'quest'];
-        const normalized = response.trim().toLowerCase();
-        
-        if (validTypes.includes(normalized)) {
-            // Capitalize first letter for proper entity type
-            const properCase = normalized.charAt(0).toUpperCase() + normalized.slice(1);
-            
-            // Special case: NPC should be all caps
-            if (normalized === 'npc') {
-                return 'NPC';
-            }
-            
-            return properCase;
-        }
-        
-        return null;
-    }
-    
-    // ==========================
-    // Skill Generation
-    // ==========================
-    function generateRandomSkills(level = 1) {
-        // Parse skill sections from [RPG_SCHEMA] Skills card
-        const skillsCard = Utilities.storyCard.get('[RPG_SCHEMA] Skills');
-        if (!skillsCard || !skillsCard.entry) return '';
-        
-        const skillsBySection = {};
-        let currentSection = null;
-        
-        const lines = skillsCard.entry.split('\n');
-        for (const line of lines) {
-            const trimmed = line.trim();
-            
-            // Check for section headers
-            if (trimmed.startsWith('## ')) {
-                currentSection = trimmed.substring(3);
-                skillsBySection[currentSection] = [];
-                continue;
-            }
-            
-            // Parse skill definitions
-            if (trimmed.startsWith('* ') && currentSection) {
-                const skillMatch = trimmed.match(/^\* ([a-z_]+):/);
-                if (skillMatch) {
-                    skillsBySection[currentSection].push(skillMatch[1]);
-                }
-            }
-        }
-        
-        // Select 2 random skills (max 1 from Combat)
-        const selectedSkills = [];
-        const sections = Object.keys(skillsBySection);
-        
-        // First, decide if we're picking from Combat
-        const combatSkills = skillsBySection['Combat'] || [];
-        const nonCombatSections = sections.filter(s => s !== 'Combat' && s !== 'XP Categories');
-        
-        if (combatSkills.length > 0 && Math.random() < 0.5) {
-            // Pick one combat skill
-            const randomCombat = combatSkills[Math.floor(Math.random() * combatSkills.length)];
-            selectedSkills.push(randomCombat);
-        }
-        
-        // Fill remaining slots with non-combat skills
-        while (selectedSkills.length < 2 && nonCombatSections.length > 0) {
-            const randomSection = nonCombatSections[Math.floor(Math.random() * nonCombatSections.length)];
-            const sectionSkills = skillsBySection[randomSection] || [];
-            
-            if (sectionSkills.length > 0) {
-                const randomSkill = sectionSkills[Math.floor(Math.random() * sectionSkills.length)];
-                selectedSkills.push(randomSkill);
-            }
-        }
-        
-        // Format skills with XP values (always start at Level 1)
-        const formattedSkills = selectedSkills.map(skill => {
-            const xpMax = 100; // Level 1 XP requirement
-            const currentXp = Math.floor(Math.random() * 30); // Random progress up to 30 XP
-            return `${skill}: Level 1 (${currentXp}/${xpMax} XP)`;
-        });
-        
-        return formattedSkills.join('\n');
-    }
-    
-    // ==========================
-    // Helper Functions
-    // ==========================
-    function normalizeDateFormat(dateStr) {
-        if (!dateStr) return '';
-        
-        // If already in YYYY-MM-DD format, return as is
-        if (/^\d{4}-\d{2}-\d{2}$/.test(dateStr)) {
-            return dateStr;
-        }
-        
-        // Try to parse various date formats
-        const months = {
-            'january': '01', 'jan': '01',
-            'february': '02', 'feb': '02',
-            'march': '03', 'mar': '03',
-            'april': '04', 'apr': '04',
-            'may': '05',
-            'june': '06', 'jun': '06',
-            'july': '07', 'jul': '07',
-            'august': '08', 'aug': '08',
-            'september': '09', 'sep': '09', 'sept': '09',
-            'october': '10', 'oct': '10',
-            'november': '11', 'nov': '11',
-            'december': '12', 'dec': '12'
-        };
-        
-        // Try "Month DD, YYYY" or "Month DD YYYY"
-        const match1 = dateStr.match(/^(\w+)\s+(\d{1,2}),?\s+(\d{4})$/i);
-        if (match1) {
-            const month = months[match1[1].toLowerCase()];
-            if (month) {
-                const day = match1[2].padStart(2, '0');
-                return `${match1[3]}-${month}-${day}`;
-            }
-        }
-        
-        // Try "DD Month YYYY"
-        const match2 = dateStr.match(/^(\d{1,2})\s+(\w+)\s+(\d{4})$/i);
-        if (match2) {
-            const month = months[match2[2].toLowerCase()];
-            if (month) {
-                const day = match2[1].padStart(2, '0');
-                return `${match2[3]}-${month}-${day}`;
-            }
-        }
-        
-        // Try MM/DD/YYYY or MM-DD-YYYY
-        const match3 = dateStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-        if (match3) {
-            const month = match3[1].padStart(2, '0');
-            const day = match3[2].padStart(2, '0');
-            return `${match3[3]}-${month}-${day}`;
-        }
-        
-        // Try DD/MM/YYYY (assume day first if day > 12)
-        const match4 = dateStr.match(/^(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})$/);
-        if (match4) {
-            const first = parseInt(match4[1]);
-            const second = parseInt(match4[2]);
-            if (first > 12 && second <= 12) {
-                // First number must be day
-                const month = match4[2].padStart(2, '0');
-                const day = match4[1].padStart(2, '0');
-                return `${match4[3]}-${month}-${day}`;
-            }
-        }
-        
-        // Return original if we can't parse it
-        return dateStr;
-    }
-    
-    // ==========================
-    // Final Template Processing
-    // ==========================
-    function processTemplate(template, collectedData) {
-        let finalText = template.entry;
-        
-        // Flatten nested properties for template processing
-        const flatData = {...collectedData};
-        
-        if (debug && flatData.STAGES !== undefined) {
-            console.log(`${MODULE_NAME}: processTemplate - STAGES value: "${flatData.STAGES}"`);
-            console.log(`${MODULE_NAME}: processTemplate - STAGES type: ${typeof flatData.STAGES}`);
-        }
-        
-        // Handle hp object specially
-        if (collectedData.hp && typeof collectedData.hp === 'object') {
-            flatData['hp.current'] = collectedData.hp.current || 100;
-            flatData['hp.max'] = collectedData.hp.max || 100;
-            // Remove the nested object to avoid confusion
-            delete flatData.hp;
-        } else if (collectedData.HP || collectedData.MAX_HP) {
-            // Fallback if HP/MAX_HP are provided as flat fields
-            flatData['hp.current'] = collectedData.HP || collectedData.MAX_HP || 100;
-            flatData['hp.max'] = collectedData.MAX_HP || collectedData.HP || 100;
-        } else {
-            // Default HP values for NPCs
-            flatData['hp.current'] = 100;
-            flatData['hp.max'] = 100;
-        }
-        
-        // Normalize DOB to YYYY-MM-DD format
-        if (flatData.DOB) {
-            flatData.DOB = normalizeDateFormat(flatData.DOB);
-        }
-        
-        // Generate random skills for NPCs if not provided
-        if (!flatData.SKILLS) {
-            flatData.SKILLS = generateRandomSkills(1); // Always level 1
-        }
-        
-        // Get location from first [PLAYER] if not provided
-        if (!flatData.LOCATION) {
-            const players = Utilities.storyCard.find(c => c.title && c.title.startsWith('[PLAYER]'), true);
-            if (players && players.length > 0) {
-                const match = players[0].entry.match(/Current Location:\s*([^\n]+)/);
-                if (match) {
-                    flatData.LOCATION = match[1].trim();
-                }
-            }
-            // Default if no player found
-            if (!flatData.LOCATION) {
-                flatData.LOCATION = 'Town_Of_Beginnings';
-            }
-        }
-        
-        // Replace all {{FIELD_NAME}} placeholders that exist in flatData
-        for (const [field, value] of Object.entries(flatData)) {
-            // Escape dots in field names for regex
-            const escapedField = field.replace(/\./g, '\\.');
-            const placeholder = new RegExp(`\\{\\{${escapedField}\\}\\}`, 'gi');
-            finalText = finalText.replace(placeholder, value || '');
-        }
-        
-        // Process formulas from the description
-        const descFields = parseTemplateDescription(template.description);
-        for (const field of descFields) {
-            if (field.type === FieldTypes.FORMULA && field.params) {
-                const placeholder = new RegExp(`\\{\\{${field.name}\\}\\}`, 'gi');
-                const result = calculateFormula(field.params, collectedData);
-                finalText = finalText.replace(placeholder, result);
-            }
-            else if (field.type === FieldTypes.GAMESTATE && field.params) {
-                const placeholder = new RegExp(`\\{\\{${field.name}\\}\\}`, 'gi');
-                // This will be processed by GameState's processGetters
-                finalText = finalText.replace(placeholder, `get_${field.params}`);
-            }
-        }
-        
-        // Handle optional sections {{#FIELD}}...{{/FIELD}}
-        const optionalPattern = /\{\{#([A-Z_]+)\}\}([\s\S]*?)\{\{\/\1\}\}/g;
-        finalText = finalText.replace(optionalPattern, (match, fieldName, content) => {
-            if (collectedData[fieldName]) {
-                return content;
-            }
-            return '';
-        });
-        
-        // Clean up any remaining placeholders for optional fields
-        finalText = finalText.replace(/\{\{[A-Z_]+\}\}/g, '');
-        
-        return finalText;
-    }
-    
-    function parseTemplateDescription(description) {
-        // Parse ALL fields including formulas and gamestate
-        const fields = [];
-        const lines = description.split('\n');
-        
-        for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
-            
-            const match = trimmed.match(/^([A-Z_]+):\s*([^,]+),\s*([^,]+)(?:,\s*(.+))?$/);
-            if (!match) continue;
-            
-            const field = {
-                name: match[1],
-                requirement: match[2].trim(),
-                type: null,
-                params: null
-            };
-            
-            const typeMatch = match[3].trim().match(/^([a-z]+)(?:\[([^\]]+)\])?$/);
-            if (typeMatch) {
-                field.type = typeMatch[1];
-                field.params = typeMatch[2] || null;
-            }
-            
-            fields.push(field);
-        }
-        
-        return fields;
-    }
-    
-    function calculateFormula(formula, data) {
-        try {
-            let calcFormula = formula;
-            
-            // Replace field references
-            for (const [field, value] of Object.entries(data)) {
-                const pattern = new RegExp(`\\b${field}\\b`, 'gi');
-                calcFormula = calcFormula.replace(pattern, value);
-            }
-            
-            // Safely evaluate
-            const result = eval(calcFormula);
-            return Math.round(result);
-        } catch (e) {
-            if (debug) console.log(`${MODULE_NAME}: Formula error: ${e}`);
-            return 0;
-        }
-    }
-    
-    function createEntityCard(entityType, finalText, collectedData) {
-        // Determine card title based on entity type
-        let cardTitle = '';
-        let cardType = '';
-        const name = collectedData.NAME || 'Unknown';
-        
-        // Special handling for NPCs - use GameState's character creation
-        if (entityType.toUpperCase() === 'NPC') {
-            // Get trigger name from collectedData if it was passed
-            const triggerName = collectedData.triggerName || null;
-            
-            // Transform collected data to character format
-            const characterData = transformToCharacterData(collectedData, triggerName);
-            
-            // Use GameState to create the character if available
-            if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                const character = GameState.createCharacter(characterData);
-                if (character) {
-                    if (debug) console.log(`${MODULE_NAME}: Created NPC ${name} using GameState`);
-                    return; // Character was created successfully
-                }
-            }
-            
-            // Fallback to manual creation if GameState not available
-            cardTitle = `[CHARACTER] ${name}`;
-            cardType = 'character';
-        }
-        
-        switch(entityType.toUpperCase()) {
-            case 'NPC':
-                // Already handled above
-                break;
-            case 'MONSTER':
-                cardTitle = `[MONSTER] ${name}`;
-                cardType = 'monster';
-                break;
-            case 'BOSS':
-                cardTitle = `[BOSS] ${name}`;
-                cardType = 'boss';
-                break;
-            case 'LOCATION':
-                // Create location card using collectedData (not progress which isn't available here)
-                return createLocationFromData(collectedData, collectedData.metadata);
-                break;
-            case 'ITEM':
-                cardTitle = `[ITEM] ${name}`;
-                cardType = 'item';
-                break;
-            case 'QUEST':
-                cardTitle = `[QUEST] ${name}`;
-                cardType = 'quest';
-                break;
-            default:
-                cardTitle = `[${entityType.toUpperCase()}] ${name}`;
-                cardType = entityType.toLowerCase();
-        }
-        
-        // Create keys - username, real name, and trigger name if available
-        let keysList = [name];
-        if (collectedData.FULL_NAME && collectedData.FULL_NAME !== name) {
-            keysList.push(collectedData.FULL_NAME);
-        }
-        // Ensure triggerName is a string before adding to keys
-        const triggerNameStr = typeof collectedData.triggerName === 'string' 
-            ? collectedData.triggerName 
-            : (collectedData.triggerName?.name || null);
-        if (triggerNameStr && triggerNameStr !== name) {
-            keysList.push(' ' + triggerNameStr);
-            keysList.push('(' + triggerNameStr);
-        }
-        const keys = keysList.join(', ');
-        
-        // Create the story card
-        let description = `Generated by GenerationWizard on turn ${info?.actionCount || 0}`;
-        if (triggerNameStr && triggerNameStr !== name) {
-            description += `\nTrigger Name: ${triggerNameStr}`;
-        }
-        
-        Utilities.storyCard.add({
-            title: cardTitle,
-            entry: finalText,
-            type: cardType,
-            keys: keys,
-            description: description
-        });
-        
-        if (debug) console.log(`${MODULE_NAME}: Created entity card: ${cardTitle} with type: ${cardType}, keys: ${keys}`);
-        return cardTitle;
-    }
-    
-    // ==========================
-    // Default Template Creation
-    // ==========================
-    function createDefaultTemplates() {
-        // NPC Template (creates [CHARACTER] cards)
-        Utilities.storyCard.add({
-            title: '[GW Template] NPC',
-            type: 'data',
-            entry: (
-                `## **{{NAME}}** {{#FULL_NAME}} [{{FULL_NAME}}]{{/FULL_NAME}}\n` +
-                `DOB: {{DOB}} | Gender: {{GENDER}} | HP: {{hp.current}}/{{hp.max}} | Level {{LEVEL}} (0/{{XP_MAX}} XP) | Current Location: {{LOCATION}}\n` +
-                `**Appearance**\n` +
-                `Hair: {{HAIR}} | Eyes: {{EYES}} | Build: {{BUILD}}\n` +
-                `**Personality**\n` +
-                `{{PERSONALITY}}\n` +
-                `**Background**\n` +
-                `{{BACKGROUND}}\n` +
-                `**Attributes**\n` +
-                `VITALITY: {{VITALITY}} | STRENGTH: {{STRENGTH}} | DEXTERITY: {{DEXTERITY}} | AGILITY: {{AGILITY}}\n` +
-                `**Skills**\n` +
-                `{{SKILLS}}\n` +
-                `**Inventory**\n` +
-                `{}\n` +
-                `**Relationships**\n`
-            ),
-            description: (
-                `// NPC Generation\n` +
-                `NAME: required, text, Username/Gamertag (e.g. Nixara, LewdLeah, xXNyaXx, Pixel_Prowl; snake_case)\n` +
-                `FULL_NAME: optional, text, Real name (if known)\n` +
-                `GENDER: required, text, Gender (Male/Female/Other)\n` +
-                `DOB: required, text, Birth date\n` +
-                `HAIR: required, text, Hair color and style\n` +
-                `EYES: required, text, Eye color\n` +
-                `BUILD: required, text, Body build/physique\n` +
-                `PERSONALITY: required, text, Core traits and behavior patterns\n` +
-                `BACKGROUND: required, text, Their history and who they are\n` +
-                `// Auto-calculated fields (Level 1)\n` +
-                `LEVEL: formula, formula[1], Character level\n` +
-                `HP: formula, formula[100], Current health\n` +
-                `MAX_HP: formula, formula[100], Maximum health\n` +
-                `XP_MAX: formula, formula[400], Experience required for Level 2\n` +
-                `VITALITY: formula, formula[8+Math.floor(Math.random()*6)], Vitality\n` +
-                `STRENGTH: formula, formula[8+Math.floor(Math.random()*6)], Strength\n` +
-                `DEXTERITY: formula, formula[8+Math.floor(Math.random()*6)], Dexterity\n` +
-                `AGILITY: formula, formula[8+Math.floor(Math.random()*6)], Agility`
-            ),
-        });
-        
-        // Location Template
-        Utilities.storyCard.add({
-            title: '[GW Template] Location',
-            type: 'data',
-            entry: (
-                `<$# Locations>\n` +
-                `## **{{NAME}}**\n` +
-                `Type: {{LOCATION_TYPE}} | Terrain: {{TERRAIN}}\n` +
-                `**Description**\n` +
-                `{{DESCRIPTION}}\n` +
-                `**Pathways**\n` +
-                `{{PATHWAYS}}`
-            ),
-            description: (
-                `// Location Generation\n` +
-                `NAME: required, text, Location name (e.g., Dark_Forest, Mountain_Pass)\n` +
-                `LOCATION_TYPE: required, choice[Settlement|Safezone|Wilderness|Dungeon|Landmark|Ruins], Primary location type\n` +
-                `TERRAIN: required, text, Terrain type (e.g., Plains, Forest, Cobblestone Plaza, etc.)\n` +
-                `ATMOSPHERE: required, text, 2-3 words for inherent mood/vibe (e.g., "dark and ominous", "bustling and lively" - NOT current events/scene)\n` +
-                `DESCRIPTION: required, text, 2-3 sentences about the location's permanent characteristics (NOT current scene/events/people present)`
-            )
-        });
-        
-        // Quest Template
-        Utilities.storyCard.add({
-            title: '[GW Template] Quest',
-            type: 'data',
-            entry: (
-                `<\$# Quests><\$## Active Quests>\n` +
-                `## **{{NAME}}**\n` +
-                `Type: {{QUEST_TYPE}} | Giver: {{QUEST_GIVER}} | Current Stage: 0\n` +
-                `**Description**\n` +
-                `{{DESCRIPTION}}\n` +
-                `**Stages**\n` +
-                `{{STAGES}}\n` +
-                `**Rewards**\n` +
-                `{{REWARDS}}`
-            ),
-            description: (
-                `// Quest Generation\n` +
-                `NAME: predefined, text, Quest name from accept_quest\n` +
-                `QUEST_TYPE: predefined, text, Quest type from accept_quest\n` +
-                `QUEST_GIVER: predefined, text, Quest giver from accept_quest\n` +
-                `STAGE_COUNT: predefined, number, Number of stages from accept_quest\n` +
-                `DESCRIPTION: required, text, Quest story and context\n` +
-                `STAGES: batched, text, Quest objectives (collected separately)\n` +
-                `REWARDS: batched, text, Quest rewards (XP, Col, Items - collected together)`
-            )
-        });
-        
-        // Add other templates as needed...
-        
-        if (debug) console.log(`${MODULE_NAME}: Created default templates`);
-    }
-    
-    // ==========================
-    // Entity Classification Functions
-    // ==========================
-    
-    function generateEntityClassificationPrompt(progress) {
-        // Load entity tracker templates
-        const templatesCard = Utilities.storyCard.get('[RPG_RUNTIME] Entity Templates');
-        if (!templatesCard) {
-            return ''; // No templates configured
-        }
-        
-        // Get the appropriate query based on stage
-        const templates = parseEntityTemplates(templatesCard.entry);
-        const prompts = loadPrompts();
-        
-        if (progress.stage === 'classification') {
-            // First stage - classify the entity
-            const query = templates.CLASSIFICATION_QUERY || 
-                `Classify the entity "${progress.entityName}" that was just referenced:\n` +
-                `ENTITY_TYPE: [CHARACTER/MONSTER/BOSS/GROUP]\n` +
-                `FULL_NAME: [Complete name if different from "${progress.entityName}"]\n` +
-                `GENDER: [Male/Female/Other/Unknown]\n` +
-                `DESCRIPTION: [2-3 sentences about who/what this is]`;
-            
-            const prompt = prompts['Entity Classification'] || '';
-            return prompt.replace('{{CLASSIFICATION_QUERY}}', query.replace('{name}', progress.entityName));
-        } else if (progress.stage === 'details') {
-            // Second stage - get type-specific details
-            const entityType = progress.collectedData.ENTITY_TYPE;
-            const queryKey = `${entityType}_QUERY`;
-            const query = templates[queryKey] || '';
-            
-            const prompt = prompts['Entity Details'] || '';
-            return prompt.replace('{{DETAILS_QUERY}}', query.replace('{name}', progress.entityName));
-        } else if (progress.stage === 'player_specifics') {
-            // Third stage - for NPC_PLAYER only
-            const query = templates.PLAYER_SPECIFICS_QUERY || '';
-            const prompt = prompts['Entity Details'] || '';
-            return prompt.replace('{{DETAILS_QUERY}}', query.replace('{name}', progress.entityName));
-        }
-        
-        return '';
-    }
-    
-    function parseEntityTemplates(text) {
-        const templates = {};
-        const sections = text.split(/^#\s+/m).filter(s => s.trim());
-        
-        for (const section of sections) {
-            const lines = section.split('\n');
-            const key = lines[0].trim().replace(/\s+/g, '_').toUpperCase();
-            const content = lines.slice(1).join('\n').trim();
-            templates[key] = content;
-        }
-        
-        return templates;
-    }
-    
-    function handleEntityClassification(progress, text, config) {
-        const debug = config.debug;
-        
-        if (progress.stage === 'classification') {
-            // Parse classification response
-            const parsed = parseEntityClassificationResponse(text);
-            
-            if (parsed.ENTITY_TYPE) {
-                progress.collectedData = parsed;
-                progress.stage = 'details';
-                saveProgress(progress);
-                
-                if (debug) console.log(`${MODULE_NAME}: Entity classified as ${parsed.ENTITY_TYPE}`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-            } else {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse entity classification`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-            }
-        } else if (progress.stage === 'details') {
-            // Parse type-specific details
-            const entityType = progress.collectedData.ENTITY_TYPE;
-            const parsed = parseEntityDetailsResponse(text, entityType);
-            
-            // Merge with existing data
-            Object.assign(progress.collectedData, parsed);
-            
-            // Check if we need player specifics (for NPC_PLAYER)
-            if (entityType === 'CHARACTER' && parsed.TYPE === 'NPC_PLAYER') {
-                progress.stage = 'player_specifics';
-                saveProgress(progress);
-                
-                if (debug) console.log(`${MODULE_NAME}: Character is NPC_PLAYER, getting additional details`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-            } else {
-                // We have everything, create the entity
-                progress.completed = true;
-                saveProgress(progress);
-                
-                // Create the character using GameState
-                if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                    const characterData = transformEntityToCharacter(progress.collectedData, progress.triggerName || progress.entityName);
-                    GameState.createCharacter(characterData);
-                    
-                    // Signal completion to GameState
-                    if (GameState.completeEntityGeneration) {
-                        GameState.completeEntityGeneration(progress.entityName);
-                    }
-                }
-                
-                if (debug) console.log(`${MODULE_NAME}: Entity generation completed for ${progress.entityName}`);
-                return { active: true, text: config.debug ? wrapDebugOutput(text) : COMPLETION_MESSAGE };
-            }
-        } else if (progress.stage === 'player_specifics') {
-            // Parse player-specific details
-            const parsed = parsePlayerSpecificsResponse(text);
-            
-            // Merge with existing data
-            Object.assign(progress.collectedData, parsed);
-            
-            // Create the entity
-            progress.completed = true;
-            saveProgress(progress);
-            
-            // Create the character using GameState
-            if (typeof GameState !== 'undefined' && GameState.createCharacter) {
-                const characterData = transformEntityToCharacter(progress.collectedData, progress.triggerName || progress.entityName);
-                GameState.createCharacter(characterData);
-                
-                // Signal completion to GameState
-                if (GameState.completeEntityGeneration) {
-                    GameState.completeEntityGeneration(progress.entityName);
-                }
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: Player character generation completed for ${progress.entityName}`);
-            return { active: true, text: config.debug ? wrapDebugOutput(text) : COMPLETION_MESSAGE };
-        }
-        
-        return { active: true, text: config.debug ? wrapDebugOutput(text) : HIDDEN_OUTPUT };
-    }
-    
-    function parseEntityClassificationResponse(text) {
-        const result = {};
-        
-        // Parse each expected field
-        const typeMatch = text.match(/ENTITY_TYPE:\s*([A-Z_]+)/i);
-        if (typeMatch) result.ENTITY_TYPE = typeMatch[1].toUpperCase();
-        
-        const nameMatch = text.match(/FULL_NAME:\s*([^\n]+)/i);
-        if (nameMatch) result.FULL_NAME = nameMatch[1].trim();
-        
-        const genderMatch = text.match(/GENDER:\s*([^\n]+)/i);
-        if (genderMatch) result.GENDER = genderMatch[1].trim();
-        
-        const descMatch = text.match(/DESCRIPTION:\s*([^\n]+(?:\n[^\n]+)?)/i);
-        if (descMatch) result.DESCRIPTION = descMatch[1].trim();
-        
-        return result;
-    }
-    
-    function parseEntityDetailsResponse(text, entityType) {
-        const result = {};
-        
-        // Common fields
-        const levelMatch = text.match(/LEVEL:\s*(\d+)/i);
-        if (levelMatch) result.LEVEL = parseInt(levelMatch[1]);
-        
-        const locationMatch = text.match(/LOCATION:\s*([^\n]+)/i);
-        if (locationMatch) result.LOCATION = locationMatch[1].trim();
-        
-        const appearanceMatch = text.match(/APPEARANCE:\s*([^\n]+(?:\n[^\n]+)?)/i);
-        if (appearanceMatch) result.APPEARANCE = appearanceMatch[1].trim();
-        
-        // Type-specific parsing
-        if (entityType === 'CHARACTER') {
-            const typeMatch = text.match(/TYPE:\s*(NPC|NPC_PLAYER)/i);
-            if (typeMatch) result.TYPE = typeMatch[1].toUpperCase();
-            
-            const personalityMatch = text.match(/PERSONALITY:\s*([^\n]+(?:\n[^\n]+)?)/i);
-            if (personalityMatch) result.PERSONALITY = personalityMatch[1].trim();
-            
-            const backgroundMatch = text.match(/BACKGROUND:\s*([^\n]+(?:\n[^\n]+)?)/i);
-            if (backgroundMatch) result.BACKGROUND = backgroundMatch[1].trim();
-            
-            const skillsMatch = text.match(/PRIMARY_SKILLS:\s*([^\n]+)/i);
-            if (skillsMatch) result.PRIMARY_SKILLS = skillsMatch[1].trim();
-            
-            const itemsMatch = text.match(/STARTING_ITEMS:\s*([^\n]+)/i);
-            if (itemsMatch) result.STARTING_ITEMS = itemsMatch[1].trim();
-            
-            const relMatch = text.match(/RELATIONSHIPS:\s*([^\n]+)/i);
-            if (relMatch) result.RELATIONSHIPS = relMatch[1].trim();
-        } else if (entityType === 'MONSTER' || entityType === 'BOSS') {
-            const abilitiesMatch = text.match(/ABILITIES:\s*([^\n]+(?:\n[^\n]+)?)/i);
-            if (abilitiesMatch) result.ABILITIES = abilitiesMatch[1].trim();
-            
-            const lootMatch = text.match(/LOOT:\s*([^\n]+)/i);
-            if (lootMatch) result.LOOT = lootMatch[1].trim();
-            
-            const weakMatch = text.match(/WEAKNESSES:\s*([^\n]+)/i);
-            if (weakMatch) result.WEAKNESSES = weakMatch[1].trim();
-            
-            if (entityType === 'BOSS') {
-                const phasesMatch = text.match(/PHASES:\s*(\d+)/i);
-                if (phasesMatch) result.PHASES = parseInt(phasesMatch[1]);
-                
-                const legendaryMatch = text.match(/LEGENDARY_ACTIONS:\s*([^\n]+)/i);
-                if (legendaryMatch) result.LEGENDARY_ACTIONS = legendaryMatch[1].trim();
-            }
-        }
-        
-        return result;
-    }
-    
-    function parsePlayerSpecificsResponse(text) {
-        const result = {};
-        
-        const dobMatch = text.match(/DOB:\s*(\d{4}-\d{2}-\d{2})/i);
-        if (dobMatch) result.DOB = dobMatch[1];
-        
-        const classMatch = text.match(/STARTING_CLASS:\s*([^\n]+)/i);
-        if (classMatch) result.STARTING_CLASS = classMatch[1].trim();
-        
-        const attrMatch = text.match(/ATTRIBUTE_FOCUS:\s*([^\n]+)/i);
-        if (attrMatch) result.ATTRIBUTE_FOCUS = attrMatch[1].trim();
-        
-        const skillMatch = text.match(/SKILL_SPECIALIZATION:\s*([^\n]+)/i);
-        if (skillMatch) result.SKILL_SPECIALIZATION = skillMatch[1].trim();
-        
-        const hooksMatch = text.match(/BACKSTORY_HOOKS:\s*([^\n]+(?:\n[^\n]+)?)/i);
-        if (hooksMatch) result.BACKSTORY_HOOKS = hooksMatch[1].trim();
-        
-        return result;
-    }
-    
-    function getPlayerLocation() {
-        // Use GameState's existing functions to get player location
-        if (typeof GameState !== 'undefined' && GameState.getPlayerName && GameState.get) {
-            const playerName = GameState.getPlayerName();
-            if (playerName) {
-                const location = GameState.get(`Character.${playerName}.info.location`);
-                return location || null;
-            }
-        }
-        return null;
-    }
-    
-    function transformEntityToCharacter(entityData, entityName) {
-        // Transform collected entity data into ECS component format for GameState
-        const characterData = {
-            name: entityData.FULL_NAME || entityName,
-            
-            // Display fields
-            gender: entityData.GENDER || 'Unknown',
-            appearance: entityData.APPEARANCE || '',
-            personality: entityData.PERSONALITY || '',
-            backstory: entityData.BACKGROUND || entityData.BACKSTORY || '',
-            
-            // Stats component with dot notation
-            'stats.level': parseInt(entityData.LEVEL) || 1,
-            'stats.hp.current': 100,
-            'stats.hp.max': 100,
-            'stats.xp.current': 0,
-            'stats.xp.max': 1000,
-            
-            // Info component
-            'info.location': entityData.LOCATION || getPlayerLocation() || 'unknown',
-            'info.faction': entityData.FACTION || null,
-            'info.trigger_name': entityName,  // Store the trigger name that caused generation
-            'info.generation_turn': info?.actionCount || 0,
-            
-            // Attributes component - set defaults with proper structure
-            attributes: {
-                VITALITY: { value: 10 },
-                STRENGTH: { value: 10 },
-                DEXTERITY: { value: 10 },
-                AGILITY: { value: 10 }
-            },
-            
-            // Initialize empty components
-            skills: {},
-            inventory: {},
-            relationships: {}
-        };
-        
-        // Add DOB and class for player characters
-        if (entityData.TYPE === 'NPC_PLAYER') {
-            if (entityData.DOB) characterData.dob = entityData.DOB;
-            if (entityData.STARTING_CLASS) characterData.class = entityData.STARTING_CLASS;
-            characterData.isPlayer = true;
-        } else {
-            characterData.isPlayer = false;
-        }
-        
-        // Parse skills
-        if (entityData.PRIMARY_SKILLS) {
-            characterData.skills = {};
-            const skills = entityData.PRIMARY_SKILLS.split(',').map(s => s.trim());
-            for (const skill of skills) {
-                const skillKey = skill.toLowerCase().replace(/\s+/g, '_');
-                characterData.skills[skillKey] = {
-                    level: 1,
-                    xp: { current: 0, max: 100 }
-                };
-            }
-        }
-        
-        // Parse items
-        if (entityData.STARTING_ITEMS) {
-            characterData.inventory = {};
-            const items = entityData.STARTING_ITEMS.split(',').map(s => s.trim());
-            for (const item of items) {
-                const itemKey = item.toLowerCase().replace(/\s+/g, '_');
-                characterData.inventory[itemKey] = { quantity: 1 };
-            }
-        }
-        
-        // Parse relationships
-        if (entityData.RELATIONSHIPS) {
-            characterData.relationships = {};
-            // Simple parsing - could be enhanced
-            const rels = entityData.RELATIONSHIPS.split(',').map(s => s.trim());
-            for (const rel of rels) {
-                if (rel && rel !== 'None') {
-                    const relKey = rel.toLowerCase().replace(/\s+/g, '_');
-                    characterData.relationships[relKey] = 'neutral';
-                }
-            }
-        }
-        
-        return characterData;
-    }
-    
-    // ==========================
-    // Hook Processing / API Mode
-    // ==========================
-    
-    // Auto-initialize API methods on first call
-    if (!GenerationWizard.isActive) {
-        // Set up all public API methods
-        GenerationWizard.isActive = isGenerationActive;
-        GenerationWizard.shouldTakeControl = shouldTakeControl;
-        
-        GenerationWizard.startGeneration = function(entityType, initialData = {}) {
-            if (isGenerationActive()) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return false;
-            }
-            
-            // Special handling for 'Entity' - it's a branching path
-            if (entityType === 'Entity') {
-                const progress = {
-                    entityType: 'Entity',
-                    collectedData: {},
-                    templateFields: null,
-                    completed: false,
-                    currentBatch: null,
-                    branchResolved: false,
-                    startTurn: info?.actionCount || 0
-                };
-                
-                saveProgress(progress);
-                if (debug) console.log(`${MODULE_NAME}: Started Entity branching generation`);
-                return true;
-            }
-            
-            // Load the specific template
-            const template = loadTemplate(entityType);
-            if (!template) {
-                if (debug) console.log(`${MODULE_NAME}: No template for ${entityType}`);
-                return false;
-            }
-            
-            let templateFields = parseTemplateFields(template.description);
-            
-            // Handle predefined fields from initialData for any entity type
-            if (initialData && Object.keys(initialData).length > 0) {
-                // Remove fields we already have values for
-                templateFields = templateFields.filter(field => {
-                    // Skip if this field was predefined
-                    if (field.requirement === 'predefined') {
-                        return false;
-                    }
-                    // Skip if we already have a value for this field
-                    if (initialData.hasOwnProperty(field.name)) {
-                        if (debug) console.log(`${MODULE_NAME}: Skipping ${field.name} - already provided`);
-                        return false;
-                    }
-                    return true;
-                });
-            }
-            
-            if (templateFields.length === 0 && entityType !== 'Quest') {
-                if (debug) console.log(`${MODULE_NAME}: Empty template for ${entityType}`);
-                return false;
-            }
-            
-            // Store trigger name separately if it exists
-            const collectedData = { ...initialData };
-            let triggerName = null;
-            if (collectedData.name) {
-                triggerName = collectedData.name;
-                delete collectedData.name; // Remove from collected data to avoid confusion
-            }
-            
-            // Pre-fill default values for optional fields
-            for (const field of templateFields) {
-                if (field.requirement === 'optional' && field.type === 'default' && field.params) {
-                    if (!collectedData.hasOwnProperty(field.name)) {
-                        collectedData[field.name] = field.params;
-                        if (debug) console.log(`${MODULE_NAME}: Set default for ${field.name}: ${field.params}`);
-                    }
-                }
-            }
-            
-            // Initialize progress - initialData already contains the predefined values
-            const progress = {
-                entityType: entityType,
-                triggerName: triggerName, // Store the original trigger name
-                collectedData: collectedData,
-                templateFields: templateFields,
-                completed: false,
-                currentBatch: null,
-                branchResolved: true,
-                startTurn: info?.actionCount || 0,
-                // Quest-specific fields
-                stageCollection: entityType === 'Quest' ? {
-                    stageCount: initialData?.STAGE_COUNT || 3,
-                    stages: {}
-                } : null,
-                expectingQuestBatch: entityType === 'Quest'
-            };
-            
-            saveProgress(progress);
-            if (debug) console.log(`${MODULE_NAME}: Started ${entityType} generation`);
-            return true;
-        };
-        
-        GenerationWizard.cancelGeneration = function() {
-            if (!isGenerationActive()) return false;
-            clearProgress();
-            return true;
-        };
-        
-        GenerationWizard.process = function(hook, text) {
-            if (!isGenerationActive()) return { active: false };
-            return processGeneration(hook, text);
-        };
-        
-        GenerationWizard.startQuestGeneration = function(questName, questGiver, questType, stageCount) {
-            if (!questName || !questGiver || !questType || !stageCount) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest parameters - missing required fields`);
-                return false;
-            }
-            
-            // Validate stage count (minimum 2)
-            stageCount = parseInt(stageCount);
-            if (isNaN(stageCount) || stageCount < 2) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid stage count: ${stageCount} (minimum 2 required)`);
-                return false;
-            }
-            
-            // Load valid quest types from schema
-            let validTypes = ['story', 'side', 'hidden', 'raid']; // Default fallback
-            
-            if (typeof Utilities !== 'undefined') {
-                const questSchema = Utilities.storyCard.get('[RPG_SCHEMA] Quest Types');
-                if (questSchema && questSchema.value) {
-                    const parsed = Utilities.config.load('[RPG_SCHEMA] Quest Types');
-                    validTypes = Object.keys(parsed).map(type => type.toLowerCase());
-                }
-            }
-            
-            // Validate quest type - expect lowercase
-            if (!validTypes.includes(questType)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType}. Valid types: ${validTypes.join(', ')}`);
-                return false;
-            }
-            
-            // Start generation with predefined values
-            return GenerationWizard.startGeneration('Quest', {
-                NAME: questName,
-                QUEST_TYPE: questType,  // Pass through as lowercase
-                QUEST_GIVER: questGiver,
-                STAGE_COUNT: stageCount
-            });
-        };
-        
-        GenerationWizard.startEntityGeneration = function(entityData) {
-            if (!entityData || !entityData.name) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid entity data - missing name`);
-                return false;
-            }
-            
-            if (isGenerationActive()) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return false;
-            }
-            
-            // Start with entity classification stage
-            const progress = {
-                entityType: 'EntityClassification',
-                entityName: entityData.name,
-                triggerName: entityData.name,  // Store the trigger name from entity tracker
-                stage: entityData.stage || 'classification',
-                collectedData: entityData.collectedData || {},
-                templateFields: null,
-                completed: false,
-                currentBatch: null,
-                branchResolved: false,
-                startTurn: info?.actionCount || 0
-            };
-            
-            saveProgress(progress);
-            if (debug) console.log(`${MODULE_NAME}: Started entity classification for ${entityData.name}`);
-            return true;
-        };
-        
-    }
-    
-    // Handle hook-based initialization
-    if (hook === 'api') {
-        return GenerationWizard;
-    }
-    
-    // Create default templates on first run
-    if (!Utilities.storyCard.get('[GW Template] NPC')) {
-        createDefaultTemplates();
-    }
-    
-    // Create combined config/prompts card on first run
-    if (!Utilities.storyCard.get(CONFIG_AND_PROMPTS_CARD)) {
-        createDefaultConfigAndPrompts();
-    }
-    
-    return GenerationWizard;
-}
+    // ========================================
+    // TABLE OF CONTENTS
+    // ========================================
+    // SECTION 1: INITIALIZATION & CONFIGURATION
+    // SECTION 2: CORE DATA MANAGEMENT
+    //   2A: Data Cache & Storage
+    //   2B: Universal Data Access (get/set/resolve)
+    //   2C: Entity Management (load/save/create)
+    //   2D: Component System
+    //   2E: GameplayTag System
+    //   2F: Query System
+    //   2G: Schema Management
+    // SECTION 3: REGISTRATION SYSTEM
+    // SECTION 5: COMPONENT MODULES
+    // SECTION 6: TOOL PROCESSING
+    // SECTION 7: COMMAND PROCESSING
+    // SECTION 8: HOOK PROCESSING
+    // SECTION 9: BLUEPRINT SYSTEM
+    // API EXPOSURE
+    // RUNTIME CONFIGURATION LOADING
+    // MAIN EXECUTION
+    // ========================================
 
-function GameState(hook, text) {
-    'use strict';
-    
+    // ========================================
+    // SECTION 1: INITIALIZATION & CONFIGURATION
+    // ========================================
+    //#region SECTION 1
+
+    // Core configuration
+    const VERSION = '2.0.0';
+    const MODULE_NAME = 'SANE';
     const debug = true;
-    const MODULE_NAME = 'GameState';
-    const begin = Date.now(); // Start timing execution
-    
-    // Variable to track current hash
-    let currentHash = null;
-    
-    // Entity cache - stores all loaded entities for the current turn
-    // Uses entity type + name as cache key
-    let entityCache = {};
-    
-    // Helper to get all cached entities of a type
-    function getCachedEntitiesOfType(type) {
-        const result = {};
-        const prefix = type + '.';
-        for (const [key, entity] of Object.entries(entityCache)) {
-            if (key.startsWith(prefix)) {
-                const name = key.substring(prefix.length);
-                result[name] = entity;
-            }
-        }
-        return result;
-    }
-    
-    // Debug-only: Initialize execution times array if needed  
-    if (debug && !state.times) {
-        state.times = []; // Array of {hash, hook, duration}
+    const startTime = Date.now();
+
+    // Validate hook and text parameters
+    if (!hook || !text) {
+        console.log(`${MODULE_NAME}: Invalid parameters - hook: ${hook}, text length: ${text?.length}`);
+        return text || '\u200B';  // WHY WOULD IT EVER BE EMPTY THO
     }
 
-    const logTime = () => {
-        const duration = Date.now() - begin;
-        
-        if (debug) {
-            // Only track times in debug mode
-            if (state.times) {
-                const timeEntry = {
-                    hash: currentHash || 'pending',
-                    hook: hook,
-                    duration: duration
-                };
-                
-                state.times.push(timeEntry);
-            }
-            
-            // Associate pending CONTEXT entries with current output hash
-            // (Input entries keep their own hash from the modified input text)
-            if (hook === 'output' && currentHash && state.times) {
-            // Only update pending CONTEXT entries, not input entries
-            for (let i = state.times.length - 2; i >= 0; i--) {
-                if (state.times[i].hash === 'pending' && state.times[i].hook === 'context') {
-                    state.times[i].hash = currentHash;
-                } else if (state.times[i].hash !== 'pending') {
-                    break; // Stop when we hit a non-pending entry
-                }
-            }
-            
-            // Clean up timing entries for hashes no longer in history
-            // Get all valid hashes from RewindSystem
-            const validHashes = new Set();
-            validHashes.add('pending'); // Keep pending entries
-            
-            try {
-                const rewindCards = RewindSystem.getAllCards();
-                rewindCards.forEach(card => {
-                    if (card.data && card.data.entries) {
-                        card.data.entries.forEach(entry => {
-                            if (entry && entry.h) {
-                                validHashes.add(entry.h);
-                            }
-                        });
-                    }
-                });
-            } catch (e) {
-                // If we can't get RewindSystem data, keep all times for safety
-                return;
-            }
-            
-            // Filter to keep only times with valid hashes
-            state.times = state.times.filter(t => validHashes.has(t.hash));
-            }
-            
-            console.log(`${MODULE_NAME} [${hook}]: Execution time: ${duration} ms`);
-        }
+    // Optional dependencies
+    const Calendar = typeof globalThis.Calendar !== 'undefined' ? globalThis.Calendar : null;
+
+    // AI Dungeon sandbox <3
+    const state = globalThis.state || {};
+    const history = globalThis.history || [];
+
+    // Core registries
+    const schemas = {};
+    const tools = {};
+    const hooks = {
+        preContext: [],  // Greedy modules that run first
+        context: [],
+        input: [],
+        output: []
     };
-    
-    // Debug-only state usage
-    if (debug) {
-        // Check for automatic cleanup FIRST before any processing
-        const stateSize = JSON.stringify(state).length;
-        if (stateSize > 50000) {
-            console.log(`${MODULE_NAME}: State size ${Math.round(stateSize/1000)}KB exceeds 50KB limit - performing automatic cleanup`);
-            
-            // Reset debug logs
-            if (state.debugLog) {
-                state.debugLog = {
-                    turns: [],
-                    allErrors: state.debugLog.allErrors ? state.debugLog.allErrors.slice(-10) : [], // Keep last X errors
-                    lastRewindData: null // Clear rewind data backup too
-                };
-            }
-            
-            // Clear rewind backups
-            if (state.rewindBackups) {
-                delete state.rewindBackups;
-            }
-            
-            // Clear execution times
-            if (state.times) {
-                state.times = [];
-            }
-        }
-    }
-    
-    // Entity generation tracking 
-    let currentEntityGeneration = null;
-    
-    // Tool pattern: standard function calls like tool_name(param1, param2, param3)
-    const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/gi;
-    
-    // Universal getter pattern for object data: get[objectType.entityName.field]
-    // Examples: get[character.Bob.level], get[location.Somewhere_Over_There.type]
-    const UNIVERSAL_GETTER_PATTERN = /get\[([^\]]+)\]/gi;
-    
-    // Function getter pattern for dynamic/computed values: get_function(parameters)
-    // Examples: get_currentdate(), get_formattedtime(), get_daynumber()
-    const FUNCTION_GETTER_PATTERN = /get_[a-z]+\s*\([^)]*\)/gi;
-    
-    // ==========================
-    // Debug Logging System
-    // ==========================
-    const MAX_DEBUG_TURNS = 5; // Keep only last 5 turns to save state space
-    
-    function initDebugLogging() {
-        if (!debug) return;
-        
-        // Initialize debug log structure in state if needed
-        if (!state.debugLog) {
-            state.debugLog = {
-                turns: [],  // Array of turn data
-                allErrors: []  // Track ALL errors throughout the entire adventure
-            };
-        }
-        
-        // Ensure allErrors exists even for existing debug logs
-        if (!state.debugLog.allErrors) {
-            state.debugLog.allErrors = [];
-        }
-    }
-    
-    function logError(error, context = '') {
-        if (!debug) return;
-        
-        if (!state.debugLog) {
-            initDebugLogging();
-        }
-        
-        const errorEntry = {
-            actionCount: state.actionCount || 0,
-            error: error.toString(),
-            stack: error.stack || '',
-            context: context,
-            timestamp: new Date().toISOString()
-        };
-        
-        state.debugLog.allErrors.push(errorEntry);
-        
-        // When we exceed X errors, keep only the last Y
-        if (state.debugLog.allErrors.length > 40) {
-            state.debugLog.allErrors = state.debugLog.allErrors.slice(-10);
-        }
-    }
-    
-    // Track processing events for this turn
-    let currentTurnEvents = [];
-    
-    // Intercept console.log to capture all debug messages
-    const originalConsoleLog = console.log;
-    console.log = function(...args) {
-        // Call the original console.log
-        originalConsoleLog.apply(console, args);
-        
-        // If in debug mode and message contains MODULE_NAME, capture it
-        if (debug && args.length > 0) {
-            const message = args.join(' ');
-            if (message.includes(MODULE_NAME)) {
-                currentTurnEvents.push(message);
-            }
-        }
+    const rewindableTools = {};  // Stores rewind strategies for tools
+
+    // Data storage
+    let dataCache = {};
+    const modifiedEntities = new Set();  // Track entities modified during this hook
+    let entityAliasMap = {};
+    let Library = {};
+
+    // Runtime configurations (loaded from [SANE_RUNTIME] cards)
+    let runtimeTools = {};
+    let inputCommands = {};
+    let inputModifier = null;
+    let contextModifier = null;
+    let outputModifier = null;
+
+    // Parsing patterns
+    const TOOL_PATTERN = /\b([a-z_]+)\(([^)]*)\)/g;
+    const COMMAND_PATTERN = /\/([a-z_]+)(?:\s+([^\n/]*))?/gi;
+    const GETTER_PATTERN = /get\[([^\]]+)\]/gi;
+
+    // Zero-width character to prevent empty output errors
+    const ZERO_WIDTH_CHAR = '\u200B';
+
+    const HIDE_BEGINNING = '<<<'
+    const HIDE_ENDING = '>>>'
+
+    // Scene management
+    let currentScene = null;
+    let currentHash = null;
+
+    // Entity tracker (must be defined early for tool processing)
+    const entityTracker = {
+        unknown: {},       // Track entities referenced but not found
+        unknownTools: {},  // Track unknown tools from AI
+        queue: [],         // Queue for entities pending generation
+        threshold: 3,      // Default threshold for auto-generation
+        autoGenerate: true // Whether to auto-generate entities
     };
-    
-    function logDebugTurn(hook, inputText, outputText, extraData = {}) {
-        if (!debug) return;
-        
-        initDebugLogging();
-        
-        const turnData = {
-            hook: hook,
-            actionCount: info?.actionCount || state.actionCount || 0,
-            events: [...currentTurnEvents], // Capture all events for this turn
-            ...extraData // Include all extra data passed in
+
+    // Initialize Library with external dependencies
+    Library.Utilities = Utilities;
+    if (typeof Calendar !== 'undefined') {
+        Library.Calendar = Calendar;
+    }
+
+    // Debug logging functions
+    let debugLogStore, debugLog, getDebugLog, logTime;
+    (function initDebugFunctions() {
+        debugLogStore = {
+            entries: [],
+            maxEntries: 100,
+            errors: []
         };
-        
-        // Clear events after capturing
-        currentTurnEvents = [];
-        
-        // Store hook-specific data
-        if (hook === 'input') {
-            // Track any commands processed
-            if (inputText && inputText.includes('/')) {
-                turnData.commandDetected = true;
-                // Extract command names
-                const commandMatches = inputText.match(/\/([a-z_]+)/gi);
-                if (commandMatches) {
-                    turnData.commands = commandMatches;
-                }
-            }
-        } else if (hook === 'context') {
-            // Track context size
-            turnData.contextSize = inputText ? inputText.length : 0;
-        } else if (hook === 'output') {
-            // Check for tools in output
-            const toolMatches = outputText ? outputText.match(/([a-z_]+)\s*\([^)]*\)/gi) : [];
-            if (toolMatches && toolMatches.length > 0) {
-                turnData.toolsInOutput = toolMatches;
-            }
-            
-            // Capture RewindSystem data - store only essential info to prevent memory issues
-            let rewindData = {
-                cards: [],
-                totalEntries: 0,
-                position: -1
+
+        debugLog = function(category, message) {
+            if (!debug) return;
+            const entry = {
+                time: Date.now() - startTime,
+                category,
+                message
             };
-            
-            try {
-                const rewindCards = RewindSystem.getAllCards();
-                rewindCards.forEach(card => {
-                    // For each entry, store only hash and tools (not full text)
-                    const compactEntries = (card.data?.entries || []).map(entry => {
-                        if (!entry) return null;
-                        // Keep only essential fields
-                        return {
-                            h: entry.h,  // hash
-                            t: entry.t   // tools (if any)
-                        };
-                    }).filter(e => e !== null);
-                    
-                    const cardData = {
-                        title: card.title,
-                        entries: compactEntries,
-                        position: card.data ? card.data.position : -1
-                    };
-                    rewindData.cards.push(cardData);
-                    rewindData.totalEntries += compactEntries.length;
-                    if (cardData.position > rewindData.position) {
-                        rewindData.position = cardData.position;
-                    }
-                });
-            } catch (e) {
-                // If cards are deleted or corrupted, at least we tried
-                rewindData.error = e.toString();
-                logError(e, 'Failed to read RewindSystem cards');
+            debugLogStore.entries.push(entry);
+            if (debugLogStore.entries.length > debugLogStore.maxEntries) {
+                debugLogStore.entries.shift();
             }
-            
-            // Store the compact RewindSystem data in state as backup
-            turnData.rewindData = rewindData;
-            
-            // Track state size at this point
-            turnData.stateSizeAtTurn = JSON.stringify(state).length;
-        }
-        
-        // Only store turns that have meaningful data
-        const hasEvents = turnData.events && turnData.events.length > 0;
-        const hasTools = turnData.toolsExecuted && turnData.toolsExecuted.length > 0;
-        const hasInput = turnData.hook === 'input' && (turnData.commandDetected || turnData.inputSummary?.startsWith('/'));
-        const hasEntityQueued = turnData.entityQueued;
-        const hasGenerationWizard = turnData.generationWizardActive;
-        
-        // Skip storing empty context hooks and output hooks with only "Loaded 1 runtime tools"
-        const isEmptyContext = turnData.hook === 'context' && !hasEvents;
-        const isBoringOutput = turnData.hook === 'output' && 
-            !hasTools && !hasEntityQueued && !hasGenerationWizard &&
-            (!hasEvents || (turnData.events.length === 1 && turnData.events[0].includes('Loaded 1 runtime tools')));
-        
-        if (!isEmptyContext && !isBoringOutput) {
-            // This turn has meaningful data, store it
-            state.debugLog.turns.push(turnData);
-            
-            // Keep only last MAX_DEBUG_TURNS
-            if (state.debugLog.turns.length > MAX_DEBUG_TURNS) {
-                state.debugLog.turns = state.debugLog.turns.slice(-MAX_DEBUG_TURNS);
-            }
-        }
-        
-        // Store complete RewindSystem data as backup (includes position info)
-        state.debugLog.lastRewindData = turnData.rewindData;
-    }
-    
-    function outputDebugLog() {
-        if (!debug) {
-            return "Debug mode is not enabled. Set debug = true in GameState.js to enable debug logging.";
-        }
-        
-        if (!state.debugLog || !state.debugLog.turns || state.debugLog.turns.length === 0) {
-            return "No debug logs available yet.";
-        }
-        
-        // Build comprehensive debug output
-        let output = `# Debug Log Report\n`;
-        output += `Generated: ${new Date().toISOString()}\n\n`;
-        
-        output += `## Recent Actions\n\n`;
-        
-        state.debugLog.turns.forEach((turn, index) => {
-            // Skip input hooks entirely
-            if (turn.hook === 'input') {
-                return; // Skip all input hooks
-            }
-            
-            // Skip context hooks that have no events or useful info
-            if (turn.hook === 'context' && (!turn.events || turn.events.length === 0)) {
-                return; // Skip this turn entirely
-            }
-            
-            // Skip output hooks that only loaded runtime tools and nothing else
-            if (turn.hook === 'output' && turn.events && turn.events.length === 1 && 
-                turn.events[0].includes('Loaded 1 runtime tools') &&
-                !turn.entityQueued && !turn.generationWizardActive) {
-                return; // Skip this turn entirely
-            }
-            
-            output += `### Action ${turn.actionCount} - ${turn.hook.toUpperCase()} Hook\n`;
-            
-            // Show hook-specific debug info
-            if (turn.hook === 'input') {
-                if (turn.commands) output += `Commands: ${turn.commands.join(', ')}\n`;
-            } else if (turn.hook === 'context') {
-                if (turn.contextSize) output += `Context Size: ${turn.contextSize} chars\n`;
-                if (turn.triggerNamesReplaced) output += `Trigger Names Replaced: ${turn.triggerNamesReplaced}\n`;
-                if (turn.gettersReplaced && Object.keys(turn.gettersReplaced).length > 0) {
-                    const getterList = Object.entries(turn.gettersReplaced)
-                        .map(([name, count]) => count > 1 ? `${name}(${count})` : name)
-                        .join(', ');
-                    output += `Getters Replaced: ${getterList}\n`;
-                }
-                if (turn.variablesReplaced) output += `Variables Replaced: ${turn.variablesReplaced}\n`;
-            } else if (turn.hook === 'output') {
-                if (turn.toolsInOutput) output += `Tools in Output: ${turn.toolsInOutput.length}\n`;
-                if (turn.entityQueued) output += `Entity Queued: ${turn.entityQueued}\n`;
-                if (turn.generationWizardActive) output += `GenerationWizard Active: ${turn.generationWizardActive}\n`;
-            }
-            
-            // Show processing events for this turn
-            if (turn.events && turn.events.length > 0) {
-                output += `\n#### Processing Events:\n`;
-                turn.events.forEach(event => {
-                    output += `${event}\n`;
-                });
-            }
-            
-            output += `\n---\n`;
-        });
-        
-        // Get COMPLETE RewindSystem data from the separate storage
-        let latestRewindData = state.debugLog.lastRewindData;
-        
-        // Build hash to execution times mapping
-        const hashToTimes = {};
-        if (state.times && state.times.length > 0) {
-            state.times.forEach(entry => {
-                if (entry.hash && entry.hash !== 'pending') {
-                    if (!hashToTimes[entry.hash]) {
-                        hashToTimes[entry.hash] = [];
-                    }
-                    hashToTimes[entry.hash].push({
-                        hook: entry.hook,
-                        duration: entry.duration
-                    });
-                }
-            });
-        }
-        
-        // Add RewindSystem data with execution times
-        output += `## Rewind System Data (with Execution Times)\n\n`;
-        
-        if (latestRewindData) {
-            if (latestRewindData.error) {
-                output += `ERROR: ${latestRewindData.error}\n\n`;
-            }
-            
-            // Show each card and ALL its entries
-            latestRewindData.cards.forEach((card, cardIndex) => {
-                output += `### ${card.title} (${card.entries.length} entries, position: ${card.position})\n`;
-                
-                if (card.entries.length > 0) {
-                    card.entries.forEach((entry, entryIndex) => {
-                        output += `[${entryIndex}]: `;
-                        if (entry) {
-                            if (entry.h) output += `hash:${entry.h.substring(0, 8)} `;
-                            
-                            // Check if this is an input entry (has input timing)
-                            const hasInputTiming = entry.h && hashToTimes[entry.h] && 
-                                                  hashToTimes[entry.h].some(t => t.hook === 'input');
-                            
-                            if (hasInputTiming) {
-                                // Input entries show commands instead of tools
-                                output += `(player input)`;
-                            } else if (entry.t && entry.t.length > 0) {
-                                // Output entries show tools
-                                const toolList = entry.t.map(t => {
-                                    if (Array.isArray(t)) {
-                                        return `${t[0]}(${t[1] ? t[1].join(',') : ''})`;
-                                    }
-                                    return String(t);
-                                }).join(', ');
-                                output += `tools:[${toolList}]`;
-                            } else {
-                                output += `no tools`;
-                            }
-                            
-                            // Add execution times if available
-                            if (entry.h && hashToTimes[entry.h]) {
-                                const times = hashToTimes[entry.h];
-                                const timesStr = times.map(t => `${t.hook}:${t.duration}ms`).join(', ');
-                                output += ` | times:[${timesStr}]`;
-                            }
-                        } else {
-                            output += `null entry`;
-                        }
-                        output += `\n`;
-                    });
-                } else {
-                    output += `(no entries)\n`;
-                }
-                output += `\n`;
-            });
-        } else {
-            output += `No rewind data found in stored turns.\n\n`;
-        }
-        
-        // Add ALL ERRORS from the entire adventure
-        if (state.debugLog.allErrors && state.debugLog.allErrors.length > 0) {
-            output += `## Recent Errors (Rolling History)\n\n`;
-            output += `Showing: ${state.debugLog.allErrors.length} errors\n\n`;
-            
-            state.debugLog.allErrors.forEach((err, index) => {
-                output += `### Error ${index + 1} (Action ${err.actionCount})\n`;
-                output += `Time: ${err.timestamp}\n`;
-                output += `Context: ${err.context}\n`;
-                output += `Error: ${err.error}\n`;
-                if (err.stack) {
-                    output += `Stack:\n\`\`\`\n${err.stack}\n\`\`\`\n`;
-                }
-                output += `\n`;
-            });
-            output += `---\n`;
-        }
-        
-        // Add execution time averages and context info
-        if (state.times && state.times.length > 0) {
-            output += `## Execution Time Summary\n\n`;
-            
-            const byHook = {
-                input: state.times.filter(t => t.hook === 'input'),
-                context: state.times.filter(t => t.hook === 'context'),  
-                output: state.times.filter(t => t.hook === 'output')
-            };
-            
-            ['input', 'context', 'output'].forEach(hookType => {
-                const entries = byHook[hookType];
-                if (entries && entries.length > 0) {
-                    const average = Math.round(entries.reduce((sum, e) => sum + e.duration, 0) / entries.length);
-                    const max = Math.max(...entries.map(e => e.duration));
-                    const min = Math.min(...entries.map(e => e.duration));
-                    output += `${hookType.toUpperCase()}: avg ${average}ms (min ${min}ms, max ${max}ms) from ${entries.length} samples\n`;
-                }
-            });
-            
-            // Add context length
-            if (state.lastContextLength !== undefined) {
-                output += `\nLast Context Length: ${state.lastContextLength} characters\n`;
-            }
-        }
-        
-        // Save to Story Card using upsert
-        const debugCard = {
-            title: '[DEBUG] Debug Log',
-            type: 'data',
-            description: output,
-            entry: `Debug log generated at ${new Date().toISOString()}\nUse /debug_log to update this card.`
+            console.log(`${MODULE_NAME} [${category}]: ${message}`);
         };
-        
-        Utilities.storyCard.upsert(debugCard);
-        
-        // Pin debug card after player cards for easy access
-        try {
-            const debugCardObj = Utilities.storyCard.get('[DEBUG] Debug Log');
-            if (debugCardObj && typeof storyCards !== 'undefined' && storyCards.length > 1) {
-                // Sort by update time (newest first)
-                storyCards.sort((a, b) => {
-                    const timeA = a.updatedAt ? Date.parse(a.updatedAt) : 0;
-                    const timeB = b.updatedAt ? Date.parse(b.updatedAt) : 0;
-                    return timeB - timeA;
-                });
-                
-                // Count player cards at top
-                let playerCount = 0;
-                for (const card of storyCards) {
-                    if (card && card.title && card.title.startsWith('[PLAYER]')) {
-                        playerCount++;
-                    } else {
-                        break; // Stop when we hit non-player cards
-                    }
-                }
-                
-                // Move debug card after player cards
-                const debugIndex = storyCards.findIndex(card => card.title === '[DEBUG] Debug Log');
-                if (debugIndex >= 0 && debugIndex !== playerCount) {
-                    const [debugEntry] = storyCards.splice(debugIndex, 1);
-                    storyCards.splice(playerCount, 0, debugEntry);
-                }
+
+        getDebugLog = function() {
+            return debugLogStore.entries.map(e =>
+                `[${e.time}ms] ${e.category}: ${e.message}`
+            ).join('\n');
+        };
+
+        logTime = function() {
+            if (MODULE_CONFIG.debug) {
+                const elapsed = Date.now() - startTime;
+                debugLog('performance', `Hook ${hook} completed in ${elapsed}ms`);
             }
-        } catch (e) {
-            // Ignore pinning errors - not critical
-        }
-        
-        return `Debug log saved to [DEBUG] Debug Log story card.`;
+        };
+    })();
+
+    //#endregion SECTION 1
+
+    // ========================================
+    // SECTION 2: CORE DATA MANAGEMENT
+    // ========================================
+    //#region SECTION 2
+
+    // ========================================
+    // SECTION 2A: UNIVERSAL DATA ACCESS
+    // ========================================
+    //#region SECTION 2A
+
+    // Normalize entity ID for case-insensitive operations
+    function normalizeEntityId(entityId) {
+        if (!entityId || typeof entityId !== 'string') return entityId;
+        return entityId.toLowerCase();
     }
-    
-    // ==========================
-    // Universal Data System
-    // ==========================
-    
-    // Cache for discovered schemas
-    let schemaRegistry = null;
-    
-    // Cache for field configurations  
-    // REMOVED: fieldConfigCache - part of removed SANE_FIELDS system
-    
-    // Pre-built alias mapping for efficient lookups
-    // Maps lowercase aliases -> canonical schema name
-    let schemaAliasMap = null;
-    
-    // Removed - now combined with entityCardMap for single-lookup efficiency
-    
-    // Discover all available schemas and build registry
-    function initializeSchemaRegistry() {
-        if (schemaRegistry !== null) return schemaRegistry;
-        
-        schemaRegistry = {};
-        const componentRegistry = {}; // Store component schemas separately
-        
-        // First, load component definitions from [SANE_COMP] cards
-        const compCards = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[SANE_COMP]'),
-            true // Get all matches
-        );
-        
-        for (const card of compCards || []) {
-            const match = card.title.match(/\[SANE_COMP\]\s+(.+)/);
-            if (!match) continue;
-            
-            const compName = match[1].trim();
-            try {
-                // Parse component definition from description field
-                const compDef = JSON.parse(card.description || '{}');
-                componentRegistry[compName] = {
-                    name: compName,
-                    fields: compDef.fields || {},
-                    defaults: compDef.defaults || {}
-                };
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse component ${compName}: ${e.message}`);
-            }
-        }
-        
-        // Then load entity types from [SANE_ENTITY] cards
-        const entityCards = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[SANE_ENTITY]'),
-            true // Get all matches
-        );
-        
-        for (const card of entityCards || []) {
-            const match = card.title.match(/\[SANE_ENTITY\]\s+(.+)/);
-            if (!match) continue;
-            
-            const entityType = match[1].trim();
-            try {
-                // Parse entity definition from description field
-                const entityDef = JSON.parse(card.description || '{}');
-                schemaRegistry[entityType] = {
-                    name: entityType,
-                    type: entityType,
-                    components: entityDef.components || [],
-                    prefixes: entityDef.prefixes || [entityType.toUpperCase()],
-                    dataOnly: entityDef.dataOnly || false,
-                    singleton: entityDef.singleton || false
-                };
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse entity type ${entityType}: ${e.message}`);
-            }
-        }
-        
-        // Store component registry globally for access
-        schemaRegistry._components = componentRegistry;
-        
-        // Build aliases map for quick lookup
-        const aliasMap = {};
-        for (const [name, schema] of Object.entries(schemaRegistry)) {
-            if (schema.aliases) {
-                for (const alias of schema.aliases) {
-                    aliasMap[alias] = name;
-                }
-            }
-        }
-        schemaRegistry._aliases = aliasMap;
-        
-        if (debug) {
-            log(`${MODULE_NAME}: Registered ${Object.keys(schemaRegistry).length} entity schemas`);
-            log(`${MODULE_NAME}: Registered ${Object.keys(componentRegistry).length} component schemas`);
-        }
-        
-        // Ensure Runtime is always available even without explicit schema
-        if (!schemaRegistry['Global']) {
-            schemaRegistry['Global'] = {
-                name: 'Global',
-                prefixes: [],
-                storageType: 'global'
-            };
-        }
-        
-        // Build the complete alias map for O(1) lookups
-        schemaAliasMap = {};
-        for (const [schemaName, schema] of Object.entries(schemaRegistry)) {
-            // Add the schema name itself (normalized)
-            schemaAliasMap[schemaName.toLowerCase()] = schemaName;
-            
-            // Add all defined aliases
-            if (schema.aliases) {
-                for (const alias of schema.aliases) {
-                    schemaAliasMap[alias.toLowerCase()] = schemaName;
-                }
-            }
-            
-            // Add all prefixes as aliases
-            if (schema.prefixes) {
-                for (const prefix of schema.prefixes) {
-                    schemaAliasMap[prefix.toLowerCase()] = schemaName;
-                }
-            }
-        }
-        
-        if (debug) log(`${MODULE_NAME}: Built alias map with ${Object.keys(schemaAliasMap).length} entries`);
-        
-        // Create default components and entities if they don't exist
-        initializeDefaultComponents();
-        
-        // Create default FORMAT cards if they don't exist
-        initializeDefaultFormatCards();
-        
-        return schemaRegistry;
-    }
-    
-    // Create default component and entity cards if they don't exist
-    function initializeDefaultComponents() {
-        // Stats component with level containing xp
-        if (!Utilities.storyCard.get('[SANE_COMP] stats')) {
-            const statsComponent = {
-                title: '[SANE_COMP] stats',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {
-                        level: {
-                            value: 1,
-                            xp: { current: 0, max: 500 }
-                        },
-                        hp: { current: 100, max: 100 }
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(statsComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created stats component`);
-        }
-        
-        // Info component
-        if (!Utilities.storyCard.get('[SANE_COMP] info')) {
-            const infoComponent = {
-                title: '[SANE_COMP] info',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {
-                        gender: 'Unknown',
-                        race: 'Human',
-                        class: 'Adventurer',
-                        location: 'Unknown'
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(infoComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created info component`);
-        }
-        
-        // Skills component with registry and formulas
-        if (!Utilities.storyCard.get('[SANE_COMP] skills')) {
-            const skillsComponent = {
-                title: '[SANE_COMP] skills',
-                type: 'component', 
-                description: JSON.stringify({
-                    defaults: {},
-                    categories: {
-                        "combat": { "xp_formula": "level * 80" },
-                        "crafting": { "xp_formula": "level * 150" },
-                        "social": { "xp_formula": "level * 120" },
-                        "gathering": { "xp_formula": "level * 130" },
-                        "support": { "xp_formula": "level * 90" }
-                    },
-                    registry: {
-                        "one_handed_sword": { "category": "combat" },
-                        "katana": { "category": "combat", "xp_formula": "level * 200" },
-                        "two_handed_sword": { "category": "combat" },
-                        "rapier": { "category": "combat" },
-                        "dagger": { "category": "combat" },
-                        "spear": { "category": "combat" },
-                        "shield": { "category": "combat" },
-                        "parry": { "category": "combat" },
-                        "meditation": { "category": "support" },
-                        "detection": { "category": "support" },
-                        "hiding": { "category": "support" },
-                        "alchemy": { "category": "crafting" },
-                        "blacksmithing": { "category": "crafting" },
-                        "tailoring": { "category": "crafting" },
-                        "cooking": { "category": "crafting" },
-                        "fishing": { "category": "gathering" },
-                        "herbalism": { "category": "gathering" },
-                        "mining": { "category": "gathering" },
-                        "woodcutting": { "category": "gathering" },
-                        "negotiation": { "category": "social" },
-                        "intimidation": { "category": "social" },
-                        "persuasion": { "category": "social" },
-                        "deception": { "category": "social" },
-                        "insight": { "category": "social" },
-                        "leadership": { "category": "social" },
-                        "first_aid": { "category": "support" },
-                        "tracking": { "category": "support" },
-                        "stealth": { "category": "support" },
-                        "lockpicking": { "category": "support" },
-                        "acrobatics": { "category": "support" },
-                        "night_vision": { "category": "support" },
-                        "battle_healing": { "category": "support" },
-                        "emergency_recovery": { "category": "support" },
-                        "sprint": { "category": "support" },
-                        "extended_weight_limit": { "category": "support" },
-                        "martial_arts": { "category": "combat" },
-                        "throwing": { "category": "combat" },
-                        "archery": { "category": "combat" }
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(skillsComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created skills component with registry`);
-        }
-        
-        // Attributes component
-        if (!Utilities.storyCard.get('[SANE_COMP] attributes')) {
-            const attributesComponent = {
-                title: '[SANE_COMP] attributes',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {},
-                    registry: {
-                        "VITALITY": { 
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases max HP"
-                        },
-                        "STRENGTH": {
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases physical damage"
-                        },
-                        "DEXTERITY": {
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases accuracy and crit chance"
-                        },
-                        "AGILITY": {
-                            "formula": "10 + (level - 1) * 2",
-                            "description": "Increases evasion and speed"
-                        }
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(attributesComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created attributes component`);
-        }
-        
-        // Inventory component
-        if (!Utilities.storyCard.get('[SANE_COMP] inventory')) {
-            const inventoryComponent = {
-                title: '[SANE_COMP] inventory',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {}
-                }, null, 2)
-            };
-            Utilities.storyCard.add(inventoryComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created inventory component`);
-        }
-        
-        // Relationships component with thresholds
-        if (!Utilities.storyCard.get('[SANE_COMP] relationships')) {
-            const relationshipsComponent = {
-                title: '[SANE_COMP] relationships',
-                type: 'component',
-                description: JSON.stringify({
-                    defaults: {},
-                    thresholds: {
-                        "Stranger": 0,
-                        "Acquaintance": 10,
-                        "Friend": 30,
-                        "Close Friend": 60,
-                        "Best Friend": 100,
-                        "Trusted Ally": 150,
-                        "Rival": -10,
-                        "Enemy": -30,
-                        "Nemesis": -60,
-                        "Arch-Enemy": -100
-                    }
-                }, null, 2)
-            };
-            Utilities.storyCard.add(relationshipsComponent);
-            if (debug) console.log(`${MODULE_NAME}: Created relationships component`);
-        }
-        
-        // Character entity type
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Character')) {
-            const characterEntity = {
-                title: '[SANE_ENTITY] Character',
-                type: 'entity',
-                description: JSON.stringify({
-                    components: ['info', 'stats', 'skills', 'attributes', 'inventory', 'relationships'],
-                    prefixes: ['CHARACTER', 'PLAYER'],
-                    aliases: ['char', 'c'],
-                    dataOnly: false
-                }, null, 2)
-            };
-            Utilities.storyCard.add(characterEntity);
-            if (debug) console.log(`${MODULE_NAME}: Created Character entity type`);
-        }
-        
-        // Location entity type
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Location')) {
-            const locationEntity = {
-                title: '[SANE_ENTITY] Location',
-                type: 'entity',
-                description: JSON.stringify({
-                    components: [],
-                    prefixes: ['LOCATION'],
-                    aliases: ['loc', 'l'],
-                    dataOnly: false
-                }, null, 2)
-            };
-            Utilities.storyCard.add(locationEntity);
-            if (debug) console.log(`${MODULE_NAME}: Created Location entity type`);
-        }
-        
-        // Global entity type (singleton)
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Global')) {
-            const globalEntity = {
-                title: '[SANE_ENTITY] Global',
-                type: 'entity',
-                description: JSON.stringify({
-                    components: [],
-                    prefixes: [],
-                    aliases: ['runtime', 'global'],
-                    singleton: true,
-                    dataOnly: true
-                }, null, 2)
-            };
-            Utilities.storyCard.add(globalEntity);
-            if (debug) console.log(`${MODULE_NAME}: Created Global entity type`);
-        }
-    }
-    
-    // Create default FORMAT cards for entities that need them
-    function initializeDefaultFormatCards() {
-        // Default CHARACTER FORMAT (for NPCs)
-        if (!Utilities.storyCard.get('[SANE_FORMAT] CHARACTER')) {
-            const characterFormat = {
-                title: '[SANE_FORMAT] CHARACTER',
-                type: 'schema',
-                entry: '// Computed fields\n' +
-                    'info_line: {info.dob?DOB\\: $(info.dob) | }Gender: $(info.gender) | Level: $(stats.level.value) ($(stats.level.xp.current)/$(stats.level.xp.max)) | HP: $(stats.hp.current)/$(stats.hp.max) | Location: $(info.location)\n',
-                description: '<$# Character>\n' +
-                    '## **{name}**{info.full_name? [{info.full_name}]}\n' +
-                    '{info_line}\n' +
-                    '{info.appearance?**Appearance**\n{info.appearance}\n}' +
-                    '{info.personality?**Personality**\n{info.personality}\n}' +
-                    '{info.background?**Background**\n{info.background}\n}' +
-                    '{attributes?**Attributes**\n{attributes.*|{*}: {*.value}}\n}' +
-                    '{skills?**Skills**\n{skills.*:• {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}\n}' +
-                    '{inventory?**Inventory**\n{inventory.*:• {*} x{*.quantity}}\n}' +
-                    '{relationships?**Relationships**\n{relationships.*:• {*}: {*.}}}' +
-                    '{misc?{misc}}'
-            };
-            Utilities.storyCard.add(characterFormat);
-            if (debug) console.log(`${MODULE_NAME}: Created default FORMAT card for CHARACTER`);
-        }
-        
-        // Default PLAYER FORMAT
-        if (!Utilities.storyCard.get('[SANE_FORMAT] PLAYER')) {
-            const playerFormat = {
-                title: '[SANE_FORMAT] PLAYER',
-                type: 'schema',
-                entry: '// Computed fields\n' +
-                    'info_line: {info.dob?DOB\\: $(info.dob) | }Gender: $(info.gender) | Level: $(stats.level.value) ($(stats.level.xp.current)/$(stats.level.xp.max)) | HP: $(stats.hp.current)/$(stats.hp.max) | Location: $(info.location)\n',
-                description: '<$# User>\n' +
-                    '## **{name}**{info.full_name? [{info.full_name}]}\n' +
-                    '{info_line}\n' +
-                    '{info.appearance?**Appearance**\n{info.appearance}\n}' +
-                    '{info.personality?**Personality**\n{info.personality}\n}' +
-                    '{info.background?**Background**\n{info.background}\n}' +
-                    '**Attributes**\n{attributes.*|{*}: {*.value}}\n' +
-                    '**Skills**\n{skills.*:• {*}\\: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}\n' +
-                    '**Inventory**\n{inventory.*:• {*} x{*.quantity}}\n' +
-                    '==={name} is a USER. Do not act or speak for them.==='
-            };
-            
-            Utilities.storyCard.add(playerFormat);
-            if (debug) console.log(`${MODULE_NAME}: Created default FORMAT card for PLAYER`);
-        }
-        
-        // Default Location FORMAT  
-        if (!Utilities.storyCard.get('[SANE_FORMAT] Location')) {
-            const locationFormat = {
-                title: '[SANE_FORMAT] Location',
-                type: 'schema',
-                entry: '// Computed fields\n' +
-                    'info_line: {info.type?Type: {info.type}}{info.floor? | Floor: {info.floor}}{info.district? | District: {info.district}}\n' +
-                    '\n' +
-                    '// Format hints\n' +
-                    'format:connections: directional\n' +
-                    'format:inhabitants: bullets',
-                description: '<$# Location>\n' +
-                    '## **{name}**\n' +
-                    '{info_line}\n' +
-                    '{info.description?**Description**\n' +
-                    '{info.description}}\n' +
-                    '{connections?**Connections**\n' +
-                    '{connections_formatted}}\n' +
-                    '{info.features?**Notable Features**\n' +
-                    '{info.features}}'
-            };
-            Utilities.storyCard.add(locationFormat);
-            if (debug) console.log(`${MODULE_NAME}: Created default FORMAT card for Location`);
-        }
-    }
-    
-    // Universal getter function - access any data via path
+
     // Resolve dynamic expressions in paths
-    // Examples:
-    // "Character.$(player).level" -> "Character.Bob.level" (if player = "Bob")
-    // "Location.$(Character.Bob.location).type" -> "Location.Somewhere_Over_There.type"
     function resolve(path) {
         if (!path || typeof path !== 'string') return path;
-        
+
         // Replace all $(expression) with their evaluated results
         return path.replace(/\$\((.*?)\)/g, function(match, expression) {
-            // Recursively resolve the expression
-            const resolved = resolve(expression);
-            // Get the value at that path
-            const value = get(resolved);
-            // Return the value as a string for path construction
-            return value !== undefined && value !== null ? String(value) : match;
+            // Handle array access: Global.party[0]
+            const arrayMatch = expression.match(/^(.+)\[(\d+)\]$/);
+            if (arrayMatch) {
+                const arrayPath = arrayMatch[1];
+                const index = parseInt(arrayMatch[2]);
+                const array = get(arrayPath);
+
+                if (Array.isArray(array) && index >= 0 && index < array.length) {
+                    return array[index];
+                }
+                return match; // Return unchanged if not valid
+            }
+
+            // Handle nested resolution: Global.party[$(Global.index)]
+            if (expression.includes('$(')) {
+                expression = resolve(expression);
+            }
+
+            // Simple field resolution
+            const value = get(expression);
+            if (value !== undefined && value !== null) {
+                return String(value);
+            }
+
+            return match; // Return unchanged if not found
         });
     }
-    
+
+    // Universal getter function
     function get(path) {
         if (!path) return undefined;
-        
-        // First resolve any dynamic expressions in the path
-        const resolvedPath = resolve(path);
-        if (resolvedPath !== path) {
-            path = resolvedPath;
-        }
-        
-        // Parse path: "Character.Bob.level" or "Global.currentPlayer"
+
+        // Resolve any dynamic expressions first
+        path = resolve(path);
+
+        // Parse the path
         const parts = path.split('.');
-        if (parts.length < 2) return undefined;
-        
-        const objectType = parts[0];
-        const entityName = parts[1];
-        const fieldPath = parts.slice(2).join('.');
-        
-        // Special case for Global variables
-        if (objectType === 'Global') {
-            const value = getGlobalValue(entityName);
-            if (value === null) return undefined;
-            return fieldPath ? getNestedField(value, fieldPath) : value;
+        if (parts.length === 0) return undefined;
+
+        // First part is the entity ID or special accessor
+        let entityId = parts[0];
+
+        // Handle special accessors
+        switch(entityId.toLowerCase()) {
+            case 'global':
+                entityId = 'Global';
+                break;
+            case 'time':
+            case 'calendar':
+                if (typeof Calendar !== 'undefined' && Calendar) {
+                    if (parts.length === 1) return Calendar.getCurrentTime ? Calendar.getCurrentTime() : null;
+
+                    const timeProp = parts[1]?.toLowerCase();
+                    switch(timeProp) {
+                        case 'time':
+                        case 'current':
+                            return Calendar.getCurrentTime ? Calendar.getCurrentTime() : null;
+                        case 'formatted':
+                            return Calendar.getFormattedTime ? Calendar.getFormattedTime() : null;
+                        case 'period':
+                        case 'timeofday':
+                            return Calendar.getTimeOfDay ? Calendar.getTimeOfDay() : null;
+                        case 'date':
+                            return Calendar.getCurrentDate ? Calendar.getCurrentDate() : null;
+                        case 'formatteddate':
+                            if (Calendar.getDayNumber) {
+                                const dayNumber = Calendar.getDayNumber();
+                                const startDate = new Date(2022, 10, 6); // Nov 6, 2022
+                                const currentDateObj = new Date(startDate);
+                                currentDateObj.setDate(currentDateObj.getDate() + dayNumber - 1);
+
+                                const monthNames = ["January", "February", "March", "April", "May", "June",
+                                    "July", "August", "September", "October", "November", "December"];
+                                const month = monthNames[currentDateObj.getMonth()];
+                                const day = currentDateObj.getDate();
+                                const year = currentDateObj.getFullYear();
+                                return `${month} ${day}, ${year}`;
+                            }
+                            return null;
+                        case 'day':
+                        case 'daynumber':
+                            return Calendar.getDayNumber ? Calendar.getDayNumber().toString() : null;
+                        case 'season':
+                            return Calendar.getCurrentSeason ? Calendar.getCurrentSeason() : null;
+                    }
+                }
+                return null;
         }
-        
-        // Load the entity using our simplified load function
-        const entity = load(objectType, entityName);
-        if (!entity) return undefined;
-        return fieldPath ? getNestedField(entity, fieldPath) : entity;
-    }
-    
-    // Universal setter function - set any data via path
-    function set(path, value) {
-        if (!path) return false;
-        
-        // First resolve any dynamic expressions in the path
-        const resolvedPath = resolve(path);
-        if (resolvedPath !== path) {
-            path = resolvedPath;
-        }
-        
-        // Parse path: "Character.Bob.level" or "Global.currentPlayer"
-        const parts = path.split('.');
-        if (parts.length < 2) return false;
-        
-        const objectType = parts[0];
-        const entityName = parts[1];
-        const fieldPath = parts.slice(2).join('.');
-        
-        // Special case for Global variables
-        if (objectType === 'Global') {
-            if (fieldPath) {
-                // Get current value, modify nested field, save back
-                let currentValue = getGlobalValue(entityName) || {};
-                setNestedField(currentValue, fieldPath, value);
-                return setGlobalValue(entityName, currentValue);
-            } else {
-                return setGlobalValue(entityName, value);
+
+        // Normalize for case-insensitive lookup
+        const normalizedId = normalizeEntityId(entityId);
+
+        // Check alias map first
+        const resolvedId = entityAliasMap[normalizedId] || entityId;
+        const normalizedResolvedId = normalizeEntityId(resolvedId);
+
+        // Get entity from cache using normalized key
+        let entity = dataCache[normalizedResolvedId];
+
+        // If not in cache, try to load it
+        if (!entity && !dataCache.hasOwnProperty(normalizedResolvedId)) {
+            entity = loadEntityFromCache(resolvedId);
+            if (entity) {
+                dataCache[normalizedResolvedId] = entity;
             }
         }
-        
-        // Load the entity
-        const entity = load(objectType, entityName);
-        if (!entity) {
-            if (debug) console.log(`${MODULE_NAME}: Entity not found: ${objectType}.${entityName}`);
-            return false;
+
+        // If just getting the entity itself
+        if (parts.length === 1) {
+            return entity;
         }
-        
-        // Modify the field
-        if (fieldPath) {
-            setNestedField(entity, fieldPath, value);
-        } else {
-            Object.assign(entity, value);
+
+        // Navigate the path
+        let current = entity;
+        for (let i = 1; i < parts.length; i++) {
+            if (!current || typeof current !== 'object') return undefined;
+            current = current[parts[i]];
         }
-        
-        // Save the entity back
-        return save(objectType, entity);
-    }
-    
-    // Helper to get nested field from any object
-    function getNestedField(obj, path) {
-        if (!obj || !path) return obj;
-        
-        const parts = path.split('.');
-        let current = obj;
-        
-        for (const part of parts) {
-            if (current === null || current === undefined) return undefined;
-            
-            // Handle array index notation [0]
-            const arrayMatch = part.match(/^(.+)\[(\d+)\]$/);
-            if (arrayMatch) {
-                current = current[arrayMatch[1]];
-                if (Array.isArray(current)) {
-                    current = current[parseInt(arrayMatch[2])];
-                }
-            } else {
-                // Try exact match first
-                if (current[part] !== undefined) {
-                    current = current[part];
-                } else if (typeof current === 'object') {
-                    // Try case-insensitive match
-                    const lowerPart = part.toLowerCase();
-                    const key = Object.keys(current).find(k => k.toLowerCase() === lowerPart);
-                    current = key ? current[key] : undefined;
-                } else {
-                    current = undefined;
-                }
-            }
-        }
-        
+
         return current;
     }
-    
-    // Helper to set nested field in any object
-    function setNestedField(obj, path, value) {
-        if (!obj || !path) return false;
-        
+
+    // Universal setter function
+    function set(path, value) {
+        if (!path) return false;
+
+        // Resolve any dynamic expressions
+        path = resolve(path);
+
         const parts = path.split('.');
-        let current = obj;
-        
-        for (let i = 0; i < parts.length - 1; i++) {
-            const part = parts[i];
-            
-            // Handle array index notation
-            const arrayMatch = part.match(/^(.+)\[(\d+)\]$/);
-            if (arrayMatch) {
-                const fieldName = arrayMatch[1];
-                const index = parseInt(arrayMatch[2]);
-                
-                if (!current[fieldName]) current[fieldName] = [];
-                if (!current[fieldName][index]) current[fieldName][index] = {};
-                current = current[fieldName][index];
-            } else {
-                if (!current[part]) current[part] = {};
-                current = current[part];
-            }
+        if (parts.length === 0) return false;
+
+        // Get or create entity
+        let entityId = parts[0];
+
+        // Handle special cases
+        if (entityId.toLowerCase() === 'global') {
+            entityId = 'Global';
         }
-        
-        // Set the final value
+
+        // Normalize ID
+        const normalizedId = normalizeEntityId(entityId);
+        const resolvedId = entityAliasMap[normalizedId] || normalizedId;  // Use normalized ID, not original
+
+        // Get or create entity (use normalized key for lookup)
+        let entity = dataCache[resolvedId];
+        if (!entity) {
+            // Create new entity
+            entity = { id: entityId };
+            dataCache[resolvedId] = entity;
+        }
+
+        // If setting the entity itself
+        if (parts.length === 1) {
+            dataCache[resolvedId] = value;
+            return true;
+        }
+
+        // Navigate to parent of target field
+        let current = entity;
+        for (let i = 1; i < parts.length - 1; i++) {
+            if (!current[parts[i]] || typeof current[parts[i]] !== 'object') {
+                current[parts[i]] = {};
+            }
+            current = current[parts[i]];
+        }
+
+        // Set the value
         const lastPart = parts[parts.length - 1];
-        const arrayMatch = lastPart.match(/^(.+)\[(\d+)\]$/);
-        if (arrayMatch) {
-            if (!current[arrayMatch[1]]) current[arrayMatch[1]] = [];
-            current[arrayMatch[1]][parseInt(arrayMatch[2])] = value;
+        if (value === null || value === undefined) {
+            delete current[lastPart];
         } else {
             current[lastPart] = value;
         }
-        
+
+        // Mark entity as modified (would trigger save in full implementation)
         return true;
     }
-    
-    // Aliases for compatibility with old code that used getNestedValue/setNestedValue
-    const getNestedValue = getNestedField;
-    const setNestedValue = setNestedField;
-    
-    // ==========================
-    // Location Helper Functions
-    // ==========================
-    function getOppositeDirection(direction) {
-        // Simple hardcoded opposites - could be moved to a component if needed
-        const opposites = {
-            'north': 'south',
-            'south': 'north',
-            'east': 'west',
-            'west': 'east',
-            'northeast': 'southwest',
-            'northwest': 'southeast',
-            'southeast': 'northwest',
-            'southwest': 'northeast',
-            'up': 'down',
-            'down': 'up',
-            'in': 'out',
-            'out': 'in',
-            'inside': 'outside',
-            'outside': 'inside',
-            'forward': 'back',
-            'back': 'forward',
-            'left': 'right',
-            'right': 'left'
-        };
-        
-        const lower = direction.toLowerCase();
-        const opposite = opposites[lower];
-        
-        // Return with same capitalization as input
-        if (opposite) {
-            if (direction[0] === direction[0].toUpperCase()) {
-                return opposite.charAt(0).toUpperCase() + opposite.slice(1);
-            }
-            return opposite;
-        }
-        
-        // No opposite found - return original
-        return direction;
+
+    //#endregion SECTION 2A
+
+    // ========================================
+    // SECTION 2C: ENTITY MANAGEMENT
+    // ========================================
+    //#region SECTION 2C
+
+    function loadEntityFromCache(entityId) {
+        // Since all entities are loaded at initialization, just check cache
+        const normalizedId = normalizeEntityId(entityId);
+        return dataCache[normalizedId] || null;
     }
-    
-    function getLocationPathways(locationName) {
-        // Get all pathways for a location
-        const location = load('Location', locationName);
-        if (!location) return {};
-        
-        return location.pathways || {};
-    }
-    
-    function removeLocationPathway(locationName, direction, removeBidirectional = true) {
-        // Remove a pathway from a location
-        const location = load('Location', locationName);
-        if (!location || !location.pathways) {
-            return false;
+
+    function save(entityId, entity, immediate = false) {
+        if (!entityId || !entity) return false;
+
+        const normalizedId = normalizeEntityId(entityId);
+        dataCache[normalizedId] = entity;
+
+        // Track this entity for batch saving unless immediate save requested
+        if (!immediate) {
+            modifiedEntities.add(normalizedId);
+            if (debug) console.log(`[SANE save]: Queued entity ${entityId} for batch save`);
+            return true;
         }
-        
-        const dirLower = direction.toLowerCase();
-        const destinationName = location.pathways[dirLower];
-        
-        if (!destinationName) {
-            return false; // Pathway doesn't exist
-        }
-        
-        // Remove the pathway
-        delete location.pathways[dirLower];
-        
-        // Save the updated location
-        const saved = save('Location', location);
-        
-        if (saved && removeBidirectional && destinationName) {
-            // Also remove reverse pathway
-            const destination = load('Location', destinationName);
-            if (destination && destination.pathways) {
-                const oppositeDir = getOppositeDirection(direction).toLowerCase();
-                delete destination.pathways[oppositeDir];
-                save('Location', destination);
-                
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Removed bidirectional pathway: ${locationName} -X- ${destinationName}`);
-                }
+
+        if (debug) console.log(`[SANE save]: Immediately saving entity ${entityId}`);
+
+        // Update alias map
+        if (entity.aliases && Array.isArray(entity.aliases)) {
+            for (const alias of entity.aliases) {
+                entityAliasMap[normalizeEntityId(alias)] = normalizedId;
             }
         }
-        
-        return saved;
-    }
-    
-    function updateLocationPathway(locationName, direction, destinationName, bidirectional = true) {
-        // Use universal load function
-        const location = load('Location', locationName);
-        if (!location) {
-            if (debug) console.log(`${MODULE_NAME}: Location not found: ${locationName}`);
-            return false;
-        }
-        
-        // Normalize direction
-        const dirLower = direction.toLowerCase();
-        
-        // Update pathways - works with both component and direct property
-        if (!location.pathways || typeof location.pathways !== 'object') {
-            location.pathways = {};
-        }
-        location.pathways[dirLower] = destinationName;
-        
-        // Save the updated location using universal save
-        const saved = save('Location', location);
-        
-        if (saved && bidirectional) {
-            // Also update the destination location with reverse pathway
-            const destination = load('Location', destinationName);
-            if (destination) {
-                const oppositeDir = getOppositeDirection(direction).toLowerCase();
-                
-                if (!destination.pathways || typeof destination.pathways !== 'object') {
-                    destination.pathways = {};
-                }
-                destination.pathways[oppositeDir] = locationName;
-                save('Location', destination);
-                
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Created bidirectional pathway: ${locationName} <-${direction}/${oppositeDir}-> ${destinationName}`);
-                }
-            }
-        } else if (saved) {
-            if (debug) {
-                console.log(`${MODULE_NAME}: Updated ${locationName} pathway ${direction} -> ${destinationName}`);
-            }
-        }
-        
-        return saved;
-    }
-    
-    // ==========================
-    // Global Variables System (Universal Data Integration)
-    // ==========================
-    // Global variables now use the universal load/save system
-    // They are stored as a special 'Global' entity type
-    
-    function loadGlobalVariables() {
-        // Global variables use [GLOBAL] Global card for singleton storage
-        const card = Utilities.storyCard.get('[GLOBAL] Global');
-        if (!card || !card.description) return {};
-        
+
+        // Save to Story Cards
         try {
-            // Try to parse as JSON first for complex data
-            return JSON.parse(card.description);
-        } catch (e) {
-            // Fall back to key:value format
-            const globalVars = {};
-            const lines = card.description.split('\n');
-            for (const line of lines) {
-                const colonIndex = line.indexOf(':');
-                if (colonIndex > 0) {
-                    const key = line.substring(0, colonIndex).trim();
-                    const value = line.substring(colonIndex + 1).trim();
-                    try {
-                        globalVars[key] = JSON.parse(value);
-                    } catch {
-                        globalVars[key] = value;
-                    }
-                }
-            }
-            return globalVars;
-        }
-    }
-    
-    function getGlobalValue(varName) {
-        const globalVars = loadGlobalVariables();
-        return globalVars[varName] !== undefined ? globalVars[varName] : null;
-    }
-    
-    function setGlobalValue(varName, value) {
-        const globalVars = loadGlobalVariables();
-        globalVars[varName] = value;
-        
-        // Save back as JSON for complex data support
-        return Utilities.storyCard.upsert('[GLOBAL] Global', {
-            entry: 'Global variable storage',
-            description: JSON.stringify(globalVars, null, 2)
-        });
-    }
-    
-    function deleteGlobalValue(varName) {
-        const globalVars = loadGlobalVariables();
-        if (!globalVars[varName]) return false;
-        
-        delete globalVars[varName];
-        
-        // Save back as JSON
-        return Utilities.storyCard.upsert('[GLOBAL] Data', {
-            entry: 'Global variable storage',
-            description: JSON.stringify(globalVars, null, 2)
-        });
-    }
-    
-    // ==========================
-    // Custom Tools Loading
-    // ==========================
-    
-    // Store for runtime-loaded tools
-    const runtimeTools = {};
-    
-    function loadRuntimeTools() {
-        // Load runtime tools from [SANE_RUNTIME] TOOLS card
-        const toolsCard = Utilities.storyCard.get('[SANE_RUNTIME] TOOLS');
-        if (!toolsCard) return;
-        
-        try {
-            // Parse the tools from the card (check both entry and description)
-            const toolsCode = toolsCard.description || toolsCard.entry || '';
-            if (!toolsCode.trim()) return;
-            
-            // Create context for the tools with proper binding
-            const toolContext = {
-                GameState: GameState,
-                Utilities: Utilities,
-                Calendar: typeof Calendar !== 'undefined' ? Calendar : null,
-                state: state,
-                info: info,
-                history: history,
-                console: console,
-                log: log,
-                debug: debug,
-                get: get,
-                set: set,
-                load: load,
-                save: save,
-                loadAll: loadAll
-            };
-            
-            // Use a simpler approach - just eval the whole tools definition
-            // The format should be: toolname: function(...) { ... }, toolname2: function(...) { ... }
-            try {
-                // Wrap in object literal to make it valid JavaScript
-                const wrappedCode = `({${toolsCode}})`;
-                const toolDefinitions = eval(wrappedCode);
-                
-                // Register each tool
-                for (const [name, func] of Object.entries(toolDefinitions)) {
-                    if (typeof func === 'function') {
-                        runtimeTools[name] = (function(toolName, toolFunc) {
-                            return function(...args) {
-                                try {
-                                    // Apply the function with the tool context
-                                    const result = toolFunc.apply(toolContext, args);
-                                    
-                                    if (debug) console.log(`${MODULE_NAME}: Runtime tool ${toolName} returned: ${result}`);
-                                    return result;
-                                } catch(e) {
-                                    if (debug) console.log(`${MODULE_NAME}: Error in runtime tool ${toolName}: ${e.toString()}`);
-                                    if (debug && e.stack) console.log(`${MODULE_NAME}: Stack: ${e.stack}`);
-                                    return 'malformed';
+            // Determine if entity should have display card (has display component and it's active)
+            const hasDisplay = entity.display && entity.display.active !== false;
+
+            if (hasDisplay) {
+                // Find existing card that contains this entity
+                let existingCardTitle = null;
+                const entityCards = Utilities.storyCard.find(card => card.title && card.title.startsWith('[SANE:E]'), true) || [];
+
+                for (const card of entityCards) {
+                    if (card.description) {
+                        try {
+                            const match = card.description.match(/<== SANE DATA ==>([\s\S]*?)<== END DATA ==>/);
+                            if (match) {
+                                const parsed = JSON.parse(match[1].trim());
+                                if (parsed[entityId] || parsed[normalizedId]) {
+                                    existingCardTitle = card.title;
+                                    break;
                                 }
-                            };
-                        })(name, func);
+                            }
+                        } catch (e) {
+                            // Continue searching
+                        }
                     }
                 }
-                
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Loaded ${Object.keys(runtimeTools).length} runtime tools`);
+
+                // CLEANUP: Remove entity from [SANE:D] data cards if transitioning from DATA to DISPLAY
+                // This happens when display.active gets set to true after generation completes
+                const dataCards = Utilities.storyCard.find(card => card.title && card.title.startsWith('[SANE:D]'), true) || [];
+                for (const dataCard of dataCards) {
+                    if (dataCard.description) {
+                        try {
+                            const entities = JSON.parse(dataCard.description);
+                            // Check if this entity exists in this data card
+                            if (entities[entityId] || entities[normalizedId]) {
+                                // Remove the entity from the data card
+                                delete entities[entityId];
+                                delete entities[normalizedId];
+
+                                // Update the data card without this entity
+                                const updatedJson = JSON.stringify(entities);
+                                Utilities.storyCard.upsert({
+                                    title: dataCard.title,
+                                    value: dataCard.value || '# Data Storage',
+                                    description: updatedJson,
+                                    type: 'data'
+                                });
+
+                                if (debug) console.log(`[SANE save]: Removed ${entityId} from ${dataCard.title} during transition to display card`);
+                            }
+                        } catch (e) {
+                            // Continue checking other data cards
+                        }
+                    }
                 }
-            } catch(evalError) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to eval runtime tools: ${evalError}`);
+
+                // Prepare the entity data wrapped in an object
+                const wrappedEntity = { [entityId]: entity };
+                const dataJson = JSON.stringify(wrappedEntity, null, 2);
+                const dataSection = `<== SANE DATA ==>\n${dataJson}\n<== END DATA ==>`;
+
+                // Generate display text using DisplayModule
+                let displayText;
+                try {
+                    displayText = Library.buildEntityDisplay ?
+                        Library.buildEntityDisplay(entity) :
+                        `# ${entityId}\n${JSON.stringify(entity, null, 2)}`;
+                } catch (displayError) {
+                    // If display generation fails, use fallback
+                    if (debug) console.log(`[SANE save]: Display generation failed for ${entityId}: ${displayError.message}, using fallback`);
+                    displayText = `# ${entityId}\n${JSON.stringify(entity, null, 2)}`;
+                }
+
+                if (debug) console.log(`[SANE save]: Generated display text (${displayText.length} chars) for ${entityId}`);
+
+                // Generate keys for Story Card triggers
+                const keys = generateEntityKeys(entityId, entity);
+
+                // Use existing card title or create a reasonable one
+                const cardTitle = existingCardTitle || `[SANE:E] ${entityId}`;
+
+                // Handle overflow if entity is too large
+                if (dataSection.length > 9500) {
+                    saveEntityWithOverflow(cardTitle, entityId, wrappedEntity, displayText, keys);
+                } else {
+                    // Normal save without overflow
+                    Utilities.storyCard.upsert({
+                        title: cardTitle,
+                        entry: displayText,  // What the AI sees
+                        description: dataSection,  // Data storage
+                        keys: keys,
+                        type: 'story'
+                    });
+                }
+            } else {
+                // Save to [SANE:D] data card (no display)
+                saveToDataCard(entityId, entity);
             }
-        } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load runtime tools: ${e}`);
+        } catch (e) {
+            debugLogStore.errors.push({ error: e.message, context: `save:${entityId}` });
+            if (debug) console.log(`[SANE save]: ERROR saving ${entityId}: ${e.message}`);
+            return false;
+        }
+
+        return true;
+    }
+
+    function generateEntityKeys(entityId, entity) {
+        if (!entityId || !entity) return '';
+
+        // Check if it's a location
+        const isLocation = entity.GameplayTags && entity.GameplayTags.some(tag => tag.startsWith('Location'));
+
+        if (isLocation) {
+            // Location format: " Location_ID, Title Case Name"
+            const titleCase = entityId.split('_').map(word =>
+                word.charAt(0).toUpperCase() + word.slice(1).toLowerCase()
+            ).join(' ');
+
+            return ` ${entityId}, ${titleCase}`;
+        } else {
+            // Character/other entity format: " EntityID,(EntityId, trigger_name,(trigger_name"
+            let keys = ` ${entityId},(${entityId}`;
+
+            // Add trigger_name if present
+            const triggerName = entity.info?.trigger_name;
+            if (triggerName && triggerName !== entityId) {
+                keys += `, ${triggerName},(${triggerName}`;
+            }
+
+            return keys;
         }
     }
-    
-    // ==========================
-    // Input Commands System
-    // ==========================
-    const inputCommands = {};
-    
-    function loadInputCommands() {
-        const commandsCard = Utilities.storyCard.get('[SANE_RUNTIME] INPUT_COMMANDS');
-        if (!commandsCard) {
-            if (debug) console.log(`${MODULE_NAME}: No input commands card found`);
+
+    function flushModifiedEntities() {
+        if (modifiedEntities.size === 0) return;
+
+        if (debug) console.log(`[SANE]: Flushing ${modifiedEntities.size} modified entities to Story Cards`);
+
+        for (const entityId of modifiedEntities) {
+            const entity = dataCache[entityId];
+            if (entity) {
+                save(entity.id || entityId, entity, true);  // Force immediate save
+            }
+        }
+
+        modifiedEntities.clear();
+    }
+
+    function saveEntityWithOverflow(cardTitle, entityId, wrappedEntity, displayText, keys) {
+        const dataJson = JSON.stringify(wrappedEntity);
+        const chunks = [];
+        const MAX_CHUNK = 9000;
+
+        // Split data into chunks
+        for (let i = 0; i < dataJson.length; i += MAX_CHUNK) {
+            chunks.push(dataJson.substring(i, i + MAX_CHUNK));
+        }
+
+        // Save main card with first chunk
+        Utilities.storyCard.upsert({
+            title: cardTitle,
+            entry: displayText,
+            description: `<== SANE DATA ==>\n${chunks[0]}~~1~~\n<== END DATA ==>`,
+            keys: keys,
+            type: 'story'
+        });
+
+        // Save overflow cards - these maintain the same base title with overflow markers
+        for (let i = 1; i < chunks.length; i++) {
+            const marker = i < chunks.length - 1 ? `~~${i+1}~~` : '';
+            Utilities.storyCard.upsert({
+                title: `${cardTitle} ~${i}~`,
+                value: `# ${entityId} Overflow ${i}`,
+                description: chunks[i] + marker,
+                type: 'data'
+            });
+        }
+    }
+
+    function saveToDataCard(entityId, entity) {
+        // Save entities without display to [SANE:D] cards
+        // These can pack multiple entities per card
+        const dataCardTitle = '[SANE:D] Data';
+        const dataCard = Utilities.storyCard.get(dataCardTitle);
+
+        let entities = {};
+        if (dataCard && dataCard.description) {
+            try {
+                entities = JSON.parse(dataCard.description);
+            } catch (e) {
+                // Start fresh if corrupted
+            }
+        }
+
+        entities[entityId] = entity;
+        const dataJson = JSON.stringify(entities);
+
+        // Check if we need overflow
+        if (dataJson.length > 9500) {
+            // Split into multiple data cards
+            saveDataWithOverflow(entities);
+        } else {
+            Utilities.storyCard.upsert({
+                title: dataCardTitle,
+                value: '# Data Storage',
+                description: dataJson,
+                type: 'data'
+            });
+        }
+    }
+
+    function saveDataWithOverflow(entities) {
+        // Split entities across multiple data cards
+        const chunks = [];
+        let currentChunk = {};
+        let currentSize = 0;
+
+        for (const [id, entity] of Object.entries(entities)) {
+            const entrySize = JSON.stringify({ [id]: entity }).length;
+            if (currentSize + entrySize > 9000 && Object.keys(currentChunk).length > 0) {
+                chunks.push(currentChunk);
+                currentChunk = {};
+                currentSize = 0;
+            }
+            currentChunk[id] = entity;
+            currentSize += entrySize;
+        }
+        if (Object.keys(currentChunk).length > 0) {
+            chunks.push(currentChunk);
+        }
+
+        // Save chunks to separate cards
+        for (let i = 0; i < chunks.length; i++) {
+            const cardNum = i === 0 ? '' : `~~${i}~~`;
+            Utilities.storyCard.upsert({
+                title: `[SANE:D] Data${cardNum}`,
+                value: `# Data Storage ${i}`,
+                description: JSON.stringify(chunks[i]),
+                type: 'data'
+            });
+        }
+    }
+
+    function del(entityId) {
+        if (!entityId) return false;
+
+        const normalizedId = normalizeEntityId(entityId);
+
+        // Remove from cache
+        delete dataCache[normalizedId];
+
+        // Remove from alias map
+        for (const [alias, id] of Object.entries(entityAliasMap)) {
+            if (id === normalizedId) {
+                delete entityAliasMap[alias];
+            }
+        }
+
+        // Remove from modified entities if queued
+        modifiedEntities.delete(normalizedId);
+
+        // Remove from data cards
+        const dataCardTitle = '[SANE:D] Data';
+        const dataCard = Utilities.storyCard.get(dataCardTitle);
+
+        if (dataCard && dataCard.description) {
+            try {
+                const entities = JSON.parse(dataCard.description);
+                if (entities[entityId] || entities[normalizedId]) {
+                    delete entities[entityId];
+                    delete entities[normalizedId];
+
+                    // Save updated data card
+                    const dataJson = JSON.stringify(entities);
+                    Utilities.storyCard.upsert({
+                        title: dataCardTitle,
+                        value: '# Data Storage',
+                        description: dataJson,
+                        type: 'data'
+                    });
+
+                    if (debug) console.log(`[SANE del]: Removed ${entityId} from data card`);
+                }
+            } catch (e) {
+                if (debug) console.log(`[SANE del]: Error removing from data card: ${e.message}`);
+            }
+        }
+
+        // Also check for entity cards with display
+        const entityCard = Utilities.storyCard.get(`[SANE:E] ${entityId}`);
+        if (entityCard) {
+            Utilities.storyCard.remove(`[SANE:E] ${entityId}`);
+            if (debug) console.log(`[SANE del]: Removed entity card [SANE:E] ${entityId}`);
+        }
+
+        return true;
+    }
+
+    function create(entityData) {
+        if (!entityData || !entityData.id) return null;
+
+        const entity = {
+            id: entityData.id,
+            aliases: entityData.aliases || [],
+            GameplayTags: entityData.GameplayTags || [],
+            components: entityData.components || [],
+            ...entityData
+        };
+
+        save(entity.id, entity);
+        return entity.id;
+    }
+
+    //#endregion SECTION 2C
+
+    // ========================================
+    // SECTION 2D: COMPONENT SYSTEM
+    // ========================================
+    //#region SECTION 2D
+
+    function initializeEntityComponents(entity) {
+        if (!entity || !entity.components) return entity;
+
+        for (const componentId of entity.components) {
+            if (!entity[componentId]) {
+                const schema = schemas[componentId];
+                if (schema && schema.defaults) {
+                    entity[componentId] = JSON.parse(JSON.stringify(schema.defaults));
+                }
+            }
+        }
+
+        return entity;
+    }
+
+    //#endregion SECTION 2D
+
+    // ========================================
+    // SECTION 2E: GAMEPLAY TAG SYSTEM
+    // ========================================
+    //#region SECTION 2E
+
+    function hasGameplayTag(entity, searchTag) {
+        // Check if entity has a specific tag or parent tag
+        // e.g., entity with "Location.Dangerous.Trap" matches "Location.Dangerous"
+        if (!entity || !entity.GameplayTags) return false;
+
+        for (const tag of entity.GameplayTags) {
+            // Simple hierarchical matching
+            if (tag === searchTag || tag.startsWith(searchTag + '.')) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    function hasTagExact(entity, searchTag) {
+        if (!entity?.GameplayTags) return false;
+        return entity.GameplayTags.includes(searchTag);
+    }
+
+    function hasAnyTag(entity, searchTags) {
+        if (!entity?.GameplayTags || !Array.isArray(searchTags)) return false;
+        for (const searchTag of searchTags) {
+            if (hasGameplayTag(entity, searchTag)) return true;
+        }
+        return false;
+    }
+
+    function hasAllTags(entity, searchTags) {
+        if (!entity?.GameplayTags || !Array.isArray(searchTags)) return false;
+        for (const searchTag of searchTags) {
+            if (!hasGameplayTag(entity, searchTag)) return false;
+        }
+        return true;
+    }
+
+    function addGameplayTag(entity, tag) {
+        if (!entity) return false;
+        if (!entity.GameplayTags) entity.GameplayTags = [];
+
+        const normalized = tag.split('.').map(t => t.trim()).filter(t => t).join('.');
+        if (!entity.GameplayTags.includes(normalized)) {
+            entity.GameplayTags.push(normalized);
+            return true;
+        }
+        return false;
+    }
+
+    //#endregion SECTION 2E
+
+    // ========================================
+    // SECTION 2F: QUERY SYSTEM
+    // ========================================
+    //#region SECTION 2F
+
+    function queryTags(query) {
+        // Query entities using either a predicate function or tag expression
+        // Examples:
+        //   queryTags('Character')                    // All characters
+        //   queryTags('Character.NPC')                // All NPCs
+        //   queryTags(e => e.stats.level.value > 10)  // Custom predicate
+        //   queryTags('*')                            // ALL entities (loads from storage)
+
+        // Special handling for wildcard - load all entities from storage
+        if (query === '*') {
+            loadAllEntities();
+        }
+
+        let predicate;
+
+        // If query is a function, use it directly
+        if (typeof query === 'function') {
+            predicate = query;
+        }
+        // Special case for '*' wildcard - match everything
+        else if (query === '*') {
+            predicate = entity => true;
+        }
+        // Simple tag match
+        else if (typeof query === 'string') {
+            predicate = entity => hasGameplayTag(entity, query);
+        }
+        else {
+            if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Invalid query type: ${typeof query}`);
+            return [];
+        }
+
+        const results = [];
+        for (const [key, entity] of Object.entries(dataCache)) {
+            if (!entity || typeof entity !== 'object') continue;
+
+            // Skip schema entries, library functions, and other non-entity data
+            if (key.startsWith('schema.') || key.startsWith('Library.') || key.startsWith('_')) continue;
+
+            // Apply predicate
+            try {
+                if (predicate(entity)) {
+                    results.push(entity);
+                }
+            } catch (e) {
+                // Skip entities that cause errors in predicate
+                if (MODULE_CONFIG.debug) debugLog('query', `Error in queryTags predicate for ${key}: ${e.message}`);
+            }
+        }
+
+        return results;
+    }
+
+    function loadAllEntities() {
+        // Load all entities from Story Cards into cache
+        // Card titles are ARBITRARY - we don't care what they're called, just that they start with [SANE:E]
+        const entityCards = Utilities.storyCard.find(card => card.title && card.title.startsWith('[SANE:E]'), true) || [];
+        if (debug) console.log(`${MODULE_NAME}: Found ${entityCards.length} [SANE:E] cards`);
+
+        for (const card of entityCards) {
+            if (card.description) {
+                try {
+                    const match = card.description.match(/<== SANE DATA ==>([\s\S]*?)<== END DATA ==>/);
+                    if (match) {
+                        const parsed = JSON.parse(match[1].trim());
+                        // The parsed data contains one or more entities - process them all
+                        for (const [entityId, entity] of Object.entries(parsed)) {
+                            const normalizedId = normalizeEntityId(entityId);
+                            dataCache[normalizedId] = entity;
+
+                            // Also update alias mappings
+                            if (entity.aliases && Array.isArray(entity.aliases)) {
+                                for (const alias of entity.aliases) {
+                                    entityAliasMap[normalizeEntityId(alias)] = normalizedId;
+                                }
+                            }
+                        }
+                    }
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Error parsing card '${card.title}': ${e.message}`);
+                    debugLogStore.errors.push({ error: e.message, context: `loadAllEntities: ${card.title}` });
+                }
+            }
+        }
+
+        // Also load from data cards
+        const dataCards = Utilities.storyCard.find(card => card.title && card.title.startsWith('[SANE:D]'), true) || [];
+        if (debug) console.log(`${MODULE_NAME}: Found ${dataCards.length} [SANE:D] cards`);
+        for (const card of dataCards) {
+            if (card.description) {
+                try {
+                    const entities = JSON.parse(card.description);
+                    for (const [entityId, entity] of Object.entries(entities)) {
+                        const normalizedId = normalizeEntityId(entityId);
+                        dataCache[normalizedId] = entity;
+
+                        // Update alias mappings
+                        if (entity.aliases && Array.isArray(entity.aliases)) {
+                            for (const alias of entity.aliases) {
+                                entityAliasMap[normalizeEntityId(alias)] = normalizedId;
+                            }
+                        }
+                    }
+                } catch (e) {
+                    debugLogStore.errors.push({ error: e.message, context: 'loadAllEntities data card' });
+                }
+            }
+        }
+    }
+
+    //#endregion SECTION 2F
+
+    // ========================================
+    // SECTION 2G: SCHEMA MANAGEMENT
+    // ========================================
+    //#region SECTION 2G
+
+    function loadSchemaIntoCache(schemaId) {
+        // Check module registry first
+        if (schemas[schemaId]) {
+            dataCache[`schema.${schemaId}`] = schemas[schemaId];
+            return schemas[schemaId];
+        }
+
+        // Would load from [SANE:S] cards in full implementation
+        return null;
+    }
+
+    //#endregion SECTION 2G
+
+    //#endregion SECTION 2
+
+    // ========================================
+    // SECTION 3: REGISTRATION SYSTEM
+    // ========================================
+    //#region SECTION 3
+    // Simple registration functions that modules call directly
+
+    function registerSchema(id, schema) {
+        schemas[id] = schema;
+
+        // Create the Story Card for this schema so it persists
+        Utilities.storyCard.upsert({
+            title: `[SANE:S] ${id}`,
+            entry: `# ${id} Schema\n\nComponent schema for ${id}`,
+            description: JSON.stringify(schema),
+            type: 'story'
+        });
+    }
+
+    function registerTool(name, func) {
+        tools[name] = func;
+    }
+
+    function registerRewindable(toolName, strategy) {
+        // Strategy should have:
+        // - type: 'inverse' | 'stateful' | null
+        // - For inverse: getInverse(params) returns inverse operation
+        // - For stateful: captureState(entity, params) and restoreState(entity, state, params)
+        rewindableTools[toolName] = strategy;
+    }
+
+    function registerHook(type, func) {
+        if (hooks[type]) {
+            hooks[type].push(func);
+        }
+    }
+
+    function registerAPI(name, func) {
+        Library[name] = func;
+        dataCache[`function.${name}`] = func;
+        // Also set on ModuleAPI for direct access
+        if (ModuleAPI) {
+            ModuleAPI[name] = func;
+        }
+    }
+
+    // ============================
+    // SECTION 5: COMPONENT MODULES 
+    // ============================
+    // ======== START OF MODULES ========
+    //#region SECTION 5
+    // To add a module: paste its code below
+    // To remove a module: delete its code block
+
+    // Interconnected module API - modules can access all core functions
+    const ModuleAPI = {
+        // Core data functions
+        get, set, resolve, save, create, del,
+
+        // Entity management
+        loadEntityFromCache,
+        generateEntityKeys,
+
+        // Component functions
+        initializeEntityComponents,
+        loadSchemaIntoCache,
+
+        // GameplayTag functions
+        hasGameplayTag,
+        hasTagExact,
+        hasAnyTag,
+        hasAllTags,
+        addGameplayTag,
+
+        // Query functions
+        queryTags,
+        loadAllEntities,
+
+        // Blueprint functions
+        instantiateBlueprint,
+        deepMerge,
+
+        // Entity tracker (will be provided by EntityTrackerModule)
+        trackUnknownEntity: null,  // Will be set by EntityTrackerModule
+        entityTracker,
+
+        // Registration functions
+        registerSchema, registerTool, registerRewindable, registerHook, registerAPI,
+
+        // Processing functions
+        processTool,
+        parseToolCall,
+
+        // Utilities
+        Utilities: globalThis.Utilities || {},
+        Calendar: globalThis.Calendar || {},
+        Library,
+
+        // Direct access to registries
+        schemas, tools, hooks, rewindableTools,
+
+        // Direct access to caches
+        dataCache,
+        entityAliasMap,
+
+        // Debug functions
+        debugLog, getDebugLog
+    };
+
+
+
+    // ========================================
+    // SHARED MODULE CONFIGURATION & HELPERS
+    // ========================================
+    //#region MODULE_HELPERS
+
+    // Centralized configuration for all modules
+    const MODULE_CONFIG = {
+        debug: true,
+        maxHistory: 100,
+        maxRewind: 99
+    };
+
+    // Parameter validation helpers
+    const validators = {
+        // Check if required parameters are present
+        requireParams: (...params) => params.every(p => p !== undefined && p !== null),
+
+        // Normalize string to lowercase
+        normalizeString: (str) => str ? String(str).toLowerCase() : '',
+
+        // Parse and validate number
+        parseNumber: (val, allowNegative = false) => {
+            if (val === undefined || val === null) return null;
+            const str = String(val).trim();
+            const pattern = allowNegative ? /^-?\d+$/ : /^\d+$/;
+            if (!pattern.test(str)) return null;
+            return parseInt(str);
+        },
+
+        // Validate positive number
+        requirePositiveNumber: (val) => {
+            const num = validators.parseNumber(val, false);
+            return num !== null && num > 0 ? num : null;
+        }
+    };
+
+    // Common tool patterns
+    const toolHelpers = {
+        // Get entity or track if not found
+        getEntityOrTrack: (entityName, toolName) => {
+            const normalized = validators.normalizeString(entityName);
+            const entity = get(normalized);
+            if (!entity) {
+                // Use ModuleAPI if available (will be set up by EntityTrackerModule)
+                if (ModuleAPI.trackUnknownEntity) {
+                    ModuleAPI.trackUnknownEntity(entityName, toolName);
+                }
+                if (MODULE_CONFIG.debug) {
+                    console.log(`[${toolName}]: Entity ${entityName} not found`);
+                }
+            }
+            return entity;
+        },
+
+        // Standard parameter validation
+        validateParams: (params, count) => {
+            if (!params || params.length < count) return false;
+            return params.slice(0, count).every(p => p !== undefined);
+        },
+
+        // Create a tool wrapper with common validation
+        createTool: (name, minParams, handler) => {
+            return function(params) {
+                if (!toolHelpers.validateParams(params, minParams)) {
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`[${name}]: Insufficient parameters (need ${minParams}, got ${params ? params.length : 0})`);
+                    }
+                    return 'malformed';
+                }
+
+                try {
+                    return handler(params);
+                } catch (e) {
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`[${name}]: Error - ${e.message}`);
+                    }
+                    return 'malformed';
+                }
+            };
+        }
+    };
+
+    //#endregion MODULE_HELPERS
+
+    // ========================================
+    // CRITICAL: Load schemas and entities BEFORE modules execute
+    // ========================================
+    // Load schemas from [SANE:S] Story Cards
+    function loadSchemasFromCards() {
+        let schemaCount = 0;
+        const schemaCards = Utilities.storyCard.find(
+            card => card.title && card.title.startsWith('[SANE:S]'),
+            true  // Get all matching cards
+        ) || [];
+
+        for (const card of schemaCards) {
+            try {
+                const schema = JSON.parse(card.description || '{}');
+                // Schema MUST have an id field
+                if (!schema.id) {
+                    if (debug) console.log(`${MODULE_NAME}: Schema in card ${card.title} missing required 'id' field`);
+                    continue;
+                }
+                // Store in schemas registry and dataCache
+                schemas[schema.id] = schema;
+                dataCache[`schema.${schema.id}`] = schema;
+                schemaCount++;
+               // if (debug) console.log(`${MODULE_NAME}: Loaded schema '${schema.id}' from ${card.title}`);
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Failed to load schema from ${card.title}: ${e.message}`);
+            }
+        }
+        return schemaCount;
+    }
+
+    // Load variable definitions from [SANE:G] Variables card
+    function loadVariableDefinitions() {
+        const vardefCard = Utilities.storyCard.get('[SANE:G] Variables');
+        if (!vardefCard) {
+            if (debug) console.log(`${MODULE_NAME}: No [SANE:G] Variables card found`);
             return;
         }
-        
-        try {
-            // Combine entry and description for more space
-            const fullCode = (commandsCard.entry || '') + '\n' + (commandsCard.description || '');
-            
-            // Check if only comments (no actual code)
-            const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
-            if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: No commands defined (only comments)`);
-                return;
-            }
-            
-            // Wrap in object literal and eval
-            const code = `({${fullCode}})`;
-            let commands;
-            try {
-                commands = eval(code);
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse commands, using empty object: ${e}`);
-                logError(e, 'Failed to parse INPUT_COMMANDS');
-                commands = {};
-            }
-            
-            // Register each command with proper context binding
-            for (const [name, func] of Object.entries(commands)) {
-                if (typeof func !== 'function') continue;
-                
-                inputCommands[name] = createCommandHandler(name, func);
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: Loaded ${Object.keys(commands).length} input commands`);
-        } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load input commands: ${e}`);
+
+        // Parse the simple text format:
+        // variableName: type = defaultValue // description
+        const content = (vardefCard.value || '') + '\n' + (vardefCard.description || '');
+        const lines = content.split('\n');
+
+        // Ensure Global entity exists
+        if (!dataCache.global) {
+            dataCache.global = { id: 'Global' };
         }
-        
+
+        let varCount = 0;
+        for (const line of lines) {
+            // Skip empty lines and comments
+            const trimmed = line.trim();
+            if (!trimmed || trimmed.startsWith('#')) continue;
+
+            // Parse format: "variableName: type = defaultValue // description"
+            const match = trimmed.match(/^(\w+)\s*:\s*(\w+)(?:\s*=\s*([^\/]+))?(?:\s*\/\/\s*(.*))?$/);
+            if (match) {
+                const [, varName, type, defaultValue, description] = match;
+
+                // Set default value if not already set
+                if (defaultValue && !dataCache.global[varName]) {
+                    let value = defaultValue.trim();
+                    // Convert based on type
+                    if (type === 'integer' || type === 'number') {
+                        value = parseInt(value) || 0;
+                    } else if (type === 'float') {
+                        value = parseFloat(value) || 0.0;
+                    } else if (type === 'boolean') {
+                        value = value === 'true';
+                    } else if (type === 'array') {
+                        try { value = JSON.parse(value); } catch(e) { value = []; }
+                    } else if (type === 'object') {
+                        try { value = JSON.parse(value); } catch(e) { value = {}; }
+                    }
+
+                    dataCache.global[varName] = value;
+                    varCount++;
+                    if (debug) console.log(`${MODULE_NAME}: Set Global.${varName} = ${value}`);
+                }
+            }
+        }
+
+        if (debug) console.log(`${MODULE_NAME}: Loaded ${varCount} variable definitions`);
     }
-    
-    function createCommandHandler(name, func, isDebugCommand = false) {
-        return function(args) {
-            try {
-                // Create context object
-                const context = {
-                    getGlobalValue: getGlobalValue,
-                    setGlobalValue: setGlobalValue,
-                    loadAllCharacters: () => loadAll('Character'),
-                    loadCharacter: function(name) {
-                        const chars = loadAll('Character');
-                        return chars[name.toLowerCase()];
-                    },
-                    saveCharacter: saveCharacter,
-                    createCharacter: createCharacter,
-                    getField: function(characterName, fieldPath) {
-                        const character = loadCharacter(characterName);
-                        if (!character) return null;
-                        return getCharacterField(character, fieldPath);
-                    },
-                    setField: function(characterName, fieldPath, value) {
-                        const character = loadCharacter(characterName);
-                        if (!character) return false;
-                        setCharacterField(character, fieldPath, value);
-                        return save('Character', character);
-                    },
-                    Utilities: Utilities,
-                    Calendar: typeof Calendar !== 'undefined' ? Calendar : null,
-                    GenerationWizard: typeof GenerationWizard !== 'undefined' ? GenerationWizard : null,
-                    RewindSystem: RewindSystem,  // Add RewindSystem access
-                    debug: debug,
-                    // Debug-only functions
-                    trackUnknownEntity: isDebugCommand ? trackUnknownEntity : undefined,
-                    loadEntityTrackerConfig: isDebugCommand ? loadEntityTrackerConfig : undefined,
-                    loadGlobalVariables: isDebugCommand ? loadGlobalVariables : undefined
-                };
-                
-                if (debug) console.log(`${MODULE_NAME}: Executing command /${name} with args:`, args);
-                const result = func.apply(context, [args]);
-                return result;
-            } catch(e) {
-                if (debug) console.log(`${MODULE_NAME}: Error in command ${name}: ${e.toString()}`);
-                return null;
+
+    // Load schemas and entities before modules initialize
+    // Load schemas first
+    const schemaCount = loadSchemasFromCards();
+
+    // Load variable definitions
+    loadVariableDefinitions();
+
+    // Then load entities
+    loadAllEntities();
+    if (debug) {
+        const entityCount = Object.keys(dataCache).filter(k => !k.startsWith('schema.') && !k.startsWith('function.')).length;
+    }
+
+    // ========================================
+    // InventoryModule - Item management system
+    // ========================================
+    //#region InventoryModule
+    {
+        const MODULE_NAME = 'InventoryModule';
+
+        // Define inventory schema
+        const inventorySchema = {
+            id: 'inventory',
+            defaults: {}  // Items added dynamically
+        };
+
+        // Create [SANE:S] inventory card if it doesn't exist
+        const existingCard = Utilities.storyCard.get('[SANE:S] inventory');
+        if (!existingCard) {
+            Utilities.storyCard.upsert({
+                title: '[SANE:S] inventory',
+                value: '# Inventory Component Schema\nDefines the inventory storage structure',
+                description: JSON.stringify(inventorySchema, null, 2),
+                type: 'data'
+            });
+            if (debug) console.log(`${MODULE_NAME}: Created [SANE:S] inventory Story Card`);
+        }
+
+        // Register the schema (Story Card version takes precedence if loaded)
+        ModuleAPI.registerSchema('inventory', inventorySchema);
+
+        // Helper functions
+        function getItemQuantity(inventory, itemName) {
+            if (!inventory || !itemName) return 0;
+            const item = inventory[itemName];
+            if (typeof item === 'object') return item.quantity || 0;
+            if (typeof item === 'number') return item;
+            return 0;
+        }
+
+        function setItemQuantity(inventory, itemName, quantity) {
+            if (!inventory) return;
+            if (quantity <= 0) {
+                delete inventory[itemName];
+            } else {
+                inventory[itemName] = { quantity };
+            }
+        }
+
+        // Register API functions for other modules
+        ModuleAPI.registerAPI('getItemQuantity', getItemQuantity);
+        ModuleAPI.registerAPI('setItemQuantity', setItemQuantity);
+
+        // Register add_item tool
+        ModuleAPI.registerTool('add_item', toolHelpers.createTool('add_item', 2, function(params) {
+            const [characterName, itemName, quantity] = params;
+
+            const charName = validators.normalizeString(characterName);
+            const item = validators.normalizeString(itemName);
+
+            const qty = validators.parseNumber(quantity, true);
+            if (qty === null || qty === 0) {
+                if (MODULE_CONFIG.debug) console.log(`[add_item]: Invalid quantity: ${quantity}`);
+                return 'malformed';
+            }
+
+            const character = toolHelpers.getEntityOrTrack(charName, 'add_item');
+            if (!character) return 'executed';
+
+            // Ensure inventory exists
+            if (!character.inventory) character.inventory = {};
+
+            // Update quantity
+            const currentQty = getItemQuantity(character.inventory, item);
+            const newQty = Math.max(0, currentQty + qty);
+
+            setItemQuantity(character.inventory, item, newQty);
+
+            if (MODULE_CONFIG.debug) {
+                const action = qty > 0 ? 'Added' : 'Removed';
+                console.log(`[add_item]: ${action} ${Math.abs(qty)} ${item} ${qty > 0 ? 'to' : 'from'} ${charName}'s inventory (now ${newQty})`);
+            }
+
+            ModuleAPI.save(charName, character);
+            return 'executed';
+        }));
+
+        // Register remove_item tool
+        ModuleAPI.registerTool('remove_item', toolHelpers.createTool('remove_item', 3, (params) => {
+            const [characterName, itemName, quantity] = params;
+
+            const qty = validators.parseNumber(quantity, false);
+            if (qty === null || qty === 0) {
+                if (MODULE_CONFIG.debug) console.log(`[remove_item]: Invalid quantity: ${quantity}`);
+                return 'malformed';
+            }
+
+            // Call add_item with negative quantity
+            return ModuleAPI.tools['add_item']([characterName, itemName, -qty]);
+        }));
+
+        // Register transfer_item tool
+        ModuleAPI.registerTool('transfer_item', toolHelpers.createTool('transfer_item', 3, (params) => {
+            const [giverName, receiverName, itemName, quantity] = params;
+
+            const giver = validators.normalizeString(giverName);
+            const receiver = validators.normalizeString(receiverName);
+            const item = validators.normalizeString(itemName);
+            const requestedQty = validators.requirePositiveNumber(quantity);
+
+            if (!requestedQty) {
+                if (MODULE_CONFIG.debug) console.log(`[transfer_item]: Invalid quantity: ${quantity}`);
+                return 'malformed';
+            }
+
+            // Get both characters
+            const giverChar = toolHelpers.getEntityOrTrack(giver, 'transfer_item');
+            const receiverChar = toolHelpers.getEntityOrTrack(receiver, 'transfer_item');
+
+            let transferQty = requestedQty;
+            let anySuccess = false;
+
+            // Remove from giver if exists
+            if (giverChar) {
+                if (!giverChar.inventory) giverChar.inventory = {};
+                const availableQty = getItemQuantity(giverChar.inventory, item);
+                transferQty = Math.min(availableQty, requestedQty);
+
+                if (transferQty > 0) {
+                    setItemQuantity(giverChar.inventory, item, availableQty - transferQty);
+                    ModuleAPI.save(giver, giverChar);
+                    anySuccess = true;
+                    if (MODULE_CONFIG.debug) console.log(`[transfer_item]: Removed ${transferQty} ${item} from ${giver}`);
+                }
+            }
+
+            // Add to receiver if exists
+            if (receiverChar && transferQty > 0) {
+                if (!receiverChar.inventory) receiverChar.inventory = {};
+                const currentQty = getItemQuantity(receiverChar.inventory, item);
+                setItemQuantity(receiverChar.inventory, item, currentQty + transferQty);
+                ModuleAPI.save(receiver, receiverChar);
+                anySuccess = true;
+                if (MODULE_CONFIG.debug) console.log(`[transfer_item]: Added ${transferQty} ${item} to ${receiver}`);
+            }
+
+            return anySuccess ? 'executed' : 'permitted';
+        }));
+
+        // Register use_consumable tool (alias)
+        ModuleAPI.registerTool('use_consumable', toolHelpers.createTool('use_consumable', 3, (params) => {
+            return ModuleAPI.tools['remove_item'](params);
+        }));
+
+        // Register rewindable strategies for inventory tools
+        ModuleAPI.registerRewindable('add_item', {
+            type: 'inverse',
+            getInverse: function(params, revertData) {
+                const [character, item, qty] = params;
+                const normalizedItem = validators.normalizeString(item);
+                const quantity = validators.parseNumber(qty, true);
+                if (quantity === null) return null;
+                // Inverse of add is remove
+                return ['add_item', [character, normalizedItem, -quantity]];
+            }
+        });
+
+        ModuleAPI.registerRewindable('remove_item', {
+            type: 'inverse',
+            getInverse: function(params, revertData) {
+                const [character, item, qty] = params;
+                const normalizedItem = validators.normalizeString(item);
+                const quantity = validators.parseNumber(qty, false);
+                if (quantity === null) return null;
+                // Inverse of remove is add
+                return ['add_item', [character, normalizedItem, quantity]];
+            }
+        });
+
+        ModuleAPI.registerRewindable('transfer_item', {
+            type: 'inverse',
+            getInverse: function(params, revertData) {
+                const [giver, receiver, item, qty] = params;
+                // Inverse of transfer is transfer in opposite direction
+                return ['transfer_item', [receiver, giver, item, qty]];
+            }
+        });
+
+        ModuleAPI.registerRewindable('use_consumable', {
+            type: 'inverse',
+            getInverse: function(params, revertData) {
+                // use_consumable is an alias for remove_item
+                const [character, item, qty] = params;
+                const normalizedItem = validators.normalizeString(item);
+                const quantity = validators.parseNumber(qty, false);
+                if (quantity === null) return null;
+                return ['add_item', [character, normalizedItem, quantity]];
+            }
+        });
+
+        ModuleAPI.debugLog('module', 'InventoryModule loaded');
+    }
+    //#endregion InventoryModule
+
+    // ========================================
+    // SkillsModule - Stats, skills, and attributes
+    // ========================================
+    //#region SkillsModule
+    {
+        const MODULE_NAME = 'SkillsModule';
+
+        // Define schemas
+        const statsSchema = {
+            id: 'stats',
+            defaults: {
+                level: { value: 1, xp: { current: 0, max: 500 } },
+                hp: { current: 100, max: 100 }
+            },
+            level_progression: {
+                xp_formula: "level * (level - 1) * 500"
+            },
+            hp_progression: {
+                base: 100,
+                per_level: 20
+            },
+            display: [
+                {
+                    line: "infoline",
+                    priority: 30,
+                    format: "`Level ${stats?.level?.value || 1} (${stats?.level?.xp?.current || 0}/${stats?.level?.xp?.max || 0})`"
+                },
+                {
+                    line: "infoline",
+                    priority: 40,
+                    format: "`HP: ${stats?.hp?.current || 0}/${stats?.hp?.max || 100}`"
+                }
+            ]
+        };
+
+        const skillsSchema = {
+            id: 'skills',
+            defaults: {},  // Skills are added dynamically via unlock_newskill
+            registry: ["One_Handed_Sword", "Two_Handed_Sword", "Rapier", "Shield", "Parry",
+                      "Battle_Healing", "Searching", "Tracking", "Hiding", "Night_Vision",
+                      "Sprint", "Acrobatics", "Cooking", "Fishing", "Blacksmithing",
+                      "Tailoring", "Alchemy", "Medicine_Mixing"],
+            skill_progression: {
+                xp_formula: "level * 100"
+            },
+            display: {
+                line: "section",
+                priority: 60,
+                format: "`**Skills**\\n${Object.entries(skills || {}).map(([k,v]) => \`• ${k}: Level ${v.level} (${v.xp?.current || 0}/${v.xp?.max || 0} XP)\`).join('\\n')}`",
+                condition: "Object.keys(skills || {}).length > 0"
             }
         };
-    }
-    
-    // ==========================
-    // Context Modifier System
-    // ==========================
-    let contextModifier = null;
-    
-    function loadContextModifier() {
-        const modifierCard = Utilities.storyCard.get('[SANE_RUNTIME] CONTEXT_MODIFIER');
-        if (!modifierCard) {
-            if (debug) console.log(`${MODULE_NAME}: No context modifier card found`);
-            return;
-        }
-        
-        try {
-            // Combine entry and description
-            const fullCode = (modifierCard.entry || '') + '\n' + (modifierCard.description || '');
-            
-            // Skip if only comments
-            const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
-            if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: Context modifier is empty (only comments), using pass-through`);
-                contextModifier = (text) => text;
-                return;
-            }
-            
-            // Create function from code - auto-append return if not present
-            const codeWithReturn = fullCode.includes('return ') ? fullCode : fullCode + '\nreturn text;';
-            const funcCode = `(function(text) { ${codeWithReturn} })`;
-            contextModifier = eval(funcCode);
-            
-            if (debug) console.log(`${MODULE_NAME}: Loaded context modifier`);
-        } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load context modifier: ${e}`);
-            contextModifier = null;
-        }
-    }
-    
-    // ==========================
-    // Input/Output Modifiers
-    // ==========================
-    let inputModifier = null;
-    let outputModifier = null;
-    
-    function loadInputModifier() {
-        const modifierCard = Utilities.storyCard.get('[SANE_RUNTIME] INPUT_MODIFIER');
-        if (!modifierCard) {
-            if (debug) console.log(`${MODULE_NAME}: No input modifier card found`);
-            return;
-        }
-        
-        try {
-            // Combine entry and description
-            const fullCode = (modifierCard.entry || '') + '\n' + (modifierCard.description || '');
-            
-            // Skip if only comments
-            const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
-            if (!codeWithoutComments) {
-                if (debug) console.log(`${MODULE_NAME}: Input modifier is empty (only comments), using pass-through`);
-                inputModifier = (text) => text;
-                return;
-            }
-            
-            // Create function from code - auto-append return if not present
-            const codeWithReturn = fullCode.includes('return ') ? fullCode : fullCode + '\nreturn text;';
-            const funcCode = `(function(text) { ${codeWithReturn} })`;
-            inputModifier = eval(funcCode);
-            
-            if (debug) console.log(`${MODULE_NAME}: Loaded input modifier`);
-        } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load input modifier: ${e}`);
-            if (debug) console.log(`${MODULE_NAME}: Input modifier code was: ${modifierCard.entry}`);
-            inputModifier = null;
-        }
-    }
-    
-    function loadOutputModifier() {
-        const modifierCard = Utilities.storyCard.get('[SANE_RUNTIME] OUTPUT_MODIFIER');
-        if (!modifierCard) {
-            if (debug) console.log(`${MODULE_NAME}: No output modifier card found`);
-            return;
-        }
-        
-        try {
-            // Combine entry and description
-            const fullCode = (modifierCard.entry || '') + '\n' + (modifierCard.description || '');
-            
-            // Skip if only comments
-            const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
-            if (!codeWithoutComments) {
-                outputModifier = (text) => text;
-                return;
-            }
-            
-            // Create function from code - auto-append return if not present
-            const codeWithReturn = fullCode.includes('return ') ? fullCode : fullCode + '\nreturn text;';
-            const funcCode = `(function(text) { ${codeWithReturn} })`;
-            outputModifier = eval(funcCode);
-            
-            if (debug) console.log(`${MODULE_NAME}: Loaded output modifier`);
-        } catch(e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to load output modifier: ${e}`);
-            if (debug) console.log(`${MODULE_NAME}: Output modifier code was: ${modifierCard.entry}`);
-            outputModifier = null;
-        }
-    }
-    
-    // ==========================
-    // Rewind System
-    // ==========================
-    const RewindSystem = {
-        STORAGE_CARD_PREFIX: '[GS_REWIND] History',
-        MAX_HISTORY: 100,  // Store all 100 entries
-        MAX_REWIND: 99,    // Can rewind 99 (need 1 for verification)
-        MAX_CARD_SIZE: 9000, // Max characters per card
-        
-        // Get all rewind cards
-        getAllCards: function() {
-            const cards = [];
-            let cardNum = 1;
-            
-            while (true) {
-                const cardTitle = cardNum === 1 
-                    ? RewindSystem.STORAGE_CARD_PREFIX 
-                    : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
-                
-                const card = Utilities.storyCard.get(cardTitle);
-                if (!card) break;
-                
-                try {
-                    cards.push({
-                        title: cardTitle,
-                        data: JSON.parse(card.description || '{"entries":[]}')
-                    });
-                } catch(e) {
-                    if (debug) console.log(`${MODULE_NAME}: Failed to parse card ${cardTitle}: ${e}`);
-                }
-                cardNum++;
-            }
-            
-            return cards;
-        },
-        
-        // Get merged storage from all cards
-        getStorage: function() {
-            const cards = RewindSystem.getAllCards();
-            
-            if (cards.length === 0) {
-                // Create first card
-                const firstTitle = RewindSystem.STORAGE_CARD_PREFIX;
-                Utilities.storyCard.add({
-                    title: firstTitle,
-                    value: '# Rewind System Data\nTracks tool execution history for state consistency.',
-                    description: JSON.stringify({
-                        entries: [],
-                        position: -1
-                    }),
+
+        const attributesSchema = {
+            id: 'attributes',
+            defaults: {
+                STRENGTH: { value: 10 },
+                AGILITY: { value: 10 },
+                VITALITY: { value: 10 },
+                DEXTERITY: { value: 10 }
+            },
+            registry: ["STRENGTH", "AGILITY", "VITALITY", "DEXTERITY", "INTELLIGENCE", "WISDOM", "CHARISMA", "LUCK"]
+        };
+
+        // Create [SANE:S] cards for each schema if they don't exist
+        [
+            { name: 'stats', schema: statsSchema },
+            { name: 'skills', schema: skillsSchema },
+            { name: 'attributes', schema: attributesSchema }
+        ].forEach(({ name, schema }) => {
+            const existingCard = Utilities.storyCard.get(`[SANE:S] ${name}`);
+            if (!existingCard) {
+                Utilities.storyCard.upsert({
+                    title: `[SANE:S] ${name}`,
+                    value: `# ${name.charAt(0).toUpperCase() + name.slice(1)} Component Schema`,
+                    description: JSON.stringify(schema, null, 2),
                     type: 'data'
                 });
-                return { entries: [], position: -1 };
+                if (debug) console.log(`${MODULE_NAME}: Created [SANE:S] ${name} Story Card`);
             }
-            
-            // Merge all entries from all cards
-            let allEntries = [];
-            let position = -1;
-            
-            for (const card of cards) {
-                allEntries = allEntries.concat(card.data.entries || []);
-                if (card.data.position !== undefined && card.data.position > position) {
-                    position = card.data.position;
+        });
+
+        // Register schemas (Story Card versions take precedence if loaded)
+        ModuleAPI.registerSchema('stats', statsSchema);
+        ModuleAPI.registerSchema('skills', skillsSchema);
+        ModuleAPI.registerSchema('attributes', attributesSchema);
+
+        // Helper functions
+        function calculateLevelXPRequirement(level) {
+            // Use schema formula: level * (level - 1) * 500
+            return level * (level - 1) * 500;
+        }
+
+        function calculateMaxHP(level) {
+            // Use schema formula: 100 + 20 per level
+            return 100 + ((level - 1) * 20);
+        }
+
+        function processLevelUp(character) {
+            if (!character.stats) return false;
+
+            const stats = character.stats;
+            if (!stats.level || typeof stats.level.value !== 'number') return false;
+
+            let leveledUp = false;
+
+            while (stats.level.xp && stats.level.xp.current >= stats.level.xp.max) {
+                // Level up
+                stats.level.xp.current -= stats.level.xp.max;
+                stats.level.value++;
+                stats.level.xp.max = calculateLevelXPRequirement(stats.level.value + 1);
+
+                // Update max HP
+                const newMaxHP = calculateMaxHP(stats.level.value);
+                if (stats.hp) {
+                    const hpGain = newMaxHP - stats.hp.max;
+                    stats.hp.max = newMaxHP;
+                    stats.hp.current = Math.min(stats.hp.current + hpGain, stats.hp.max);
+                }
+
+                leveledUp = true;
+                ModuleAPI.debugLog('skills', `${character.id} leveled up to ${stats.level.value}!`);
+            }
+
+            return leveledUp;
+        }
+
+        function processSkillLevelUp(skill, skillName) {
+            let leveledUp = false;
+
+            while (skill.xp && skill.xp.current >= skill.xp.max) {
+                skill.xp.current -= skill.xp.max;
+                skill.level = (skill.level || 0) + 1;
+                skill.xp.max = skill.level * 100; // Simple formula for skill XP
+                leveledUp = true;
+                ModuleAPI.debugLog('skills', `${skillName} leveled up to ${skill.level}!`);
+            }
+
+            return leveledUp;
+        }
+
+        // Register API functions
+        ModuleAPI.registerAPI('calculateLevelXPRequirement', calculateLevelXPRequirement);
+        ModuleAPI.registerAPI('calculateMaxHP', calculateMaxHP);
+        ModuleAPI.registerAPI('processLevelUp', processLevelUp);
+        ModuleAPI.registerAPI('processSkillLevelUp', processSkillLevelUp);
+
+        // Register tools
+        ModuleAPI.registerTool('add_levelxp', toolHelpers.createTool('add_levelxp', 2, (params) => {
+            const [characterName, xpAmount] = params;
+
+            const charName = validators.normalizeString(characterName);
+            const xp = validators.parseNumber(xpAmount, true);
+
+            if (xp === null || xp === 0) {
+                if (MODULE_CONFIG.debug) console.log(`[add_levelxp]: Invalid XP amount: ${xpAmount}`);
+                return 'malformed';
+            }
+
+            const character = toolHelpers.getEntityOrTrack(charName, 'add_levelxp');
+            if (!character) return 'executed';
+
+            // Ensure stats component exists
+            if (!character.stats) character.stats = {};
+            if (!character.stats.level) {
+                character.stats.level = {
+                    value: 1,
+                    xp: { current: 0, max: calculateLevelXPRequirement(2) }
+                };
+            }
+
+            const oldLevel = character.stats.level.value;
+            const oldXP = character.stats.level.xp.current;
+
+            // Apply XP (can be negative)
+            character.stats.level.xp.current = Math.max(0, oldXP + xp);
+
+            // Process level up if positive XP
+            if (xp > 0) {
+                processLevelUp(character);
+            }
+
+            const newLevel = character.stats.level.value;
+            const action = xp > 0 ? 'gained' : 'lost';
+
+            if (MODULE_CONFIG.debug) {
+                console.log(`[add_levelxp]: ${charName} ${action} ${Math.abs(xp)} XP (Level ${oldLevel} → ${newLevel})`);
+            }
+
+            // Save character
+            ModuleAPI.save(charName, character);
+            return 'executed';
+        }));
+
+        ModuleAPI.registerTool('add_skillxp', toolHelpers.createTool('add_skillxp', 3, (params) => {
+            const [characterName, skillName, xpAmount] = params;
+
+            const charName = validators.normalizeString(characterName);
+            const skill = validators.normalizeString(skillName);
+            const xp = validators.parseNumber(xpAmount, true);
+
+            if (xp === null || xp === 0) {
+                if (MODULE_CONFIG.debug) console.log(`[add_skillxp]: Invalid XP amount: ${xpAmount}`);
+                return 'malformed';
+            }
+
+            const character = toolHelpers.getEntityOrTrack(charName, 'add_skillxp');
+            if (!character) return 'executed';
+
+            // Check if skill is unlocked
+            if (!character.skills || !character.skills[skill]) {
+                if (MODULE_CONFIG.debug) console.log(`[add_skillxp]: Skill ${skill} not unlocked for ${charName}`);
+                return 'executed';
+            }
+
+            const skillData = character.skills[skill];
+            const oldLevel = skillData.level || 1;
+            const oldXP = skillData.xp ? skillData.xp.current : 0;
+
+            // Apply XP (can be negative)
+            skillData.xp.current = Math.max(0, oldXP + xp);
+
+            // Process skill level up if positive XP
+            if (xp > 0) {
+                processSkillLevelUp(skillData, skill);
+            }
+
+            const newLevel = skillData.level || 1;
+            const action = xp > 0 ? 'gained' : 'lost';
+
+            if (MODULE_CONFIG.debug) {
+                console.log(`[add_skillxp]: ${charName}'s ${skill} ${action} ${Math.abs(xp)} XP (Level ${oldLevel} → ${newLevel})`);
+            }
+
+            // Save character
+            ModuleAPI.save(charName, character);
+            return 'executed';
+        }));
+
+        ModuleAPI.registerTool('unlock_newskill', toolHelpers.createTool('unlock_newskill', 2, (params) => {
+            const [characterName, skillName] = params;
+
+            const charName = validators.normalizeString(characterName);
+            const skill = validators.normalizeString(skillName);
+
+            const character = toolHelpers.getEntityOrTrack(charName, 'unlock_newskill');
+            if (!character) return 'executed';
+
+            // Ensure skills component exists
+            if (!character.skills) character.skills = {};
+
+            // Check if already unlocked
+            if (character.skills[skill]) {
+                if (MODULE_CONFIG.debug) console.log(`[unlock_newskill]: ${charName} already has ${skill} unlocked`);
+                return 'executed';
+            }
+
+            // Unlock the skill
+            character.skills[skill] = {
+                level: 1,
+                xp: { current: 0, max: 100 }
+            };
+
+            if (MODULE_CONFIG.debug) console.log(`[unlock_newskill]: ${charName} unlocked new skill: ${skill}`);
+
+            // Save character
+            ModuleAPI.save(charName, character);
+            return 'executed';
+        }));
+
+        ModuleAPI.registerTool('modify_attribute', toolHelpers.createTool('modify_attribute', 3, (params) => {
+            const [characterName, attributeName, amount] = params;
+
+            const charName = validators.normalizeString(characterName);
+            const attribute = attributeName ? String(attributeName).toUpperCase() : '';
+            const value = validators.parseNumber(amount, true);
+
+            if (value === null || value === 0) {
+                if (MODULE_CONFIG.debug) console.log(`[modify_attribute]: Invalid amount: ${amount}`);
+                return 'malformed';
+            }
+
+            const character = toolHelpers.getEntityOrTrack(charName, 'modify_attribute');
+            if (!character) return 'executed';
+
+            // Ensure attributes component exists
+            if (!character.attributes) character.attributes = {};
+            if (!character.attributes[attribute]) {
+                character.attributes[attribute] = { value: 0 };
+            }
+
+            const oldValue = character.attributes[attribute].value;
+            const newValue = Math.max(0, oldValue + value);
+            character.attributes[attribute].value = newValue;
+
+            if (MODULE_CONFIG.debug) {
+                const action = value > 0 ? 'increased' : 'decreased';
+                console.log(`[modify_attribute]: ${charName}'s ${attribute} ${action} by ${Math.abs(value)} (${oldValue} → ${newValue})`);
+            }
+
+            // Save character
+            ModuleAPI.save(charName, character);
+            return 'executed';
+        }));
+
+        // Register rewindable strategies for skills tools
+        ModuleAPI.registerRewindable('add_levelxp', {
+            type: 'inverse',
+            getInverse: function(params, revertData) {
+                const [character, xp] = params;
+                const xpAmount = validators.parseNumber(xp, true);
+                if (xpAmount === null) return null;
+                // Inverse of adding XP is removing XP
+                return ['add_levelxp', [character, -xpAmount]];
+            }
+        });
+
+        ModuleAPI.registerRewindable('add_skillxp', {
+            type: 'inverse',
+            getInverse: function(params, revertData) {
+                const [character, skill, xp] = params;
+                const normalizedSkill = validators.normalizeString(skill);
+                const xpAmount = validators.parseNumber(xp, true);
+                if (xpAmount === null) return null;
+                // Inverse of adding XP is removing XP
+                return ['add_skillxp', [character, normalizedSkill, -xpAmount]];
+            }
+        });
+
+        ModuleAPI.registerRewindable('unlock_newskill', {
+            type: 'stateful',
+            captureState: function(params) {
+                const [characterName, skillName] = params;
+                const charName = validators.normalizeString(characterName);
+                const skill = validators.normalizeString(skillName);
+                const character = ModuleAPI.get(charName);
+
+                if (character && character.skills && character.skills[skill]) {
+                    // Skill already exists, capture its state
+                    return {
+                        skillExisted: true,
+                        skillData: JSON.stringify(character.skills[skill])
+                    };
+                }
+                return { skillExisted: false };
+            },
+            restoreState: function(params, state) {
+                const [characterName, skillName] = params;
+                const charName = validators.normalizeString(characterName);
+                const skill = validators.normalizeString(skillName);
+                const character = ModuleAPI.get(charName);
+
+                if (character && character.skills) {
+                    if (state.skillExisted && state.skillData) {
+                        // Restore previous state
+                        character.skills[skill] = JSON.parse(state.skillData);
+                    } else {
+                        // Skill didn't exist, remove it
+                        delete character.skills[skill];
+                    }
+                    ModuleAPI.save(charName, character);
                 }
             }
-            
-            return { entries: allEntries, position: position };
-        },
-        
-        // Save storage across multiple cards
-        saveStorage: function(data) {
-            // Ensure we don't exceed max history
-            if (data.entries.length > RewindSystem.MAX_HISTORY) {
-                data.entries = data.entries.slice(-RewindSystem.MAX_HISTORY);
+        });
+
+        ModuleAPI.registerRewindable('modify_attribute', {
+            type: 'inverse',
+            getInverse: function(params, revertData) {
+                const [character, attribute, value] = params;
+                // Normalize attribute name the same way the tool does
+                const normalizedAttr = validators.normalizeString(attribute).toUpperCase();
+                const amount = validators.parseNumber(value, true);
+                if (amount === null) return null;
+                // Inverse of modifying is modifying by negative amount
+                return ['modify_attribute', [character, normalizedAttr, -amount]];
             }
-            
-            // Check for suspicious data loss or hash mismatches
-            const existingData = RewindSystem.getStorage();
-            let shouldBackup = false;
-            let backupReason = '';
-            
-            // Check for significant data loss
-            if (existingData.entries.length > 20 && data.entries.length < existingData.entries.length / 2) {
-                shouldBackup = true;
-                backupReason = `Data loss: ${data.entries.length} entries replacing ${existingData.entries.length}`;
+        });
+
+        ModuleAPI.debugLog('module', 'SkillsModule loaded');
+    }
+    //#endregion SkillsModule
+
+    // ========================================
+    // DisplayModule - Entity display formatting
+    // ========================================
+    //#region DisplayModule
+    {
+        const MODULE_NAME = 'DisplayModule';
+
+        // Register the display schema with minimal defaults
+        ModuleAPI.registerSchema('display', {
+            id: 'display',
+            defaults: {
+                active: true
             }
-            
-            // Check for hash mismatches (over 30% different)
-            if (!shouldBackup && existingData.entries.length > 10 && data.entries.length > 10) {
-                let mismatchCount = 0;
-                const checkLength = Math.min(existingData.entries.length, data.entries.length);
-                
-                for (let i = 0; i < checkLength; i++) {
-                    if (existingData.entries[i]?.h !== data.entries[i]?.h) {
-                        mismatchCount++;
+        });
+
+        // Simple template parser - replaces {field.path} with entity values
+        function parseTemplate(template, entity) {
+            if (!template || !entity) return '';
+
+            // Convert escaped newlines to actual newlines
+            let result = template.replace(/\\n/g, '\n');
+
+            // First handle special function calls: {$func:param1,param2,param3}
+            result = result.replace(/\{\$(\w+):([^}]+)\}/g, (match, funcName, params) => {
+                const paramList = params.split(',').map(p => p.trim());
+
+                // Handle built-in display functions
+                if (funcName === 'relFlavor' && paramList.length === 3) {
+                    // {$relFlavor:fromPath,toPath,valuePath}
+                    const fromName = getFieldValue(entity, paramList[0]);
+                    const toName = paramList[1]; // This might be a literal or a path
+                    const value = getFieldValue(entity, paramList[2]);
+
+                    if (typeof value === 'number') {
+                        // Call the getRelationshipFlavor function from LibraryAPI if available
+                        if (ModuleAPI.Library && ModuleAPI.Library.getRelationshipFlavor) {
+                            return ModuleAPI.Library.getRelationshipFlavor(value, fromName || entity.id, toName);
+                        }
+                        // Fallback
+                        return `${fromName || entity.id} has an indescribable relationship with ${toName}`;
                     }
                 }
-                
-                if (mismatchCount > checkLength * 0.3) {
-                    shouldBackup = true;
-                    backupReason = `Hash mismatch: ${mismatchCount}/${checkLength} entries differ`;
+
+                return match; // Return unchanged if function not recognized
+            });
+
+            // Then handle iteration patterns with nested braces
+            // Match {collection.*→ ...} or {collection.*| ...} including nested braces
+            result = result.replace(/\{([^}]*\.\*[→|][^{}]*(?:\{[^}]*\}[^{}]*)*)\}/g, (match, path) => {
+                // Handle special iteration syntax: {collection.*→ pattern} or {collection.*| pattern}
+                if (path.includes('.*→') || path.includes('.*|')) {
+                    // Find the separator type
+                    const separator = path.includes('.*→') ? '\n' : ', ';
+
+                    // Split more carefully to handle nested braces in pattern
+                    let collectionPath, pattern;
+                    if (path.includes('.*→')) {
+                        const splitIndex = path.indexOf('.*→');
+                        collectionPath = path.substring(0, splitIndex);
+                        pattern = path.substring(splitIndex + 4); // 4 = length of '.*→'
+                    } else {
+                        const splitIndex = path.indexOf('.*|');
+                        collectionPath = path.substring(0, splitIndex);
+                        pattern = path.substring(splitIndex + 3); // 3 = length of '.*|'
+                    }
+
+                    // Get the collection
+                    const collection = getFieldValue(entity, collectionPath.trim());
+                    if (!collection || typeof collection !== 'object') return '';
+
+                    // Iterate and build output
+                    const items = [];
+                    for (const [key, value] of Object.entries(collection)) {
+                        let itemText = pattern.trim();
+
+                        // Handle special relationship flavor function in iterations
+                        itemText = itemText.replace(/\{\$relFlavor:([^,}]+),([^,}]+)\}/g, (m, fromParam, valueParam) => {
+                            // fromParam is either 'entity' for the parent entity or a field path
+                            // valueParam is typically '*.value' for the relationship value
+                            const fromName = fromParam === 'entity' ?
+                                (entity.info?.displayname || entity.id) :
+                                getFieldValue(entity, fromParam);
+                            const toName = key; // The key in the iteration is the target name
+                            const relValue = valueParam.startsWith('*.') ?
+                                getFieldValue(value, valueParam.substring(2)) :
+                                getFieldValue(entity, valueParam);
+
+                            if (typeof relValue === 'number') {
+                                // Use ModuleAPI.Library if available, otherwise return a default
+                                if (ModuleAPI.Library && ModuleAPI.Library.getRelationshipFlavor) {
+                                    return ModuleAPI.Library.getRelationshipFlavor(relValue, fromName, toName);
+                                } else {
+                                    // Fallback if RelationshipsModule isn't loaded
+                                    return `relationship value: ${relValue}`;
+                                }
+                            }
+                            return `${fromName} has an unknown relationship with ${toName}`;
+                        });
+
+                        // Replace {*} with key
+                        itemText = itemText.replace(/\{\*\}/g, key);
+                        // Replace {*.field} with value fields
+                        itemText = itemText.replace(/\{\*\.([^}]+)\}/g, (m, field) => {
+                            if (typeof value === 'object' && value !== null) {
+                                const fieldValue = getFieldValue(value, field);
+                                // Handle special values
+                                if (fieldValue === null || fieldValue === undefined) return 'None';
+                                if (fieldValue === true) return 'Yes';
+                                if (fieldValue === false) return 'No';
+                                return fieldValue;
+                            }
+                            return value || '';
+                        });
+                        items.push(itemText);
+                    }
+                    return items.join(separator);
+                }
+
+                return match; // Should not reach here
+            });
+
+            // Then handle normal field replacements
+            result = result.replace(/\{([^}]+)\}/g, (match, path) => {
+                // Skip iteration patterns (already handled above)
+                if (path.includes('.*→') || path.includes('.*|')) {
+                    return match;
+                }
+
+                // Normal field replacement
+                const value = getFieldValue(entity, path.trim());
+                // Handle special values for better display
+                if (value === null || value === undefined) return '';
+                if (value === true) return 'Yes';
+                if (value === false) return 'No';
+                return value;
+            });
+
+            return result;
+        }
+
+        // Helper to get nested field values
+        function getFieldValue(obj, path) {
+            const parts = path.split('.');
+            let current = obj;
+
+            for (const part of parts) {
+                if (current == null) return undefined;
+                current = current[part];
+            }
+
+            return current;
+        }
+
+
+        // Build display for an entity
+        function buildEntityDisplay(entity) {
+            if (!entity || !entity.id) {
+                ModuleAPI.debugLog('display', 'Invalid entity for display');
+                return '';
+            }
+
+            // Check if display is active
+            if (!entity.display || entity.display.active === false) {
+                return '';
+            }
+
+            const sections = {};
+
+            // Process display sections if defined
+            if (entity.display.sections) {
+                for (const [sectionName, sectionConfig] of Object.entries(entity.display.sections)) {
+                    if (!sectionConfig || !sectionConfig.template) continue;
+
+                    // Check condition if specified
+                    if (sectionConfig.condition) {
+                        // Handle wildcard patterns like "inventory.*" or "relationships.*"
+                        if (sectionConfig.condition.endsWith('.*')) {
+                            const basePath = sectionConfig.condition.slice(0, -2);
+                            const value = getFieldValue(entity, basePath);
+                            // Skip if the object doesn't exist or has no properties
+                            if (!value || typeof value !== 'object' || Object.keys(value).length === 0) {
+                                continue;
+                            }
+                        } else {
+                            // Normal condition - check if field exists and is truthy
+                            const value = getFieldValue(entity, sectionConfig.condition);
+                            if (!value) {
+                                continue;
+                            }
+                        }
+                    }
+
+                    // Parse the template
+                    const output = parseTemplate(sectionConfig.template, entity);
+
+                    if (output && output.trim()) {
+                        const line = sectionConfig.line || 'section';
+                        const priority = sectionConfig.priority || 50;
+
+                        if (!sections[line]) sections[line] = [];
+                        sections[line].push({
+                            priority,
+                            text: output,
+                            condition: sectionConfig.condition
+                        });
+                    }
                 }
             }
-            
-            if (shouldBackup) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: WARNING: ${backupReason} - creating backup in state`);
+
+            // Get separators and order
+            const separators = entity.display?.separators || {
+                nameline: ' ',
+                infoline: ' | ',
+                section: '\n',
+                footer: '\n'
+            };
+
+            const order = entity.display?.order || ['prefixline', 'nameline', 'infoline', 'section', 'footer'];
+            const lineSeparator = separators.section || '\n';
+
+            // Build output
+            let result = [];
+
+            // Add prefix if defined
+            if (entity.display?.prefix) {
+                result.push(parseTemplate(entity.display.prefix, entity));
+            }
+
+            // Process lines in the defined order
+            for (const lineName of order) {
+                if (sections[lineName] && sections[lineName].length > 0) {
+                    // Sort by priority
+                    sections[lineName].sort((a, b) => a.priority - b.priority);
+
+                    // Get separator for this line type
+                    const separator = separators[lineName] || '';
+
+                    // Join all items on this line with the line's separator
+                    const texts = sections[lineName].map(s => s.text).filter(t => t);
+                    if (texts.length > 0) {
+                        result.push(texts.join(separator));
+                    }
                 }
-                
-                // Store backup in state with turn number
-                if (!state.rewindBackups) {
-                    state.rewindBackups = [];
+            }
+
+            // Add footer if defined
+            if (entity.display?.footer) {
+                result.push(parseTemplate(entity.display.footer, entity));
+            }
+
+            return result.join(lineSeparator);
+        }
+
+        // Register the functions in the API
+        ModuleAPI.registerAPI('buildEntityDisplay', buildEntityDisplay);
+
+        // Make them available to save function and external use
+        Library.buildEntityDisplay = buildEntityDisplay;
+
+        ModuleAPI.debugLog('module', 'DisplayModule loaded');
+    }
+    //#endregion DisplayModule
+
+    // ========================================
+    // GenerationWizardModule - AI entity generation
+    // ========================================
+    //#region GenerationWizardModule
+    {
+        const MODULE_NAME = 'GenerationWizardModule';
+        const ZERO_WIDTH_CHAR = '\u200B'; // Prevents AI Dungeon from treating empty output as error
+
+        // Status messages
+        const THINKING_MESSAGE = 'The GM will use the next turn to think. Use `/gw_abort` if undesired.';
+        const PROCESSING_MESSAGE = 'The GM is processing entity generation... Use `/gw_abort` if needed.';
+        const COMPLETION_MESSAGE = 'Generation completed, returning to story.';
+
+        // Response parsing configuration
+        const PARSER_CONFIG = {
+            maxRetries: 3,
+            maxTurnsBeforeAbandoned: 10
+        };
+
+        // Value parsers for different field types
+        const valueParsers = {
+            // Parse "Item x5" format for inventory
+            inventory: function(value) {
+                // Check for empty/null values first
+                const trimmedValue = value ? value.trim().toLowerCase() : '';
+                const emptyValues = ['none', 'n/a', 'na', 'null', ''];
+
+                if (emptyValues.includes(trimmedValue)) {
+                    // Return special marker for empty inventory
+                    return { _empty: true };
                 }
-                
-                state.rewindBackups.push({
-                    turn: info?.actionCount || state.actionCount || 0,
-                    entries: existingData.entries,
-                    position: existingData.position,
-                    reason: backupReason
+
+                const match = value.match(/^(.+?)\s*x\s*(\d+)$/);
+                if (match) {
+                    return {
+                        item: match[1].trim(),
+                        quantity: parseInt(match[2], 10)
+                    };
+                }
+                return { item: value.trim(), quantity: 1 };
+            },
+            // Parse "SkillName:Level" format
+            skill: function(value) {
+                // Handle "SkillName:Level" format
+                const colonMatch = value.match(/^(.+?):(\d+)$/);
+                if (colonMatch) {
+                    return {
+                        name: colonMatch[1].trim(),
+                        level: parseInt(colonMatch[2], 10)
+                    };
+                }
+                // Handle "SkillName Level X" format
+                const levelMatch = value.match(/^(.+?)\s+[Ll]evel\s+(\d+)$/);
+                if (levelMatch) {
+                    return {
+                        name: levelMatch[1].trim(),
+                        level: parseInt(levelMatch[2], 10)
+                    };
+                }
+                // Just skill name
+                return { name: value.trim(), level: 1 };
+            },
+            // Parse "CharacterName:Value" format for relationships
+            relationship: function(value) {
+                const match = value.match(/^(.+?):(\d+)$/);
+                if (match) {
+                    return {
+                        character: match[1].trim(),
+                        value: parseInt(match[2], 10)
+                    };
+                }
+                // Just character name with default value
+                return {
+                    character: value.trim(),
+                    value: 50  // Default relationship value
+                };
+            },
+            // Parse objectives list
+            objectives: function(value) {
+                // Parse list of objectives from various formats
+                const objectives = {};
+
+                // Split by newlines and filter out empty lines
+                const lines = value.split('\n').filter(line => line.trim());
+
+                lines.forEach((line, index) => {
+                    // Remove common prefixes like "- ", "• ", "1. ", etc.
+                    const cleanLine = line.replace(/^[-•*]\s*/, '').replace(/^\d+\.\s*/, '').trim();
+
+                    if (cleanLine) {
+                        const objId = `objective_${index + 1}`;
+                        objectives[objId] = {
+                            description: cleanLine,
+                            completed: false,
+                            progress: 0,
+                            target: 1
+                        };
+                    }
                 });
-                
-                // Keep only last 3 backups to prevent state bloat
-                if (state.rewindBackups.length > 3) {
-                    state.rewindBackups = state.rewindBackups.slice(-3);
+
+                return objectives;
+            },
+            // Parse pathways/exits
+            pathways: function(value) {
+                // Parse list of pathways/exits
+                const pathways = {};
+
+                // Split by newlines and filter out empty lines
+                const lines = value.split('\n').filter(line => line.trim());
+
+                lines.forEach((line, index) => {
+                    // Remove common prefixes
+                    const cleanLine = line.replace(/^[-•*]\s*/, '').replace(/^\d+\.\s*/, '').trim();
+
+                    if (cleanLine) {
+                        // Try to parse "Direction: Destination" format
+                        const colonMatch = cleanLine.match(/^([^:]+):(.+)$/);
+                        if (colonMatch) {
+                            const direction = colonMatch[1].trim().toLowerCase();
+                            const destination = colonMatch[2].trim();
+
+                            // Store pathway keyed by direction
+                            pathways[direction] = {
+                                destination: destination,
+                                description: null
+                            };
+                        } else {
+                            // Just a direction name - use as key with Unknown destination
+                            const direction = cleanLine.toLowerCase();
+                            pathways[direction] = {
+                                destination: 'Unknown',
+                                description: null
+                            };
+                        }
+                    }
+                });
+
+                return pathways;
+            },
+            // Parse number
+            number: function(value) {
+                const num = parseInt(value, 10);
+                return isNaN(num) ? 0 : num;
+            },
+            // Parse text (default)
+            text: function(value) {
+                return value.trim();
+            },
+            // Parse select (validate against options)
+            select: function(value, options) {
+                const normalized = value.trim();
+                if (options && options.includes(normalized)) {
+                    return normalized;
                 }
-                
-                // Log the issue
-                logError(new Error('RewindSystem anomaly detected'), backupReason);
-            }
-            
-            // Clean up old backups (older than 20 turns)
-            if (state.rewindBackups && state.rewindBackups.length > 0) {
-                const currentTurn = info?.actionCount || state.actionCount || 0;
-                state.rewindBackups = state.rewindBackups.filter(backup => 
-                    currentTurn - backup.turn < 20
+                // Try case-insensitive match
+                const found = options?.find(opt =>
+                    opt.toLowerCase() === normalized.toLowerCase()
                 );
-                
-                if (state.rewindBackups.length === 0) {
-                    delete state.rewindBackups; // Clean up empty array
+                return found || normalized;
+            }
+        };
+
+        // Apply field value to entity using maps_to pattern
+        function applyMapsTo(entityId, mapsTo, parsedValue) {
+            if (!mapsTo || parsedValue === undefined || parsedValue === null) return false;
+
+            // Special handling for empty inventory marker
+            if (parsedValue && parsedValue._empty === true) {
+                // This is a valid "no items" response - return true to indicate success
+                // but don't actually set anything
+                return true;
+            }
+
+            // Replace * with entityId directly
+            let path = mapsTo.replace('*', entityId);
+
+            // Handle array notation like aliases[0]
+            const arrayMatch = path.match(/^(.+)\[(\d+)\]$/);
+            if (arrayMatch) {
+                const arrayPath = arrayMatch[1];
+                const index = parseInt(arrayMatch[2]);
+
+                // Get or create the array
+                let array = ModuleAPI.get(arrayPath);
+                if (!array || !Array.isArray(array)) {
+                    array = [];
+                }
+
+                // Ensure array has enough elements
+                while (array.length <= index) {
+                    array.push(null);
+                }
+
+                // Set the value at the index
+                array[index] = parsedValue;
+
+                // Save the entire array
+                return ModuleAPI.set(arrayPath, array);
+            }
+
+            // Handle dynamic substitutions like {name} or {item}
+            if (typeof parsedValue === 'object') {
+                // Replace {name} with parsed name value
+                if (parsedValue.name) {
+                    path = path.replace('{name}', parsedValue.name);
+                }
+                // Replace {item} with parsed item value
+                if (parsedValue.item) {
+                    path = path.replace('{item}', parsedValue.item);
+                    // For item paths, store only quantity (not the full {item, quantity} object)
+                    parsedValue = { quantity: parsedValue.quantity || 1 };
+                }
+                // Replace {character} with parsed character value
+                if (parsedValue.character) {
+                    path = path.replace('{character}', parsedValue.character);
                 }
             }
-            
-            // Clear existing cards first
-            let cardNum = 1;
-            while (true) {
-                const cardTitle = cardNum === 1 
-                    ? RewindSystem.STORAGE_CARD_PREFIX 
-                    : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
-                
-                const card = Utilities.storyCard.get(cardTitle);
-                if (!card) break;
-                
-                Utilities.storyCard.remove(cardTitle);
-                cardNum++;
-            }
-            
-            // Split entries into cards
-            const cards = [];
-            let currentCard = { entries: [], position: data.position };
-            let currentSize = 50; // Account for JSON structure overhead
-            
-            for (let i = 0; i < data.entries.length; i++) {
-                const entry = data.entries[i];
-                const entryStr = JSON.stringify(entry);
-                const entrySize = entryStr.length + 2; // +2 for comma and spacing
-                
-                if (currentSize + entrySize > RewindSystem.MAX_CARD_SIZE && currentCard.entries.length > 0) {
-                    // Save current card and start new one
-                    cards.push({...currentCard});
-                    currentCard = { entries: [], position: data.position };
-                    currentSize = 50;
-                }
-                
-                currentCard.entries.push(entry);
-                currentSize += entrySize;
-            }
-            
-            // Save last card if it has entries
-            if (currentCard.entries.length > 0) {
-                cards.push(currentCard);
-            }
-            
-            // Create/update story cards
-            for (let i = 0; i < cards.length; i++) {
-                const cardTitle = i === 0 
-                    ? RewindSystem.STORAGE_CARD_PREFIX 
-                    : `${RewindSystem.STORAGE_CARD_PREFIX} ${i + 1}`;
-                
-                const cardData = cards[i];
-                const existing = Utilities.storyCard.get(cardTitle);
-                
-                if (existing) {
-                    Utilities.storyCard.update(cardTitle, {
-                        description: JSON.stringify(cardData)
-                    });
+
+            // Special handling for objectives - ensure complete structure
+            if (path.includes('.objectives.objective_') && path.endsWith('.description')) {
+                // Extract the objective parent path
+                const objPath = path.substring(0, path.lastIndexOf('.description'));
+
+                // Get or create the objective object
+                let objective = ModuleAPI.get(objPath);
+                if (!objective || typeof objective !== 'object') {
+                    objective = {
+                        description: parsedValue,
+                        completed: false,
+                        progress: 0,
+                        target: 1
+                    };
+                    ModuleAPI.set(objPath, objective);
+                    if (debug) console.log(`${MODULE_NAME}: Created complete objective at ${objPath}`);
+                    return true;
                 } else {
-                    Utilities.storyCard.add({
+                    // Just update the description
+                    objective.description = parsedValue;
+                    ModuleAPI.set(objPath, objective);
+                    return true;
+                }
+            }
+
+            // Apply the value using ModuleAPI.set
+            try {
+                if (debug) console.log(`${MODULE_NAME}: Setting ${path} = ${JSON.stringify(parsedValue)}`);
+                return ModuleAPI.set(path, parsedValue);
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Failed to apply maps_to: ${e.message}`);
+                return false;
+            }
+        }
+
+        // Helper: Evaluate computed fields
+        function evaluateComputedField(formula, collectedFields) {
+            if (!formula || typeof formula !== 'string') return null;
+
+            // Replace $(fieldName) with collected values
+            let expression = formula;
+            const fieldPattern = /\$\(([^)]+)\)/g;
+            expression = expression.replace(fieldPattern, (match, fieldName) => {
+                const value = collectedFields[fieldName];
+                if (value === undefined || value === null) {
+                    return 'null';
+                }
+                // Quote strings
+                if (typeof value === 'string') {
+                    return `"${value.replace(/"/g, '\\"')}"`;
+                }
+                return String(value);
+            });
+
+            // Evaluate the expression using eval (AI Dungeon sandbox doesn't support Function constructor)
+            try {
+                if (debug) console.log(`${MODULE_NAME}: Evaluating expression: ${expression}`);
+                const result = eval(expression);
+                if (debug) console.log(`${MODULE_NAME}: Expression result: ${result}`);
+                return result;
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Failed to evaluate computed field: ${e.message}`);
+                return null;
+            }
+        }
+
+        // Helper: Expand template fields into concrete fields
+        function expandFieldTemplates(generation, collectedFields) {
+            if (!generation.fields) return false;
+
+            let anyExpanded = false;
+
+            // Look for fields with type: "expansion"
+            for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                if (fieldDef.type !== 'expansion') continue;
+                if (fieldDef._expanded) continue;  // Already expanded
+
+                // Evaluate the count (can be a number or a formula)
+                let count = fieldDef.count;
+                if (typeof count === 'string' && count.includes('$(')) {
+                    count = evaluateComputedField(count, collectedFields);
+                }
+
+                if (typeof count !== 'number' || count < 1) {
+                    if (debug) console.log(`${MODULE_NAME}: Invalid count for expansion field ${fieldName}: ${count}`);
+                    continue;
+                }
+
+                // Expand the template
+                const template = fieldDef.template;
+                if (!template) {
+                    if (debug) console.log(`${MODULE_NAME}: No template for expansion field ${fieldName}`);
+                    continue;
+                }
+
+                // Create {count} number of fields based on template
+                for (let i = 1; i <= count; i++) {
+                    const expandedFieldName = template.fieldName ? template.fieldName.replace('{i}', i) : `${fieldName}_${i}`;
+
+                    // Don't overwrite existing fields
+                    if (generation.fields[expandedFieldName]) continue;
+
+                    // Create the expanded field
+                    generation.fields[expandedFieldName] = {
+                        maps_to: template.maps_to ? template.maps_to.replace('{i}', i) : null,
+                        key: template.key ? template.key.replace('{i}', i) : expandedFieldName.toUpperCase(),
+                        parser: template.parser || 'text',
+                        prompt: template.prompt ? {
+                            uncollected: template.prompt.uncollected ? template.prompt.uncollected.replace(/{i}/g, i) : null,
+                            known: template.prompt.known ? template.prompt.known.replace(/{i}/g, i) : null,
+                            priority: template.prompt.priority ? template.prompt.priority + i : 50 + i
+                        } : null
+                    };
+
+                    if (debug) console.log(`${MODULE_NAME}: Expanded ${fieldName} to ${expandedFieldName}`);
+                    anyExpanded = true;
+                }
+
+                // Mark as expanded
+                fieldDef._expanded = true;
+            }
+
+            return anyExpanded;
+        }
+
+        // Helper: Process computed fields
+        function processComputedFields(generation, collectedFields) {
+            if (!generation.fields) return false;
+
+            let anyComputed = false;
+
+            for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                if (fieldDef.source !== 'computed') continue;
+                if (collectedFields[fieldName] !== undefined) continue;  // Already computed
+
+                // Evaluate the formula
+                const result = evaluateComputedField(fieldDef.formula, collectedFields);
+                if (result !== null && result !== undefined) {
+                    collectedFields[fieldName] = result;
+                    anyComputed = true;
+                    if (debug) console.log(`${MODULE_NAME}: Computed ${fieldName} = ${result}`);
+                }
+            }
+
+            return anyComputed;
+        }
+
+        // Helper: Find entities with active generation
+        function findActiveGenerator() {
+            // First check the cache
+            for (const [key, entity] of Object.entries(dataCache)) {
+                if (entity?.generationwizard?.state === 'generating') {
+                    return { entityId: entity.id, entity };
+                }
+            }
+
+            // If not in cache, scan all entity cards to find active generator
+            const entityCards = Utilities.storyCard.find(c => c.title?.startsWith('[SANE:E]'), true) || [];
+            for (const card of entityCards) {
+                if (card.description) {
+                    const entityId = card.title.replace('[SANE:E] ', '');
+                    const entity = ModuleAPI.get(entityId);
+                    if (entity?.generationwizard?.state === 'generating') {
+                        return { entityId: entity.id, entity };
+                    }
+                }
+            }
+
+            return null;
+        }
+
+        // Helper: Find queued entities
+        function findQueuedGenerators() {
+            const queued = [];
+
+            // Check cache first
+            for (const [key, entity] of Object.entries(dataCache)) {
+                if (entity?.generationwizard?.state === 'queued') {
+                    queued.push({ entityId: entity.id, entity });
+                }
+            }
+
+            // Also scan entity cards if needed
+            const entityCards = Utilities.storyCard.find(c => c.title?.startsWith('[SANE:E]'), true) || [];
+            for (const card of entityCards) {
+                if (card.description) {
+                    const entityId = card.title.replace('[SANE:E] ', '');
+                    // Skip if already found in cache
+                    if (!dataCache[entityId] && !dataCache[entityId.toLowerCase()]) {
+                        const entity = ModuleAPI.get(entityId);
+                        if (entity?.generationwizard?.state === 'queued') {
+                            queued.push({ entityId: entity.id, entity });
+                        }
+                    }
+                }
+            }
+
+            return queued;
+        }
+
+        // Helper: Set generator state
+        function setGeneratorState(entityId, newState) {
+            const entity = ModuleAPI.get(entityId);
+            if (entity?.generationwizard) {
+                entity.generationwizard.state = newState;
+                ModuleAPI.save(entityId, entity);
+            }
+        }
+
+        // Hook: context (process generation in context phase)
+        ModuleAPI.registerHook('context', function(text) {
+            // Find active or transition queued->generating entity
+            let activeGen = findActiveGenerator();
+
+            // If no active generator, check for queued ones
+            if (!activeGen) {
+                const queued = findQueuedGenerators();
+                if (queued.length > 0) {
+                    // Activate the first queued generator
+                    activeGen = queued[0];
+                    setGeneratorState(activeGen.entityId, 'generating');
+                    if (debug) console.log(`${MODULE_NAME}: Activated generation for ${activeGen.entityId}`);
+                }
+            }
+
+            if (!activeGen) {
+                return text;  // No active generation
+            }
+
+            // Build prompt from embedded component
+            const prompt = preparePromptFromComponent(activeGen.entity);
+            if (prompt) {
+                // Set thinking message for user
+                if (state && typeof state === 'object') {
+                    state.message = THINKING_MESSAGE;
+                }
+                // Append prompt to context
+                const modifiedText = text + prompt;
+                return modifiedText;
+            }
+
+            return text;
+        });
+
+        // Hook: output (process AI generation response)
+        ModuleAPI.registerHook('output', function(text) {
+            // Process AI response for field collection
+            const activeGen = findActiveGenerator();
+            if (!activeGen) {
+                return { active: false, text: text };  // Pass through original text
+            }
+
+            // Process the response
+            const result = processResponse(text, activeGen);
+            let hiddentext = ' ';
+            // Set appropriate message based on result
+            if (state && typeof state === 'object') {
+                if (result === 'completed') {
+                    state.message = COMPLETION_MESSAGE;
+                    // temp state.message fix
+                    hiddentext = HIDE_BEGINNING + COMPLETION_MESSAGE + HIDE_ENDING;
+                } else if (result) {
+                    state.message = PROCESSING_MESSAGE;
+                    // temp state.message fix
+                    hiddentext = HIDE_BEGINNING + PROCESSING_MESSAGE + HIDE_ENDING;
+                }
+            }
+
+            // Hide the output during generation
+            return { active: true, text: hiddentext /*ZERO_WIDTH_CHAR*/ };
+        });
+
+        // Helper: Process AI response
+        function processResponse(responseText, activeGen) {
+            try {
+                const entity = activeGen.entity;
+                const genComponent = entity.generationwizard;
+                const activeGenName = genComponent.activeGeneration || 'initial';
+                const generation = genComponent.generations?.[activeGenName];
+
+                if (!generation) {
+                    console.log(`${MODULE_NAME}: No active generation object found`);
+                    return false;
+                }
+
+                // Get expected fields
+                const expectedKeys = [];
+                const keyToFieldMap = {};
+                const collectedFields = genComponent.fields_collected || {};
+
+                if (generation.fields) {
+                    for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                        // Skip computed and expansion fields - they're not collected from AI
+                        if (fieldDef.source === 'computed' || fieldDef.type === 'expansion') continue;
+
+                        if (!collectedFields[fieldName]) {
+                            const key = fieldDef.key || fieldName.toUpperCase();
+                            expectedKeys.push(key);
+                            keyToFieldMap[key] = fieldName;
+                        }
+                    }
+                }
+
+                if (expectedKeys.length === 0) {
+                    // All fields collected, finalize
+                    finalizeEntity(activeGen.entityId, entity);
+                    return 'completed';
+                }
+
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Expected keys: ${expectedKeys.join(', ')}`);
+                    console.log(`${MODULE_NAME}: Response length: ${responseText.length}, starts with: "${responseText.substring(0, 50)}"`);
+                }
+
+                // Parse response for fields
+                const parsed = parseFields(responseText, expectedKeys);
+
+                if (debug) {
+                    console.log(`${MODULE_NAME}: Parsed ${Object.keys(parsed).length} fields: ${JSON.stringify(parsed)}`);
+                }
+
+                let anyCollected = false;
+
+                for (const [key, value] of Object.entries(parsed)) {
+                    const fieldName = keyToFieldMap[key];
+                    if (fieldName && generation.fields[fieldName]) {
+                        const fieldDef = generation.fields[fieldName];
+
+                        // Parse value based on field type
+                        let parsedValue = value;
+                        if (fieldDef.parser && valueParsers[fieldDef.parser]) {
+                            parsedValue = valueParsers[fieldDef.parser](value, fieldDef.options);
+                        }
+
+                        // Field validation - run validation function if defined
+                        if (fieldDef.validation) {
+                            let validationResult = true;
+                            let validationMessage = '';
+
+                            // Handle different validation types
+                            if (typeof fieldDef.validation === 'string') {
+                                // Built-in validation type
+                                if (fieldDef.validation === 'unique_entity_id') {
+                                    // Check if entity ID already exists
+                                    const entityId = value.replace(/\s+/g, '_');
+                                    const existingEntity = ModuleAPI.get(entityId);
+                                    if (existingEntity && existingEntity.id && existingEntity.id !== activeGen.entityId &&
+                                        (existingEntity.aliases || existingEntity.GameplayTags || existingEntity.components)) {
+                                        validationResult = false;
+                                        validationMessage = `Entity '${value}' already exists`;
+                                    }
+                                }
+                            } else if (typeof fieldDef.validation === 'function') {
+                                // Custom validation function
+                                try {
+                                    validationResult = fieldDef.validation(value, entity, ModuleAPI);
+                                    if (validationResult !== true && typeof validationResult === 'string') {
+                                        validationMessage = validationResult;
+                                        validationResult = false;
+                                    }
+                                } catch (e) {
+                                    console.log(`${MODULE_NAME}: Validation function error: ${e.message}`);
+                                    validationResult = false;
+                                    validationMessage = 'Validation error';
+                                }
+                            }
+
+                            // If validation failed, track rejection and skip this field
+                            if (!validationResult) {
+                                console.log(`${MODULE_NAME}: Validation failed for ${fieldName}: ${validationMessage}`);
+
+                                // Track rejected values for debugging and avoiding re-suggestions
+                                const rejectedPath = `${activeGen.entityId}.generationwizard.rejected_${fieldName}`;
+                                let rejectedValues = ModuleAPI.get(rejectedPath) || [];
+                                if (!rejectedValues.includes(value)) {
+                                    rejectedValues.push(value);
+                                    ModuleAPI.set(rejectedPath, rejectedValues);
+                                }
+
+                                // Skip storing this field - it will be re-requested
+                                continue;
+                            }
+                        }
+
+                        // Apply to entity using maps_to from blueprint
+                        if (fieldDef.maps_to) {
+                            const success = applyMapsTo(activeGen.entityId, fieldDef.maps_to, parsedValue);
+                            if (!success) {
+                                console.log(`${MODULE_NAME}: Failed to apply ${fieldName} to ${fieldDef.maps_to}`);
+                            }
+                        } else {
+                            if (debug) console.log(`${MODULE_NAME}: No maps_to defined for field ${fieldName}`);
+                        }
+
+                        // Mark as collected
+                        if (!genComponent.fields_collected) {
+                            genComponent.fields_collected = {};
+                        }
+                        // Store the original value for empty inventory items, not the marker
+                        if (parsedValue && parsedValue._empty === true) {
+                            genComponent.fields_collected[fieldName] = 'None';
+                        } else {
+                            genComponent.fields_collected[fieldName] = parsedValue;
+                        }
+                        anyCollected = true;
+                    }
+                }
+
+                // Save progress
+                if (anyCollected) {
+                    ModuleAPI.save(activeGen.entityId, entity);
+
+                    // Check if all fields are now collected (expansion already happened in prompt builder)
+                    const stillNeeded = [];
+                    if (generation.fields) {
+                        for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                            // Skip expansion templates and computed fields - they don't need to be collected
+                            if (fieldDef.type === 'expansion' || fieldDef.source === 'computed') continue;
+
+                            if (!genComponent.fields_collected[fieldName]) {
+                                stillNeeded.push(fieldName);
+                            }
+                        }
+                    }
+
+                    if (stillNeeded.length === 0) {
+                        // All fields collected, finalize
+                        if (debug) console.log(`${MODULE_NAME}: All fields collected, finalizing entity`);
+                        finalizeEntity(activeGen.entityId, entity);
+                        return 'completed';
+                    }
+                }
+
+                return anyCollected;
+            } catch (e) {
+                console.log(`${MODULE_NAME}: Error processing response: ${e.message}`);
+                return false;
+            }
+        }
+
+        // Helper: Parse fields from response text with multiple strategies
+        function parseFields(text, expectedKeys) {
+            const results = {};
+
+            if (!text || !expectedKeys || expectedKeys.length === 0) {
+                return results;
+            }
+
+            // Trim the text to remove leading/trailing whitespace
+            text = text.trim();
+
+            // Try different parsing strategies
+            const strategies = ['keyValue', 'json', 'fuzzy'];
+
+            for (const strategy of strategies) {
+                const parsed = parseWithStrategy(text, expectedKeys, strategy);
+                if (Object.keys(parsed).length > 0) {
+                    // Merge results, prioritizing new findings
+                    Object.assign(results, parsed);
+                }
+            }
+
+            return results;
+        }
+
+        // Parse with specific strategy
+        function parseWithStrategy(text, expectedKeys, strategy) {
+            const results = {};
+
+            if (debug) {
+                console.log(`${MODULE_NAME}: Trying strategy: ${strategy}`);
+            }
+
+            switch (strategy) {
+                case 'keyValue':
+                    // Standard KEY: value parsing with multi-line support
+                    const lines = text.split('\n');
+                    let currentKey = null;
+                    let currentValue = [];
+
+                    for (let i = 0; i < lines.length; i++) {
+                        const line = lines[i];
+                        // Check if this line starts with an expected key
+                        let foundKey = null;
+                        for (const key of expectedKeys) {
+                            // Try exact match for this key with multiple patterns
+                            const patterns = [
+                                `^\\s*${key}:\\s*(.*)$`,           // KEY: value (value optional for multi-line)
+                                `^\\s*\\*\\*${key}\\*\\*:\\s*(.*)$`, // **KEY**: value (value optional)
+                                `^\\s*${key}\\s*=\\s*(.*)$`         // KEY = value (value optional)
+                            ];
+
+                            for (const pattern of patterns) {
+                                const regex = new RegExp(pattern, 'i');
+                                const match = line.match(regex);
+                                if (match) {
+                                    // Save previous key-value if exists
+                                    if (currentKey) {
+                                        results[currentKey] = currentValue.join('\n').trim();
+                                    }
+                                    // Start new key-value
+                                    foundKey = key;
+                                    currentKey = key;
+                                    const initialValue = match[1] || '';
+                                    currentValue = initialValue ? [initialValue] : [];
+                                    if (debug && !initialValue) {
+                                        console.log(`${MODULE_NAME}: Found key ${key} with no initial value (multi-line expected)`);
+                                    }
+                                    break;
+                                }
+                            }
+                            if (foundKey) break;
+                        }
+
+                        // If no key found and we're collecting a value, append to current
+                        if (!foundKey && currentKey) {
+                            // Check for multi-line value continuation
+                            // Don't include lines that look like new keys (all caps followed by colon)
+                            if (line.trim() && !line.match(/^\*{0,2}[A-Z][A-Z_]+\*{0,2}[:=]/)) {
+                                currentValue.push(line);
+                            }
+                        }
+                    }
+
+                    // Save the last key-value pair
+                    if (currentKey) {
+                        results[currentKey] = currentValue.join('\n').trim();
+                        if (debug && (currentKey === 'OBJECTIVES' || currentKey === 'ITEM_REWARDS')) {
+                            console.log(`${MODULE_NAME}: Collected ${currentKey}: "${results[currentKey].substring(0, 100)}"`);
+                        }
+                    }
+                    break;
+
+                case 'json':
+                    // Try to parse as JSON object
+                    try {
+                        const jsonMatch = text.match(/\{[\s\S]*\}/);
+                        if (jsonMatch) {
+                            const parsed = JSON.parse(jsonMatch[0]);
+                            for (const key of expectedKeys) {
+                                // Check various case variations
+                                const variations = [
+                                    key,
+                                    key.toLowerCase(),
+                                    key.charAt(0).toLowerCase() + key.slice(1)
+                                ];
+                                for (const variant of variations) {
+                                    if (parsed[variant] !== undefined) {
+                                        results[key] = String(parsed[variant]);
+                                        break;
+                                    }
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        // JSON parsing failed, that's okay
+                    }
+                    break;
+
+                case 'fuzzy':
+                    // Fuzzy matching - look for keys anywhere in the text
+                    for (const key of expectedKeys) {
+                        // Skip if we already have this key from a better strategy
+                        if (results[key]) continue;
+
+                        // Create a more flexible pattern
+                        const fuzzyPattern = new RegExp(
+                            `${key}[:\\s=]+([^\\n]+)`,
+                            'i'
+                        );
+                        const match = text.match(fuzzyPattern);
+                        if (match) {
+                            // Clean up captured value - remove leading markdown asterisks
+                            let value = match[1].trim();
+                            value = value.replace(/^\*+\s*/, '').replace(/\s*\*+$/, '');
+                            results[key] = value;
+                        }
+                    }
+                    break;
+            }
+
+            return results;
+        }
+
+        // Helper: Prepare prompt from component
+        function preparePromptFromComponent(entity) {
+            const genComponent = entity.generationwizard;
+            if (!genComponent) return null;
+
+            const activeGenName = genComponent.activeGeneration || 'initial';
+            const generation = genComponent.generations?.[activeGenName];
+            if (!generation) return null;
+
+            // IMPORTANT: Process computed fields and expand templates BEFORE building prompt
+            const collectedFields = genComponent.fields_collected || {};
+
+            // Process computed fields first
+            processComputedFields(generation, collectedFields);
+
+            // Expand template fields based on computed values
+            const expanded = expandFieldTemplates(generation, collectedFields);
+            if (expanded && debug) {
+                console.log(`${MODULE_NAME}: Expanded template fields in prompt builder`);
+            }
+
+            // Build context for variable substitution
+            const context = {
+                trigger_name: genComponent.trigger || entity.info?.trigger_name || entity.info?.displayname || entity.id,
+                currentLocation: entity.info?.currentLocation || 'unknown',
+                entityId: entity.id
+            };
+
+            // Helper to process text with variable substitution
+            function processText(text) {
+                if (!text) return '';
+                // Support both $(variable) and {variable} syntax
+                text = text.replace(/\$\(([^)]+)\)/g, (match, key) => {
+                    return context[key] || match;
+                });
+                text = text.replace(/\{([^}]+)\}/g, (match, key) => {
+                    return context[key] || match;
+                });
+                return text;
+            }
+
+            // Build prompt from sections
+            let prompt = '\n\n';
+
+            // Add prompt template sections if available
+            if (generation.promptTemplate?.sections) {
+                const sections = generation.promptTemplate.sections;
+
+                // Header
+                if (sections.header) {
+                    for (const section of sections.header) {
+                        const sectionText = typeof section === 'string' ? section : (section.text || '');
+                        if (sectionText) {
+                            const processed = processText(sectionText);
+                            prompt += processed + '\n';
+                        }
+                    }
+                }
+
+                // Add a single newline before fields if there was header content
+                if (sections.header && sections.header.length > 0) {
+                    prompt += '\n';
+                }
+
+                // Field requests for uncollected fields
+                const collectedFields = genComponent.fields_collected || {};
+                if (generation.fields) {
+                    for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                        // Skip computed and expansion fields - they're not collected from AI
+                        if (fieldDef.source === 'computed' || fieldDef.type === 'expansion') continue;
+
+                        if (!collectedFields[fieldName]) {
+                            const key = fieldDef.key || fieldName.toUpperCase();
+                            if (fieldDef.prompt && fieldDef.prompt.uncollected) {
+                                prompt += processText(fieldDef.prompt.uncollected) + '\n';
+                            } else {
+                                prompt += `${key}: [Provide ${fieldName}]\n`;
+                            }
+                        }
+                    }
+                }
+
+                // Footer
+                if (sections.footer) {
+                    prompt += '\n';  // Single newline before footer
+                    for (const section of sections.footer) {
+                        const sectionText = typeof section === 'string' ? section : (section.text || '');
+                        if (sectionText) {
+                            const processed = processText(sectionText);
+                            prompt += processed + '\n';
+                        }
+                    }
+                }
+            } else {
+                // Fallback: Simple field listing
+                prompt += 'Generate the following entity details:\n\n';
+                const collectedFields = genComponent.fields_collected || {};
+                if (generation.fields) {
+                    for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                        if (!collectedFields[fieldName]) {
+                            const key = fieldDef.key || fieldName.toUpperCase();
+                            prompt += `${key}: [${fieldDef.description || fieldName}]\n`;
+                        }
+                    }
+                }
+            }
+
+            return prompt;
+        }
+
+        // Helper: Finalize entity generation (GREEDY COMPONENT - never remove)
+        function finalizeEntity(entityId, entity = null) {
+            // Use provided entity or reload from storage
+            if (!entity) {
+                entity = ModuleAPI.get(entityId);
+            }
+            if (!entity?.generationwizard) return;
+
+            const genComponent = entity.generationwizard;
+            const activeGen = genComponent.activeGeneration;
+
+            // Delete the completed generation object to save memory (but keep the component)
+            if (activeGen && genComponent.generations?.[activeGen]) {
+                delete genComponent.generations[activeGen];
+            }
+
+            // Set component to dormant state (component persists!)
+            genComponent.state = 'dormant';
+            genComponent.activeGeneration = null;
+
+            // Clean up temporary data that's no longer needed
+            if (genComponent.fields_collected) {
+                delete genComponent.fields_collected;
+            }
+            if (genComponent.trigger) {
+                delete genComponent.trigger;
+            }
+            // Clean up any rejected value tracking
+            for (const key of Object.keys(genComponent)) {
+                if (key.startsWith('rejected_')) {
+                    delete genComponent[key];
+                }
+            }
+
+            // Activate display when generation is complete
+            if (entity.components?.includes('display')) {
+                if (!entity.display) entity.display = {};
+                entity.display.active = true;
+            }
+
+            // Rename entity based on USERNAME (which should be in displayname)
+            const finalName = entity.info?.displayname || entity.aliases?.[0];
+            if (debug) {
+                console.log(`${MODULE_NAME}: Checking rename - displayname: "${entity.info?.displayname}", aliases[0]: "${entity.aliases?.[0]}", finalName: "${finalName}"`);
+            }
+            if (finalName && finalName !== entityId) {
+                // Create renamed entity - use the displayname as-is, no transformation
+                const renamedId = finalName;  // No transformation - use displayname directly
+                if (renamedId !== entityId && !ModuleAPI.get(renamedId)) {
+                    // Copy to new ID
+                    entity.id = renamedId;
+                    ModuleAPI.save(renamedId, entity);
+                    // Delete old ID
+                    ModuleAPI.del(entityId);
+                    console.log(`${MODULE_NAME}: Renamed entity from ${entityId} to ${renamedId}`);
+                    entityId = renamedId;
+                }
+            }
+
+            ModuleAPI.save(entityId, entity);
+            console.log(`${MODULE_NAME}: Completed generation for ${entityId}, component remains dormant`);
+
+            // Check for any queued generators to activate next
+            const queued = findQueuedGenerators();
+            if (queued.length > 0) {
+                console.log(`${MODULE_NAME}: Activating next queued generator: ${queued[0].entityId}`);
+                setGeneratorState(queued[0].entityId, 'generating');
+            }
+        }
+
+
+        // Register tools
+        ModuleAPI.registerTool('gw_abort', function(params) {
+            // Abort any active generation
+            const activeGen = findActiveGenerator();
+            if (activeGen) {
+                setGeneratorState(activeGen.entityId, 'aborted');
+                console.log(`${MODULE_NAME}: Aborted generation for ${activeGen.entityId}`);
+                return 'executed';
+            }
+            return 'executed';
+        });
+
+        ModuleAPI.registerTool('gw_status', function(params) {
+            const activeGen = findActiveGenerator();
+            if (!activeGen) {
+                const queued = findQueuedGenerators();
+                if (queued.length > 0) {
+                    console.log(`${MODULE_NAME}: ${queued.length} entities queued for generation`);
+                } else {
+                    console.log(`${MODULE_NAME}: GenerationWizard is idle`);
+                }
+            } else {
+                console.log(`${MODULE_NAME}: Generating entity: ${activeGen.entityId}`);
+            }
+            return 'executed';
+        });
+
+        ModuleAPI.registerTool('gw_npc', function(params) {
+            const [name, location] = params;
+
+            // Generate unique ID - use provided name or create timestamp-based one
+            const displayName = name || `NPC_${Date.now()}`;
+            const characterId = displayName;  // Use displayName as-is, no transformation
+
+            // Check if character already exists
+            if (ModuleAPI.get(characterId)) {
+                console.log(`${MODULE_NAME}: Character ${characterId} already exists`);
+                return 'malformed';
+            }
+
+            // Structure data for blueprint
+            const entityData = {
+                id: characterId,
+                info: {
+                    trigger_name: displayName  // Store the trigger name that caused generation
+                },
+                generationwizard: {
+                    trigger: displayName  // Store original name for prompt context
+                }
+            };
+
+            // Add location - use provided location or player's current location
+            if (location) {
+                entityData.info.currentLocation = location;
+            } else {
+                // Try to get player's current location
+                const player = ModuleAPI.get('player');
+                if (player && player.info && player.info.currentLocation) {
+                    entityData.info.currentLocation = player.info.currentLocation;
+                    console.log(`${MODULE_NAME}: Using player's current location: ${player.info.currentLocation}`);
+                }
+            }
+
+            // Instantiate from Character blueprint
+            const entity = ModuleAPI.instantiateBlueprint('Character', entityData);
+            if (entity) {
+                console.log(`${MODULE_NAME}: Queued NPC generation for: ${characterId}`);
+                return 'executed';
+            }
+            console.log(`${MODULE_NAME}: Failed to instantiate Character blueprint`);
+            return 'malformed';
+        });
+
+        ModuleAPI.registerTool('gw_location', function(params) {
+            const [name, direction] = params;
+
+            // Generate unique ID - use provided name or create timestamp-based one
+            const displayName = name || `Location_${Date.now()}`;
+            const locationId = displayName;  // Use displayName as-is, no transformation
+
+            // Check if location already exists
+            if (ModuleAPI.get(locationId)) {
+                console.log(`${MODULE_NAME}: Location ${locationId} already exists`);
+                return 'malformed';
+            }
+
+            // Structure data for blueprint
+            const entityData = {
+                id: locationId,
+                info: {
+                    displayname: displayName,  // Set the displayname directly
+                    trigger_name: displayName
+                },
+                generationwizard: {
+                    trigger: displayName
+                }
+            };
+
+            // Add connection info if direction provided
+            if (direction) {
+                entityData.pathways = { [direction]: 'pending' };
+            }
+
+            // Instantiate from Location blueprint
+            const entity = ModuleAPI.instantiateBlueprint('Location', entityData);
+            if (entity) {
+                console.log(`${MODULE_NAME}: Queued location generation for: ${locationId}`);
+                return 'executed';
+            }
+            return 'malformed';
+        });
+
+        ModuleAPI.registerTool('gw_quest', function(params) {
+            const [name, typeParam] = params;
+
+            // Generate unique ID - use provided name or create timestamp-based one
+            const displayName = name || `Quest_${Date.now()}`;
+            const questId = displayName;  // Use displayName as-is, no transformation
+
+            // Check if quest already exists
+            if (ModuleAPI.get(questId)) {
+                console.log(`${MODULE_NAME}: Quest ${questId} already exists`);
+                return 'malformed';
+            }
+
+            // Determine quest type - code decides, not user
+            let questType = typeParam;
+            if (!questType) {
+                // Randomize quest type with weighted distribution
+                const rand = Math.random();
+                if (rand < 0.05) {
+                    questType = "Story";        // 5% chance - Main story quests
+                } else if (rand < 0.75) {
+                    questType = "Side";         // 70% chance - Side quests
+                } else if (rand < 0.90) {
+                    questType = "Hidden";       // 15% chance - Hidden quests
+                } else {
+                    questType = "Raid";         // 10% chance - Raid quests
+                }
+                if (debug) console.log(`${MODULE_NAME}: Randomized quest type: ${questType}`);
+            }
+
+            // Structure data for blueprint
+            const entityData = {
+                id: questId,
+                quest: {
+                    type: questType
+                },
+                generationwizard: {
+                    trigger: displayName,
+                    fields_collected: {
+                        type: questType  // Mark type as already collected
+                    }
+                }
+            };
+
+            // Instantiate from Quest blueprint
+            const entity = ModuleAPI.instantiateBlueprint('Quest', entityData);
+            if (entity) {
+                console.log(`${MODULE_NAME}: Queued quest generation for: ${questId}`);
+                return 'executed';
+            }
+            return 'malformed';
+        });
+    }
+    //#endregion GenerationWizardModule
+
+    // ========================================
+    // SceneModule - Current scene card management
+    // ========================================
+    //#region SceneModule
+    {
+        const MODULE_NAME = 'SceneModule';
+
+        function createDefaultCurrentScene() {
+            // Find the first user-controlled entity
+            const userControlled = ModuleAPI.queryTags('UserControlled');
+
+            // Use first user-controlled entity name or default to 'player'
+            let playerName = 'player';
+            if (userControlled && userControlled.length > 0) {
+                playerName = userControlled[0].id.toLowerCase();
+            }
+
+            const defaultText = (
+                `[**Current Scene** Location: get(player.info.currentLocation) | get(time.formatted) (get(time.period))\n` +
+                `**Available Tools:**\n` +
+                `• Location: update_location(name, place) discover_location(character, place, direction) connect_locations(placeA, placeB, direction)\n` +
+                `  - Directions: north, south, east, west, inside (enter), outside (exit)\n` +
+                `• Time: advance_time(hours, minutes)\n` +
+                `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty)\n` +
+                `• Relations: update_relationship(name1, name2, points)\n` +
+                `• Quests: offer_quest(npc, quest_name, type) accept_quest(name, quest_name, quest_giver, type) update_quest(name, quest_name, stage) complete_quest(name, quest_name)\n` +
+                `• Progression: add_levelxp(name, amount) add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
+                `• Stats: update_attribute(name, attribute, value) update_hp(name, current) update_max_hp(name, max)\n` +
+                `• Combat: deal_damage(source, target, amount)]`
+            );
+
+            Utilities.storyCard.add({
+                title: '[CURRENT SCENE]',
+                type: 'data',
+                entry: defaultText,
+                description: 'Edit this card to customize what appears in the scene block. Use get(params) for dynamic values.',
+                keys: '.,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"'
+            });
+
+            if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Created default Current Scene template with player: ${playerName}`);
+            return defaultText;
+        }
+
+        function moveCurrentSceneCard(contextText) {
+            // Don't move scene if generation is active
+            for (const [key, entity] of Object.entries(dataCache)) {
+                if (entity?.generationwizard?.state === 'generating') {
+                    // Generation is active, don't modify context
+                    return contextText;
+                }
+            }
+
+            // Get or create the Current Scene card
+            let sceneCard = Utilities.storyCard.get('[CURRENT SCENE]');
+            if (!sceneCard) {
+                // Create the default scene card
+                createDefaultCurrentScene();
+                sceneCard = Utilities.storyCard.get('[CURRENT SCENE]');
+            }
+
+            // Get the scene content
+            const sceneContent = sceneCard.entry;
+            if (!sceneContent) {
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: No scene content to move`);
+                return contextText;
+            }
+
+            // Try to find the exact scene content in the context
+            let sceneIndex = contextText.indexOf(sceneContent);
+            let sceneToRemove = sceneContent;
+
+            if (sceneIndex === -1) {
+                // Exact match not found - try to find it by parts
+                const sceneLines = sceneContent.split('\n');
+                const firstLine = sceneLines[0];
+                const lastLine = sceneLines[sceneLines.length - 1];
+
+                sceneIndex = contextText.indexOf(firstLine);
+
+                if (sceneIndex === -1) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Scene not found in context at all`);
+                    return contextText;
+                }
+
+                // Find where the scene ends by looking for the last line
+                const endIndex = contextText.indexOf(lastLine, sceneIndex);
+                if (endIndex === -1) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Scene end not found, cannot move`);
+                    return contextText;
+                }
+
+                // Extract what's actually in the context
+                sceneToRemove = contextText.substring(sceneIndex, endIndex + lastLine.length);
+            }
+
+            // Remove the scene from its current position
+            let modifiedContext = contextText.substring(0, sceneIndex) +
+                                 contextText.substring(sceneIndex + sceneToRemove.length);
+
+            // Clean up any resulting multiple newlines
+            modifiedContext = modifiedContext.replace(/\n\n\n+/g, '\n\n');
+
+            // Split context by sentences to find insertion point
+            const sentences = modifiedContext.split(/(?<=[.!?])\s+/);
+
+            // Try to place scene 6 sentences from the end - EXACTLY LIKE GAMESTATE.JS
+            const sentencesFromEnd = 6;
+
+            if (sentences.length <= sentencesFromEnd) {
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Not enough sentences (${sentences.length}), putting scene at start`);
+                return sceneContent + '\n\n' + modifiedContext;
+            }
+
+            // Calculate insertion point
+            const insertIndex = sentences.length - sentencesFromEnd;
+
+            // Rebuild context with scene inserted
+            const beforeSentences = sentences.slice(0, insertIndex);
+            const afterSentences = sentences.slice(insertIndex);
+
+            // Join the parts
+            let result = beforeSentences.join(' ');
+            if (result && !result.endsWith('\n')) {
+                result += '\n\n';
+            }
+            result += sceneContent;
+            if (afterSentences.length > 0) {
+                result += '\n\n' + afterSentences.join(' ');
+            }
+
+            if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Positioned Current Scene 6 sentences from end`);
+            return result;
+        }
+
+        // Register context hook to move scene card
+        ModuleAPI.registerHook('context', function(text) {
+            return moveCurrentSceneCard(text);
+        });
+    }
+    //#endregion SceneModule
+
+    // ========================================
+    // BlueprintModule - Entity templates
+    // ========================================
+    //#region BlueprintModule
+    {
+        const MODULE_NAME = 'BlueprintModule';
+
+        // Create default blueprints if they don't exist
+        function createDefaultBlueprints() {
+            const blueprints = {
+                Character: {
+                    id: 'Character',
+                    GameplayTags: ['Character'],
+                    components: ['info', 'stats', 'skills', 'attributes', 'inventory', 'relationships', 'display'],
+
+                    // Default values for components
+                    info: {
+                        displayname: null,   // The character's display name (username)
+                        realname: null,      // The character's real name (if different from username)
+                        gender: null,
+                        currentLocation: 'Unknown',
+                        description: null,
+                        appearance: null,
+                        personality: null
+                    },
+
+                    stats: {
+                        level: { value: 1, xp: { current: 0, max: 500 } },
+                        hp: { current: 100, max: 100 }
+                    },
+
+                    skills: {},  // Skills are added dynamically
+
+                    attributes: {
+                        STRENGTH: { value: 10 },
+                        AGILITY: { value: 10 },
+                        VITALITY: { value: 10 },
+                        DEXTERITY: { value: 10 }
+                    },
+
+                    inventory: {},  // Items are added dynamically
+
+                    relationships: {},  // Relationships are added dynamically
+                    display: {
+                        active: false,  // Will be set to true when generation completes
+                        prefix: "<$# Character>",
+                        sections: {
+                            header: {
+                                line: "nameline",
+                                priority: 10,
+                                template: "## **{info.displayname}**",
+                                condition: "info.displayname"
+                            },
+                            realname: {
+                                line: "nameline",
+                                priority: 11,
+                                template: "[{info.realname}]",
+                                condition: "info.realname"
+                            },
+                            infoline: {
+                                line: "infoline",
+                                priority: 10,
+                                template: "Gender: {info.gender} | Level: {stats.level.value} ({stats.level.xp.current}/{stats.level.xp.max}) | HP: {stats.hp.current}/{stats.hp.max} | Location: {info.currentLocation}",
+                                condition: "info.gender"
+                            },
+                            attributes: {
+                                line: "section",
+                                priority: 20,
+                                template: "**Attributes**\nVITALITY: {attributes.VITALITY.value} | STRENGTH: {attributes.STRENGTH.value} | DEXTERITY: {attributes.DEXTERITY.value} | AGILITY: {attributes.AGILITY.value}",
+                                condition: "attributes"
+                            },
+                            appearance: {
+                                line: "section",
+                                priority: 30,
+                                template: "**Appearance**\n{info.appearance}",
+                                condition: "info.appearance"
+                            },
+                            personality: {
+                                line: "section",
+                                priority: 40,
+                                template: "**Personality**\n{info.personality}",
+                                condition: "info.personality"
+                            },
+                            background: {
+                                line: "section",
+                                priority: 50,
+                                template: "**Background**\n{info.description}",
+                                condition: "info.description"
+                            },
+                            skills: {
+                                line: "section",
+                                priority: 60,
+                                template: "**Skills**\n{skills.*→ • {*}: Level {*.level} ({*.xp.current}/{*.xp.max} XP)}",
+                                condition: "skills"
+                            },
+                            inventory: {
+                                line: "section",
+                                priority: 70,
+                                template: "**Inventory**\n{inventory.*→ • {*} x{*.quantity}}",
+                                condition: "inventory.*"
+                            },
+                            relationships: {
+                                line: "section",
+                                priority: 80,
+                                template: "**Relationships**\n{relationships.*→ • {*} ({*.value}): {$relFlavor:info.displayname,*.value}}",
+                                condition: "relationships.*"
+                            }
+                        }
+                    },
+                    // Generation wizard configuration (if used)
+                    generationwizard: {
+                        state: "queued",
+                        activeGeneration: "initial",
+                        generations: {
+                            initial: {
+                                blueprint: "Character",
+                                stage: "collecting_fields",
+                                promptTemplate: "embedded",
+                                fields: {
+                                    displayname: {
+                                        maps_to: "*.info.displayname",
+                                        validation: "unique_entity_id",  // Ensure the name is unique
+                                        key: "USERNAME",  // Still use USERNAME in the prompt for characters
+                                        prompt: {
+                                            uncollected: "USERNAME: [Create a unique username/gamertag like SwordMaster2000, DarkKnight92]",
+                                            known: "Username: $(value)",
+                                            priority: 10
+                                        }
+                                    },
+                                    realname: {
+                                        maps_to: "*.info.realname",
+                                        key: "REALNAME",
+                                        prompt: {
+                                            uncollected: "REALNAME: [Their real-world name, if different from username]",
+                                            known: "Real Name: $(value)",
+                                            priority: 15
+                                        }
+                                    },
+                                    gender: {
+                                        maps_to: "*.info.gender",
+                                        key: "GENDER",
+                                        prompt: {
+                                            uncollected: "GENDER: [Male/Female/Other]",
+                                            known: "Gender: $(value)",
+                                            priority: 20
+                                        }
+                                    },
+                                    appearance: {
+                                        maps_to: "*.info.appearance",
+                                        key: "APPEARANCE",
+                                        prompt: {
+                                            uncollected: "APPEARANCE: [Physical characteristics only - height, build, hair, eyes, facial features, distinguishing marks. Do NOT describe clothing or equipment]",
+                                            known: "Appearance: $(value)",
+                                            priority: 40
+                                        }
+                                    },
+                                    description: {
+                                        maps_to: "*.info.description",
+                                        key: "BACKGROUND",
+                                        prompt: {
+                                            uncollected: "BACKGROUND: [Their real-world life - occupation, interests. Do NOT mention SAO or why they joined]",
+                                            known: "Background: $(value)",
+                                            priority: 50
+                                        }
+                                    },
+                                    personality: {
+                                        maps_to: "*.info.personality",
+                                        key: "PERSONALITY",
+                                        prompt: {
+                                            uncollected: "PERSONALITY: [Their personality traits - how they act, think, and interact with others]",
+                                            known: "Personality: $(value)",
+                                            priority: 55
+                                        }
+                                    }
+                                },
+                                promptTemplate: {
+                                    sectionOrder: ["header", "fields", "footer"],
+                                    sections: {
+                                        header: [
+                                            {
+                                                text: "=== CARDINAL SYSTEM - Character Generation ===",
+                                                priority: 0
+                                            },
+                                            {
+                                                text: "\nThe character \"$(trigger_name)\" was just referenced and needs to be generated.",
+                                                priority: 1,
+                                                condition: "$(trigger_name)"
+                                            },
+                                            {
+                                                text: "\nA new character needs to be generated.",
+                                                priority: 1,
+                                                condition: "!$(trigger_name)"
+                                            },
+                                            {
+                                                text: "\n\n==== REQUIRED INFORMATION ====\nProvide the following details:",
+                                                priority: 10
+                                            }
+                                        ],
+                                        footer: [
+                                            {
+                                                text: "\nBe creative and consistent with the game world.\nRespond ONLY with the requested fields. No narrative or additional text.\nRespond with each field on its own line:\nKEY: value",
+                                                priority: 100
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+
+                Location: {
+                    GameplayTags: ['Location'],
+                    components: ['info', 'pathways', 'display'],
+                    info: {
+                        displayname: null,
+                        description: null,
+                        type: null,
+                        danger_level: null
+                    },
+                    pathways: {},  // Format: { "north": { destination: "location_id", description: "optional desc" } }
+                    display: {
+                        active: false,  // Will be set to true when generation completes
+                        prefix: "<$# World Map><$## Floor One>",
+                        sections: {
+                            header: {
+                                line: "nameline",
+                                priority: 10,
+                                template: "### **{info.displayname}**",
+                                condition: "info.displayname"
+                            },
+                            type: {
+                                line: "infoline",
+                                priority: 20,
+                                template: "Type: {info.type}",
+                                condition: "info.type"
+                            },
+                            danger: {
+                                line: "infoline",
+                                priority: 30,
+                                template: "Danger: {info.danger_level}",
+                                condition: "info.danger_level"
+                            },
+                            description: {
+                                line: "section",
+                                priority: 10,
+                                template: "{info.description}",
+                                condition: "info.description"
+                            },
+                            pathways: {
+                                line: "section",
+                                priority: 20,
+                                template: "**Paths:**\n{pathways.*→ • {*}: {*.destination}}",
+                                condition: "pathways.*"
+                            }
+                        }
+                    },
+                    // Generation wizard configuration (if used)
+                    generationwizard: {
+                        state: "queued",
+                        activeGeneration: "initial",
+                        generations: {
+                            initial: {
+                                blueprint: "Location",
+                                stage: "collecting_fields",
+                                promptTemplate: "embedded",
+                                fields: {
+                                    description: {
+                                        maps_to: "*.info.description",
+                                        required: true,
+                                        key: "DESCRIPTION",
+                                        prompt: {
+                                            uncollected: "DESCRIPTION: [Detailed description of the location - what it looks like, sounds, smells, notable features. 2-3 sentences]",
+                                            known: "Description: $(value)",
+                                            priority: 20
+                                        }
+                                    },
+                                    type: {
+                                        maps_to: "*.info.type",
+                                        key: "TYPE",
+                                        prompt: {
+                                            uncollected: "TYPE: [Town/Dungeon/Field/Safe Zone/Boss Room/Shop/etc.]",
+                                            known: "Type: $(value)",
+                                            priority: 40
+                                        }
+                                    },
+                                    danger_level: {
+                                        maps_to: "*.info.danger_level",
+                                        key: "DANGER_LEVEL",
+                                        prompt: {
+                                            uncollected: "DANGER_LEVEL: [Safe/Low/Medium/High/Extreme]",
+                                            known: "Danger Level: $(value)",
+                                            priority: 50
+                                        }
+                                    },
+                                    pathways: {
+                                        maps_to: "*.pathways",
+                                        parser: "pathways",
+                                        key: "EXITS",
+                                        prompt: {
+                                            uncollected: "EXITS: [List available exits, one per line]\n- [Direction]: [Destination]",
+                                            known: "Exits: $(value)",
+                                            priority: 60
+                                        }
+                                    }
+                                },
+                                promptTemplate: {
+                                    sectionOrder: ["header", "fields", "footer"],
+                                    sections: {
+                                        header: [
+                                            {
+                                                text: "=== LOCATION GENERATION SYSTEM ===",
+                                                priority: 0
+                                            },
+                                            {
+                                                text: "\nThe location \"$(trigger_name)\" needs to be generated for the game world.",
+                                                priority: 1
+                                            },
+                                            {
+                                                text: "\n==== REQUIRED LOCATION DETAILS ====\nProvide the following information:",
+                                                priority: 10
+                                            }
+                                        ],
+                                        footer: [
+                                            {
+                                                text: "\nCreate an immersive and atmospheric location.\nMake it feel alive and interesting to explore.\nRespond ONLY with the requested fields, each on its own line:\nKEY: value",
+                                                priority: 100
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+
+                Quest: {
+                    GameplayTags: ['Quest'],
+                    components: ['info', 'quest', 'objectives', 'rewards', 'display'],
+                    info: {
+                        displayname: null,
+                        description: null,
+                        difficulty: null,
+                    },
+                    quest: {
+                        status: 'available',
+                        giver: null,
+                        location: null,
+                        prerequisites: [],
+                        type: null
+                    },
+                    objectives: {},  // Objectives added dynamically
+                    rewards: {},     // Rewards added dynamically
+                    display: {
+                        active: false,  // Will be set to true when generation completes
+                        prefix: "<$# Quests>",
+                        sections: {
+                            header: {
+                                line: "nameline",
+                                priority: 10,
+                                template: "## **{info.displayname}**",
+                                condition: "info.displayname"
+                            },
+                            status: {
+                                line: "infoline",
+                                priority: 10,
+                                template: "Status: {quest.status}",
+                                condition: "quest.status"
+                            },
+                            type: {
+                                line: "infoline",
+                                priority: 11,
+                                template: "Type: {quest.type}",
+                                condition: "quest.type"
+                            },
+                            difficulty: {
+                                line: "infoline",
+                                priority: 15,
+                                template: "Difficulty: {info.difficulty}",
+                                condition: "info.difficulty"
+                            },
+                            giver: {
+                                line: "infoline",
+                                priority: 20,
+                                template: "Giver: {quest.giver}",
+                                condition: "quest.giver"
+                            },
+                            location: {
+                                line: "infoline",
+                                priority: 30,
+                                template: "Location: {quest.location}",
+                                condition: "quest.location"
+                            },
+                            description: {
+                                line: "section",
+                                priority: 10,
+                                template: "{info.description}",
+                                condition: "info.description"
+                            },
+                            objectives: {
+                                line: "section",
+                                priority: 20,
+                                template: "**Objectives:**\n{objectives.*→ • {*.description}}",
+                                condition: "objectives.*"
+                            },
+                            rewards_xp: {
+                                line: "section",
+                                priority: 30,
+                                template: "**Rewards:**\n• Experience: {rewards.xp} XP",
+                                condition: "rewards.xp"
+                            },
+                            rewards_gold: {
+                                line: "section",
+                                priority: 31,
+                                template: "• Gold: {rewards.gold}",
+                                condition: "rewards.gold"
+                            },
+                            rewards_items: {
+                                line: "section",
+                                priority: 32,
+                                template: "{rewards.items.*→ • {*} x{*.quantity}}",
+                                condition: "rewards.items.*"
+                            }
+                        }
+                    },
+                    // Generation wizard configuration (if used)
+                    generationwizard: {
+                        state: "queued",
+                        activeGeneration: "initial",
+                        generations: {
+                            initial: {
+                                blueprint: "Quest",
+                                stage: "collecting_fields",
+                                promptTemplate: "embedded",
+                                fields: {
+                                    displayname: {
+                                        maps_to: "*.info.displayname",
+                                        required: true,
+                                        key: "TITLE",
+                                        prompt: {
+                                            uncollected: "TITLE: [Create an engaging quest title]",
+                                            known: "Title: $(value)",
+                                            priority: 10
+                                        }
+                                    },
+                                    description: {
+                                        maps_to: "*.info.description",
+                                        required: true,
+                                        key: "DESCRIPTION",
+                                        prompt: {
+                                            uncollected: "DESCRIPTION: [Detailed quest story - what needs to be done, why it matters, and any background lore. 2-3 sentences]",
+                                            known: "Description: $(value)",
+                                            priority: 20
+                                        }
+                                    },
+                                    difficulty: {
+                                        maps_to: "*.info.difficulty",
+                                        key: "DIFFICULTY",
+                                        prompt: {
+                                            uncollected: "DIFFICULTY: [Easy/Medium/Hard/Legendary]",
+                                            known: "Difficulty: $(value)",
+                                            priority: 25
+                                        }
+                                    },
+                                    giver: {
+                                        maps_to: "*.quest.giver",
+                                        key: "GIVER",
+                                        prompt: {
+                                            uncollected: "GIVER: [NPC name who gives this quest]",
+                                            known: "Quest Giver: $(value)",
+                                            priority: 40
+                                        }
+                                    },
+                                    location: {
+                                        maps_to: "*.quest.location",
+                                        key: "LOCATION",
+                                        prompt: {
+                                            uncollected: "LOCATION: [Where this quest takes place]",
+                                            known: "Location: $(value)",
+                                            priority: 50
+                                        }
+                                    },
+                                    objective_count: {
+                                        source: "computed",
+                                        formula: '$(type) === "Story" ? Math.floor(Math.random() * 4) + 4 : $(type) === "Side" ? Math.floor(Math.random() * 3) + 2 : $(type) === "Hidden" ? Math.floor(Math.random() * 3) + 3 : $(type) === "Raid" ? Math.floor(Math.random() * 4) + 5 : Math.floor(Math.random() * 3) + 2'
+                                    },
+                                    objectives: {
+                                        type: "expansion",
+                                        count: "$(objective_count)",
+                                        template: {
+                                            fieldName: "objective_{i}",
+                                            maps_to: "*.objectives.objective_{i}.description",
+                                            key: "OBJECTIVE_{i}",
+                                            parser: "text",
+                                            prompt: {
+                                                uncollected: "OBJECTIVE_{i}: [Specific objective #{i} for this quest]",
+                                                known: "Objective {i}: $(value)",
+                                                priority: 60
+                                            }
+                                        }
+                                    },
+                                    xp_reward: {
+                                        maps_to: "*.rewards.xp",
+                                        parser: "number",
+                                        key: "XP_REWARD",
+                                        prompt: {
+                                            uncollected: "XP_REWARD: [Experience points (100-5000 based on difficulty)]",
+                                            known: "XP Reward: $(value)",
+                                            priority: 70
+                                        }
+                                    },
+                                    gold_reward: {
+                                        maps_to: "*.rewards.gold",
+                                        parser: "number",
+                                        key: "GOLD_REWARD",
+                                        prompt: {
+                                            uncollected: "GOLD_REWARD: [Gold coins (50-2000 based on difficulty)]",
+                                            known: "Gold Reward: $(value)",
+                                            priority: 80
+                                        }
+                                    },
+                                    item_rewards: {
+                                        maps_to: "*.rewards.items.{item}",
+                                        parser: "inventory",
+                                        key: "ITEM_REWARDS",
+                                        prompt: {
+                                            uncollected: "ITEM_REWARDS: [Single item reward as 'item_name x quantity', or 'None']",
+                                            known: "Item Rewards: $(value)",
+                                            priority: 90
+                                        }
+                                    }
+                                },
+                                promptTemplate: {
+                                    sectionOrder: ["header", "fields", "footer"],
+                                    sections: {
+                                        header: [
+                                            {
+                                                text: "=== QUEST GENERATION SYSTEM ===",
+                                                priority: 0
+                                            },
+                                            {
+                                                text: "\nA new quest needs to be generated for the game world.",
+                                                priority: 1
+                                            },
+                                            {
+                                                text: "\n==== REQUIRED QUEST DETAILS ====\nProvide the following information:",
+                                                priority: 10
+                                            }
+                                        ],
+                                        footer: [
+                                            {
+                                                text: "\nCreate an engaging quest that fits the game world.\nBalance rewards with difficulty.\nRespond ONLY with the requested fields, each on its own line:\nKEY: value",
+                                                priority: 100
+                                            }
+                                        ]
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            };
+
+            // Create blueprint cards if they don't exist
+            for (const [name, blueprint] of Object.entries(blueprints)) {
+                const cardTitle = `[SANE:BP] ${name}`;
+                if (!Utilities?.storyCard?.get(cardTitle)) {
+                    Utilities?.storyCard?.upsert({
                         title: cardTitle,
-                        value: `# Rewind System Data (Part ${i + 1})\nTracks tool execution history for state consistency.`,
-                        description: JSON.stringify(cardData),
+                        value: `# ${name} Blueprint\nTemplate for creating ${name} entities`,
+                        description: JSON.stringify(blueprint, null, 2),
+                        type: 'blueprint'
+                    });
+                }
+            }
+        }
+
+        // Register blueprint tools
+        ModuleAPI.registerTool('create_blueprint', function(params) {
+            const [name] = params;
+            if (!name) return 'malformed';
+
+            // Blueprint creation would be more complex in practice
+            // This is a simplified version
+            const blueprint = {
+                GameplayTags: [name],
+                components: ['info'],
+                info: {
+                    name: null,
+                    description: null
+                }
+            };
+
+            Utilities?.storyCard?.upsert({
+                title: `[SANE:BP] ${name}`,
+                value: `# ${name} Blueprint\nCustom blueprint`,
+                description: JSON.stringify(blueprint, null, 2),
+                type: 'blueprint'
+            });
+
+            debugLog('blueprint', `Created custom ${name} blueprint`);
+            return 'executed';
+        });
+
+        ModuleAPI.registerTool('list_blueprints', function(params) {
+            const blueprints = [];
+            // Would need to iterate story cards to find all [SANE:BP] cards
+            // For now, list the default ones
+            blueprints.push('Character', 'Location', 'Quest', 'Item');
+            debugLog('blueprint', `Available blueprints: ${blueprints.join(', ')}`);
+            return 'executed';
+        });
+
+        // Create defaults on init
+        createDefaultBlueprints();
+
+    }
+    //#endregion BlueprintModule
+
+    // ========================================
+    // CoreComponentsModule - Core schemas
+    // ========================================
+    //#region CoreComponentsModule
+    {
+        const MODULE_NAME = 'CoreComponentsModule';
+
+        // Define core component schemas (no display rules - those belong in entity display components)
+        const coreSchemas = [
+            {
+                name: 'info',
+                schema: {
+                    id: 'info',
+                    defaults: {
+                        name: null,
+                        description: null,
+                        currentLocation: null
+                    }
+                }
+            },
+            {
+                name: 'display',
+                schema: {
+                    id: 'display',
+                    defaults: {
+                        active: true,
+                        // Display component contains all formatting for the entity
+                        // Structure: display.componentName = [{ line, priority, format, condition }]
+                        // Example: display.info = [{ line: 'section', priority: 10, format: '**Description**\n{info.description}' }]
+                        separators: {
+                            nameline: ' ',
+                            infoline: ' | ',
+                            section: '\n\n',
+                            footer: '\n'
+                        },
+                        order: ['prefixline', 'nameline', 'infoline', 'section', 'footer']
+                    }
+                }
+            }
+        ];
+
+        // Create [SANE:S] cards for core schemas if they don't exist
+        for (const { name, schema } of coreSchemas) {
+            const existingCard = Utilities.storyCard.get(`[SANE:S] ${name}`);
+            if (!existingCard) {
+                Utilities.storyCard.upsert({
+                    title: `[SANE:S] ${name}`,
+                    value: `# ${name.charAt(0).toUpperCase() + name.slice(1)} Component Schema`,
+                    description: JSON.stringify(schema, null, 2),
+                    type: 'data'
+                });
+                if (debug) console.log(`${MODULE_NAME}: Created [SANE:S] ${name} Story Card`);
+            }
+
+            // Register the schema
+            ModuleAPI.registerSchema(name, schema);
+        }
+    }
+    //#endregion CoreComponentsModule
+
+    // ========================================
+    // CombatModule - Combat system
+    // ========================================
+    //#region CombatModule
+    {
+        const MODULE_NAME = 'CombatModule';
+
+        // Combat tools
+        ModuleAPI.registerTool('deal_damage', toolHelpers.createTool('deal_damage', 2, (params) => {
+            const [targetName, damage] = params;
+
+            const target = toolHelpers.getEntityOrTrack(targetName, 'deal_damage');
+            if (!target) return 'executed';
+
+            if (!target.stats || !target.stats.hp) return 'executed';
+
+            const dmg = validators.requirePositiveNumber(damage);
+            if (!dmg) {
+                if (MODULE_CONFIG.debug) console.log(`[deal_damage]: Invalid damage: ${damage}`);
+                return 'malformed';
+            }
+
+            const oldHp = target.stats.hp.current;
+            target.stats.hp.current = Math.max(0, oldHp - dmg);
+
+            ModuleAPI.save(targetName, target);
+            if (MODULE_CONFIG.debug) console.log(`[deal_damage]: ${targetName} took ${dmg} damage (${oldHp} → ${target.stats.hp.current})`);
+
+            return 'executed';
+        }));
+
+        // Register rewindable strategy for combat tools
+        ModuleAPI.registerRewindable('deal_damage', {
+            type: 'stateful',
+            captureState: function(params) {
+                const [targetName] = params;
+                const target = ModuleAPI.get(targetName);
+
+                if (target && target.stats && target.stats.hp) {
+                    return { oldHp: target.stats.hp.current };
+                }
+                return {};
+            },
+            restoreState: function(params, state) {
+                const [targetName] = params;
+                const target = ModuleAPI.get(targetName);
+
+                if (target && target.stats && target.stats.hp && state.oldHp !== undefined) {
+                    target.stats.hp.current = state.oldHp;
+                    ModuleAPI.save(targetName, target);
+                }
+            }
+        });
+
+    }
+    //#endregion CombatModule
+
+    // ========================================
+    // RelationshipsModule - Relationship tracking
+    // ========================================
+    //#region RelationshipsModule
+    {
+        const MODULE_NAME = 'RelationshipsModule';
+
+        // Relationship thresholds for flavor text
+        const THRESHOLDS = [
+            { min: -9999, max: -2000, flavor: "{from}'s hatred for {to} consumes their every thought" },
+            { min: -1999, max: -1000, flavor: "{from} would sacrifice everything to see {to} destroyed" },
+            { min: -999, max: -500, flavor: "{from} actively wishes harm upon {to}" },
+            { min: -499, max: -200, flavor: "{from} feels genuine hostility toward {to}" },
+            { min: -199, max: -100, flavor: "{from} strongly dislikes {to}" },
+            { min: -99, max: -50, flavor: "{from} finds {to} irritating and unpleasant" },
+            { min: -49, max: -25, flavor: "{from} feels mild annoyance toward {to}" },
+            { min: -24, max: 24, flavor: "{from} feels neutral about {to}" },
+            { min: 25, max: 49, flavor: "{from} has slightly positive feelings toward {to}" },
+            { min: 50, max: 99, flavor: "{from} enjoys {to}'s company" },
+            { min: 100, max: 199, flavor: "{from} considers {to} a friend" },
+            { min: 200, max: 499, flavor: "{from} cares deeply about {to}'s wellbeing" },
+            { min: 500, max: 999, flavor: "{from} trusts {to} completely" },
+            { min: 1000, max: 1999, flavor: "{from} considers {to} family" },
+            { min: 2000, max: 9999, flavor: "{from} would do absolutely anything for {to}" }
+        ];
+
+        // Helper function to get relationship flavor text
+        function getRelationshipFlavor(value, fromName, toName) {
+            // Validate inputs
+            if (!fromName || !toName || typeof value !== 'number') {
+                return `${fromName || 'Someone'} has an indescribable relationship with ${toName || 'someone'}`;
+            }
+
+            // Try to load thresholds from relationships schema
+            let thresholds = THRESHOLDS;
+            const relationshipSchema = ModuleAPI.get('schema.relationships');
+            if (relationshipSchema && relationshipSchema.thresholds) {
+                thresholds = relationshipSchema.thresholds;
+            }
+
+            for (const threshold of thresholds) {
+                if (value >= threshold.min && value <= threshold.max) {
+                    return threshold.flavor
+                        .replace('{from}', fromName)
+                        .replace('{to}', toName);
+                }
+            }
+            return `${fromName} has an indescribable relationship with ${toName}`;
+        }
+
+        // Create relationships schema
+        const relationshipsSchema = {
+            id: 'relationships',
+            defaults: {},
+            thresholds: THRESHOLDS
+        };
+
+        // Create [SANE:S] relationships card if it doesn't exist
+        const existingCard = Utilities.storyCard.get('[SANE:S] relationships');
+        if (!existingCard) {
+            Utilities.storyCard.upsert({
+                title: '[SANE:S] relationships',
+                value: '# Relationships Component Schema\nDefines relationship tracking with flavor text thresholds',
+                description: JSON.stringify(relationshipsSchema, null, 2),
+                type: 'data'
+            });
+            if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Created [SANE:S] relationships Story Card`);
+        }
+
+        // Register relationships schema
+        ModuleAPI.registerSchema('relationships', relationshipsSchema);
+
+        // Expose the function to ModuleAPI.Library
+        if (!ModuleAPI.Library) ModuleAPI.Library = {};
+        ModuleAPI.Library.getRelationshipFlavor = getRelationshipFlavor;
+
+        // Relationship tools
+        ModuleAPI.registerTool('update_relationship', toolHelpers.createTool('update_relationship', 3, (params) => {
+            const [source, target, change] = params;
+
+            const changeVal = validators.parseNumber(change, true);
+            if (changeVal === null || changeVal === 0) {
+                if (MODULE_CONFIG.debug) console.log(`[update_relationship]: Invalid change value: ${change}`);
+                return 'malformed';
+            }
+
+            // Update source's relationship to target
+            const sourceEntity = ModuleAPI.get(source);
+            if (sourceEntity) {
+                if (!sourceEntity.relationships) sourceEntity.relationships = {};
+                if (!sourceEntity.relationships[target]) {
+                    sourceEntity.relationships[target] = { value: 0 };
+                }
+                sourceEntity.relationships[target].value += changeVal;
+                ModuleAPI.save(source, sourceEntity);
+            }
+
+            // Bidirectional update
+            const targetEntity = ModuleAPI.get(target);
+            if (targetEntity) {
+                if (!targetEntity.relationships) targetEntity.relationships = {};
+                if (!targetEntity.relationships[source]) {
+                    targetEntity.relationships[source] = { value: 0 };
+                }
+                targetEntity.relationships[source].value += changeVal;
+                ModuleAPI.save(target, targetEntity);
+            }
+
+            if (MODULE_CONFIG.debug) console.log(`[update_relationship]: Updated ${source} <-> ${target} by ${changeVal}`);
+            return 'executed';
+        }));
+
+    }
+    //#endregion RelationshipsModule
+
+    // ========================================
+    // LocationModule - Location and pathways management
+    // ========================================
+    //#region LocationModule
+    {
+        const MODULE_NAME = 'LocationModule';
+
+        // Register pathways schema
+        ModuleAPI.registerSchema('pathways', {
+            id: 'pathways',
+            defaults: {}  // Connections to other locations - Format: { "north": "location_id", "south": "location_id", etc. }
+        });
+
+        // Location management tools
+        ModuleAPI.registerTool('update_location', function(params) {
+            const [characterName, locationName] = params;
+
+            if (!characterName || !locationName) return 'malformed';
+
+            const charName = String(characterName).toLowerCase();
+            const locName = String(locationName).toLowerCase();
+
+            // Get character
+            const character = ModuleAPI.get(charName);
+            if (!character) {
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Character ${charName} not found`);
+                if (ModuleAPI.trackUnknownEntity) {
+                    ModuleAPI.trackUnknownEntity(charName, 'update_location');
+                }
+                return 'executed';
+            }
+
+            // Ensure info component exists
+            if (!character.info) character.info = {};
+
+            // Store old location for reversion
+            const oldLocation = character.info.currentLocation;
+
+            // Update character's location
+            character.info.currentLocation = locName;
+
+            // Save character
+            ModuleAPI.save(charName, character);
+
+            if (MODULE_CONFIG.debug) {
+                console.log(`${MODULE_NAME}: ${character.id || charName} moved from ${oldLocation || 'nowhere'} to ${location.id || locName}`);
+            }
+
+            return 'executed';
+        });
+
+        ModuleAPI.registerTool('discover_location', function(params) {
+            const [characterName, locationName, direction] = params;
+
+            if (!characterName || !locationName) return 'malformed';
+
+            const charName = String(characterName).toLowerCase();
+            const locName = String(locationName).toLowerCase();
+            const dir = direction ? String(direction).toLowerCase() : null;
+
+            // Get character
+            const character = ModuleAPI.get(charName);
+            if (!character) {
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Character ${charName} not found`);
+                return 'executed';
+            }
+
+            // Check if location already exists - if so, it's already discovered!
+            let location = ModuleAPI.get(locName);
+            if (location) {
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Location ${locName} already exists - cannot discover existing location`);
+                return 'malformed';
+            }
+
+            // Create new location using blueprint
+            if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Creating new location ${locName} using blueprint`);
+
+            // Use instantiateBlueprint to create location with GenerationWizard support
+            const locationData = {
+                id: locName,
+                info: {
+                    displayname: locName,
+                    trigger_name: locName,
+                    discovered: true
+                },
+                pathways: {}
+            };
+
+            // If direction specified, set up pathways before creation
+            if (dir && character.info?.currentLocation) {
+                const opposites = {
+                    'north': 'south',
+                    'south': 'north',
+                    'east': 'west',
+                    'west': 'east',
+                    'up': 'down',
+                    'down': 'up',
+                    'inside': 'outside',
+                    'outside': 'inside',
+                    'enter': 'exit',
+                    'exit': 'enter'
+                };
+
+                // Add reverse pathway in the new location
+                if (opposites[dir]) {
+                    locationData.pathways[opposites[dir]] = { destination: character.info.currentLocation };
+                }
+            }
+
+            const newLocationId = ModuleAPI.instantiateBlueprint('Location', locationData);
+            if (newLocationId) {
+                location = ModuleAPI.get(newLocationId);
+            }
+
+            // Fallback if blueprint system not available
+            if (!location) {
+                location = {
+                    id: locName,
+                    GameplayTags: ['Location'],
+                    components: ['info', 'pathways', 'display'],
+                    info: {
+                        displayname: locName,
+                        description: `A location called ${locName}`,
+                        discovered: true
+                    },
+                    pathways: locationData.pathways || {},
+                    display: { active: true }
+                };
+                ModuleAPI.save(locName, location);
+            }
+
+            // If direction specified and character has current location, create connection
+            if (dir && character.info?.currentLocation) {
+                const currentLoc = ModuleAPI.get(character.info.currentLocation);
+                if (currentLoc) {
+                    // Add pathway from current location to new location
+                    if (!currentLoc.pathways) currentLoc.pathways = {};
+                    currentLoc.pathways[dir] = { destination: locName };
+
+                    // Save current location with new pathway
+                    ModuleAPI.save(character.info.currentLocation, currentLoc);
+                }
+            }
+
+            // Save location
+            ModuleAPI.save(locName, location);
+
+            if (MODULE_CONFIG.debug) {
+                console.log(`${MODULE_NAME}: ${character.id || charName} discovered ${location.id || locName}${dir ? ` to the ${dir}` : ''}`);
+            }
+
+            return 'executed';
+        });
+
+        ModuleAPI.registerTool('connect_locations', function(params) {
+            const [location1Name, location2Name, direction] = params;
+
+            if (!location1Name || !location2Name) return 'malformed';
+
+            const loc1Name = String(location1Name).toLowerCase();
+            const loc2Name = String(location2Name).toLowerCase();
+            const dir = direction ? String(direction).toLowerCase() : 'both';
+
+            // Helper function to create location using blueprint
+            function getOrCreateLocation(locationName) {
+                let location = ModuleAPI.get(locationName);
+                if (!location) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Creating location ${locationName} using blueprint`);
+
+                    // Use instantiateBlueprint to create location with GenerationWizard support
+                    const locationData = {
+                        id: locationName,
+                        info: {
+                            displayname: locationName,
+                            trigger_name: locationName,
+                            discovered: true
+                        },
+                        pathways: {}
+                    };
+
+                    const newLocationId = ModuleAPI.instantiateBlueprint('Location', locationData);
+                    if (newLocationId) {
+                        location = ModuleAPI.get(newLocationId);
+                    }
+
+                    // Fallback if blueprint system not available
+                    if (!location) {
+                        location = {
+                            id: locationName,
+                            GameplayTags: ['Location'],
+                            components: ['info', 'pathways', 'display'],
+                            info: {
+                                displayname: locationName,
+                                description: `A location called ${locationName}`,
+                                discovered: true
+                            },
+                            pathways: {},
+                            display: { active: true }
+                        };
+                        ModuleAPI.save(locationName, location);
+                    }
+                }
+                return location;
+            }
+
+            // Get or create both locations
+            let loc1 = getOrCreateLocation(loc1Name);
+            let loc2 = getOrCreateLocation(loc2Name);
+
+            // Ensure pathways component exists
+            if (!loc1.pathways) loc1.pathways = {};
+            if (!loc2.pathways) loc2.pathways = {};
+
+            // Create directional connection
+            loc1.pathways[dir] = { destination: loc2Name };
+
+            // Add reverse pathway if opposites are defined
+            const opposites = {
+                'north': 'south',
+                'south': 'north',
+                'east': 'west',
+                'west': 'east',
+                'up': 'down',
+                'down': 'up',
+                'inside': 'outside',
+                'outside': 'inside',
+                'enter': 'exit',
+                'exit': 'enter'
+            };
+
+            if (opposites[dir]) {
+                loc2.pathways[opposites[dir]] = { destination: loc1Name };
+            }
+
+            // Save both locations
+            ModuleAPI.save(loc1Name, loc1);
+            ModuleAPI.save(loc2Name, loc2);
+
+            if (MODULE_CONFIG.debug) {
+                if (dir === 'both') {
+                    console.log(`${MODULE_NAME}: Connected ${loc1.id || loc1Name} <-> ${loc2.id || loc2Name}`);
+                } else {
+                    console.log(`${MODULE_NAME}: Connected ${loc1.id || loc1Name} -${dir}-> ${loc2.id || loc2Name}`);
+                }
+            }
+
+            return 'executed';
+        });
+
+        // Register rewindable strategies for location tools
+        ModuleAPI.registerRewindable('update_location', {
+            type: 'stateful',
+            captureState: function(params) {
+                const [characterName] = params;
+                const charName = validators.normalizeString(characterName);
+                const character = ModuleAPI.get(charName);
+
+                if (character && character.info) {
+                    return { oldLocation: character.info.currentLocation };
+                }
+                return {};
+            },
+            restoreState: function(params, state) {
+                const [characterName] = params;
+                const charName = validators.normalizeString(characterName);
+                const character = ModuleAPI.get(charName);
+
+                if (character && character.info && state.oldLocation !== undefined) {
+                    character.info.currentLocation = state.oldLocation;
+                    ModuleAPI.save(charName, character);
+                }
+            }
+        });
+
+    }
+    //#endregion LocationModule
+
+    // ==============================
+    // QuestModule
+    // ==============================
+    //#region QuestModule
+    {
+        const MODULE_NAME = 'QuestModule';
+
+        // Register quest schema
+        ModuleAPI.registerSchema('quest', {
+            id: 'quest',
+            defaults: {
+                status: 'available',  // available, active, completed, failed, abandoned
+                giver: null,
+                objectives: {
+                    total: 0,
+                    completed: 0,
+                    stages: {}  // stages.1, stages.2, etc.
+                },
+                rewards: {
+                    xp: 0,
+                    gold: 0,
+                    items: {}  // { "item_name": { "quantity": N } }
+                }
+            }
+        });
+
+        // Register objectives schema (for non-quest entities that have objectives)
+        ModuleAPI.registerSchema('objectives', {
+            id: 'objectives',
+            defaults: {
+                total: 0,
+                completed: 0,
+                stages: {}  // stages.1, stages.2, etc with { description: "...", completed: false }
+            }
+        });
+
+        // Register rewards schema (for non-quest entities that have rewards)
+        ModuleAPI.registerSchema('rewards', {
+            id: 'rewards',
+            defaults: {
+                xp: 0,
+                gold: 0,
+                items: {}  // { "item_name": { "quantity": N } }
+            }
+        });
+
+        // Tool definitions
+        const tools = {
+            accept_quest: function(params) {
+                const [characterName, questName] = params;
+
+                if (!characterName || !questName) return 'malformed';
+
+                const charName = String(characterName).toLowerCase();
+                const quest = String(questName).toLowerCase();
+
+                // Get character
+                const character = get(charName);
+                if (!character) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(charName, 'accept_quest');
+                    }
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Character ${charName} not found`);
+                    return 'executed';
+                }
+
+                // Get quest entity
+                const questEntity = get(quest);
+                if (!questEntity) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(quest, 'accept_quest');
+                    }
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Quest ${quest} not found`);
+                    return 'executed';
+                }
+
+                // Check if quest is available
+                if (!questEntity.quest || questEntity.quest.status !== 'available') {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Quest ${quest} is not available (status: ${questEntity.quest?.status || 'no quest component'})`);
+                    return 'executed';
+                }
+
+                // Update quest status
+                questEntity.quest.status = 'active';
+
+                // Link quest to character
+                if (!character.quests) character.quests = {};
+                character.quests[quest] = {
+                    status: 'active',
+                    acceptedAt: history.length
+                };
+
+                if (MODULE_CONFIG.debug) {
+                    console.log(`${MODULE_NAME}: ${charName} accepted quest: ${quest}`);
+                }
+
+                // Save updates
+                save(charName, character);
+                save(quest, questEntity);
+                return 'executed';
+            },
+
+            offer_quest: function(params) {
+                const [questName, giverName] = params;
+
+                if (!questName) return 'malformed';
+
+                const quest = String(questName).toLowerCase();
+                const giver = giverName ? String(giverName).toLowerCase() : null;
+
+                // Get or create quest entity
+                let questEntity = get(quest);
+                if (!questEntity) {
+                    // Create new quest entity
+                    questEntity = create({
+                        id: quest,
+                        GameplayTags: ['Quest'],
+                        components: ['info', 'quest', 'display']
+                    });
+                }
+
+                // Ensure quest component exists
+                if (!questEntity.quest) {
+                    questEntity.quest = { ...questSchema.defaults };
+                }
+
+                // Update quest to available status
+                questEntity.quest.status = 'available';
+                if (giver) {
+                    questEntity.quest.giver = giver;
+                }
+
+                if (MODULE_CONFIG.debug) {
+                    console.log(`${MODULE_NAME}: Quest ${quest} is now available${giver ? ` from ${giver}` : ''}`);
+                }
+
+                // Save quest
+                save(quest, questEntity);
+                return 'executed';
+            },
+
+            update_quest: function(params) {
+                const [questName, objectiveNum] = params;
+
+                if (!questName) return 'malformed';
+
+                const quest = String(questName).toLowerCase();
+                const objNum = objectiveNum ? parseInt(objectiveNum) : 1;
+
+                if (isNaN(objNum) || objNum < 1) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Invalid objective number: ${objectiveNum}`);
+                    return 'malformed';
+                }
+
+                // Get quest entity
+                const questEntity = get(quest);
+                if (!questEntity || !questEntity.quest) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(quest, 'update_quest');
+                    }
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Quest ${quest} not found or has no quest component`);
+                    return 'executed';
+                }
+
+                // Check if quest is active
+                if (questEntity.quest.status !== 'active') {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Quest ${quest} is not active (status: ${questEntity.quest.status})`);
+                    return 'executed';
+                }
+
+                // Mark objective as completed
+                if (!questEntity.quest.objectives) {
+                    questEntity.quest.objectives = { total: 0, completed: 0, stages: {} };
+                }
+
+                const objectives = questEntity.quest.objectives;
+                if (objectives.stages[objNum]) {
+                    if (!objectives.stages[objNum].completed) {
+                        objectives.stages[objNum].completed = true;
+                        objectives.completed = Math.min(objectives.total, objectives.completed + 1);
+
+                        if (MODULE_CONFIG.debug) {
+                            console.log(`${MODULE_NAME}: Quest ${quest} objective ${objNum} completed (${objectives.completed}/${objectives.total})`);
+                        }
+
+                        // Check if all objectives completed
+                        if (objectives.completed >= objectives.total && objectives.total > 0) {
+                            if (MODULE_CONFIG.debug) {
+                                console.log(`${MODULE_NAME}: Quest ${quest} all objectives completed! Use complete_quest to finish.`);
+                            }
+                        }
+                    }
+                }
+
+                // Save quest
+                save(quest, questEntity);
+                return 'executed';
+            },
+
+            complete_quest: function(params) {
+                const [characterName, questName] = params;
+
+                if (!characterName || !questName) return 'malformed';
+
+                const charName = String(characterName).toLowerCase();
+                const quest = String(questName).toLowerCase();
+
+                // Get character and quest
+                const character = get(charName);
+                const questEntity = get(quest);
+
+                if (!character) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(charName, 'complete_quest');
+                    }
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Character ${charName} not found`);
+                    return 'executed';
+                }
+
+                if (!questEntity || !questEntity.quest) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(quest, 'complete_quest');
+                    }
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Quest ${quest} not found`);
+                    return 'executed';
+                }
+
+                // Check if quest is active
+                if (questEntity.quest.status !== 'active') {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Quest ${quest} is not active (status: ${questEntity.quest.status})`);
+                    return 'executed';
+                }
+
+                // Apply rewards
+                const rewards = questEntity.quest.rewards;
+                if (rewards) {
+                    // Apply XP reward
+                    if (rewards.xp > 0 && ModuleAPI.tools['add_levelxp']) {
+                        ModuleAPI.tools['add_levelxp']([charName, rewards.xp]);
+                    }
+
+                    // Apply gold reward (if currency system exists)
+                    if (rewards.gold > 0) {
+                        if (!character.currency) character.currency = {};
+                        character.currency.gold = (character.currency.gold || 0) + rewards.gold;
+                        if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: ${charName} received ${rewards.gold} gold`);
+                    }
+
+                    // Apply item rewards
+                    if (rewards.items && Object.keys(rewards.items).length > 0) {
+                        for (const itemName in rewards.items) {
+                            const quantity = rewards.items[itemName].quantity || rewards.items[itemName];
+                            if (ModuleAPI.tools['add_item']) {
+                                ModuleAPI.tools['add_item']([charName, itemName, quantity]);
+                            }
+                        }
+                    }
+                }
+
+                // Update quest status
+                questEntity.quest.status = 'completed';
+
+                // Update character's quest record
+                if (character.quests && character.quests[quest]) {
+                    character.quests[quest].status = 'completed';
+                    character.quests[quest].completedAt = history.length;
+                }
+
+                if (MODULE_CONFIG.debug) {
+                    console.log(`${MODULE_NAME}: ${charName} completed quest: ${quest}`);
+                }
+
+                // Save updates
+                save(charName, character);
+                save(quest, questEntity);
+                return 'executed';
+            },
+
+            abandon_quest: function(params) {
+                const [characterName, questName] = params;
+
+                if (!characterName || !questName) return 'malformed';
+
+                const charName = String(characterName).toLowerCase();
+                const quest = String(questName).toLowerCase();
+
+                // Get character and quest
+                const character = get(charName);
+                const questEntity = get(quest);
+
+                if (!character) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(charName, 'abandon_quest');
+                    }
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Character ${charName} not found`);
+                    return 'executed';
+                }
+
+                if (!questEntity || !questEntity.quest) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(quest, 'abandon_quest');
+                    }
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Quest ${quest} not found`);
+                    return 'executed';
+                }
+
+                // Update quest status
+                if (questEntity.quest.status === 'active') {
+                    questEntity.quest.status = 'abandoned';
+                }
+
+                // Update character's quest record
+                if (character.quests && character.quests[quest]) {
+                    character.quests[quest].status = 'abandoned';
+                    character.quests[quest].abandonedAt = history.length;
+                }
+
+                if (MODULE_CONFIG.debug) {
+                    console.log(`${MODULE_NAME}: ${charName} abandoned quest: ${quest}`);
+                }
+
+                // Save updates
+                save(charName, character);
+                save(quest, questEntity);
+                return 'executed';
+            }
+        };
+
+        // Register all tools
+        Object.entries(tools).forEach(([name, fn]) => {
+            ModuleAPI.registerTool(name, fn);
+        });
+
+    }
+    //#endregion QuestModule
+
+    // ==============================
+    // TimeModule
+    // ==============================
+    //#region TimeModule
+    {
+        const MODULE_NAME = 'TimeModule';
+
+        // Tools that interface with Calendar module if available
+        const tools = {
+            advance_time: function(params) {
+                // Check if Calendar is available
+                if (typeof Calendar === 'undefined' || !Calendar) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Calendar module not available`);
+                    return 'executed';
+                }
+
+                const [hours, minutes] = params;
+
+                if (hours === undefined && minutes === undefined) return 'malformed';
+
+                // Parse time values
+                const hoursInt = parseInt(hours) || 0;
+                const minutesInt = parseInt(minutes) || 0;
+
+                if (hoursInt < 0 || minutesInt < 0) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Cannot advance negative time`);
+                    return 'malformed';
+                }
+
+                if (hoursInt === 0 && minutesInt === 0) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: No time to advance`);
+                    return 'malformed';
+                }
+
+                try {
+                    // Build time string for Calendar
+                    let timeStr = '';
+                    if (hoursInt > 0) timeStr += `${hoursInt}h`;
+                    if (minutesInt > 0) {
+                        if (timeStr) timeStr += ' ';
+                        timeStr += `${minutesInt}m`;
+                    }
+
+                    // Use Calendar's advance function if available
+                    if (Calendar.advanceTime) {
+                        const oldTime = Calendar.getCurrentTime ? Calendar.getCurrentTime() : 'unknown';
+                        Calendar.advanceTime(timeStr);
+                        const newTime = Calendar.getCurrentTime ? Calendar.getCurrentTime() : 'unknown';
+
+                        if (MODULE_CONFIG.debug) {
+                            console.log(`${MODULE_NAME}: Advanced time by ${timeStr} (${oldTime} -> ${newTime})`);
+                        }
+                    } else {
+                        if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Calendar.advanceTime not available`);
+                    }
+
+                    return 'executed';
+                } catch (e) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Error advancing time: ${e.message}`);
+                    return 'malformed';
+                }
+            }
+        };
+
+        // Register all tools
+        Object.entries(tools).forEach(([name, fn]) => {
+            ModuleAPI.registerTool(name, fn);
+        });
+
+    }
+    //#endregion TimeModule
+
+    // ========================================
+    // EntityTrackerModule - Unknown entity tracking and auto-generation
+    // ========================================
+    //#region EntityTrackerModule
+    {
+        const MODULE_NAME = 'EntityTrackerModule';
+
+        // Module configuration
+        const config = {
+            threshold: 3,      // Default threshold for auto-generation
+            autoGenerate: true // Whether to auto-generate entities
+        };
+
+        // Tracking data
+        const trackerData = {
+            unknown: {},       // Track entities referenced but not found
+            unknownTools: {},  // Track unknown tools from AI
+            queue: []         // Queue for entities pending generation
+        };
+
+        // Load configuration from Story Card
+        function loadTrackerConfig() {
+            const trackerCard = Utilities.storyCard.get('[SANE:C] Entity Tracker');
+            if (trackerCard && trackerCard.description) {
+                try {
+                    const loadedConfig = JSON.parse(trackerCard.description || '{}');
+                    config.threshold = loadedConfig.threshold || 3;
+                    config.autoGenerate = loadedConfig.autoGenerate !== false;
+                    debugLog('tracker', `Config loaded: threshold=${config.threshold}, autoGenerate=${config.autoGenerate}`);
+                } catch (e) {
+                    debugLog('tracker', `Error loading config: ${e.message}`);
+                }
+            }
+        }
+
+        // Load queue from Story Card
+        function loadTrackerQueue() {
+            const queueCard = Utilities.storyCard.get('[SANE:C] Entity Queue');
+            if (queueCard && queueCard.description) {
+                try {
+                    const queueData = JSON.parse(queueCard.description || '{}');
+                    trackerData.queue = queueData.queue || [];
+                    trackerData.unknown = queueData.unknown || {};
+                    if (trackerData.queue.length > 0) {
+                        debugLog('tracker', `Loaded entity queue: ${trackerData.queue.length} pending`);
+                    }
+                } catch (e) {
+                    debugLog('tracker', `Error loading queue: ${e.message}`);
+                }
+            }
+        }
+
+        // Save queue to Story Card
+        function saveEntityQueue() {
+            const queueData = {
+                queue: trackerData.queue,
+                unknown: trackerData.unknown
+            };
+
+            Utilities.storyCard.upsert({
+                title: '[SANE:C] Entity Queue',
+                value: '# Entity Generation Queue',
+                description: JSON.stringify(queueData),
+                type: 'data'
+            });
+        }
+
+        // Track unknown entity
+        function trackUnknownEntity(entityName, toolName, turnNumber) {
+            if (!entityName) return;
+
+            const normalizedName = normalizeEntityId(entityName);
+
+            // Check if entity exists
+            if (dataCache[normalizedName] || loadEntityFromCache(normalizedName)) {
+                return;  // Entity exists, no need to track
+            }
+
+            // Track the unknown entity
+            if (!trackerData.unknown[normalizedName]) {
+                trackerData.unknown[normalizedName] = {
+                    name: entityName,  // Preserve original case
+                    tools: {},
+                    firstSeen: turnNumber || history.length,
+                    count: 0
+                };
+            }
+
+            const tracker = trackerData.unknown[normalizedName];
+            tracker.count++;
+
+            // Track which tools referenced this entity
+            if (toolName) {
+                tracker.tools[toolName] = (tracker.tools[toolName] || 0) + 1;
+            }
+
+            // Check if entity should be queued for generation
+            if (tracker.count >= config.threshold && !trackerData.queue.includes(normalizedName)) {
+                trackerData.queue.push(normalizedName);
+                debugLog('tracker', `Entity '${entityName}' queued for generation (count: ${tracker.count})`);
+
+                // Save queue to Story Card
+                saveEntityQueue();
+            }
+        }
+
+        // Track unknown tool
+        function trackUnknownTool(toolName) {
+            if (!toolName) return;
+
+            const normalizedName = validators.normalizeString(toolName);
+            trackerData.unknownTools[normalizedName] = (trackerData.unknownTools[normalizedName] || 0) + 1;
+            debugLog('tracker', `Unknown tool '${normalizedName}' tracked (count: ${trackerData.unknownTools[normalizedName]})`);
+        }
+
+        // Get next entity from queue
+        function getNextQueuedEntity() {
+            if (trackerData.queue.length === 0) return null;
+            return trackerData.queue[0];
+        }
+
+        // Remove entity from queue
+        function removeFromQueue(entityName) {
+            const normalizedName = normalizeEntityId(entityName);
+            const index = trackerData.queue.indexOf(normalizedName);
+            if (index !== -1) {
+                trackerData.queue.splice(index, 1);
+                saveEntityQueue();
+                debugLog('tracker', `Entity '${entityName}' removed from queue`);
+            }
+        }
+
+        // Clear tracking data for entity
+        function clearEntityTracking(entityName) {
+            const normalizedName = normalizeEntityId(entityName);
+            delete trackerData.unknown[normalizedName];
+            removeFromQueue(entityName);
+        }
+
+        // Register API functions
+        ModuleAPI.registerAPI('trackUnknownEntity', trackUnknownEntity);
+        ModuleAPI.registerAPI('trackUnknownTool', trackUnknownTool);
+        ModuleAPI.registerAPI('getEntityTrackerData', () => trackerData);
+        ModuleAPI.registerAPI('getEntityTrackerConfig', () => config);
+        ModuleAPI.registerAPI('getNextQueuedEntity', getNextQueuedEntity);
+        ModuleAPI.registerAPI('removeFromQueue', removeFromQueue);
+        ModuleAPI.registerAPI('clearEntityTracking', clearEntityTracking);
+
+        // Initialize on context hook
+        ModuleAPI.registerHook('context', function(text) {
+            // Load configuration once per turn
+            if (!trackerData.initialized) {
+                loadTrackerConfig();
+                loadTrackerQueue();
+                trackerData.initialized = true;
+            }
+            return text;
+        });
+
+        // Expose legacy entityTracker object for compatibility
+        // This maintains backward compatibility with existing code
+        Object.defineProperty(entityTracker, 'unknown', {
+            get: () => trackerData.unknown,
+            set: (val) => { trackerData.unknown = val; }
+        });
+        Object.defineProperty(entityTracker, 'unknownTools', {
+            get: () => trackerData.unknownTools,
+            set: (val) => { trackerData.unknownTools = val; }
+        });
+        Object.defineProperty(entityTracker, 'queue', {
+            get: () => trackerData.queue,
+            set: (val) => { trackerData.queue = val; }
+        });
+        Object.defineProperty(entityTracker, 'threshold', {
+            get: () => config.threshold,
+            set: (val) => { config.threshold = val; }
+        });
+        Object.defineProperty(entityTracker, 'autoGenerate', {
+            get: () => config.autoGenerate,
+            set: (val) => { config.autoGenerate = val; }
+        });
+
+    }
+    //#endregion EntityTrackerModule
+
+    // ==============================
+    // RewindModule - Full rewind system with multi-card storage
+    // ==============================
+    //#region RewindModule
+    {
+        const MODULE_NAME = 'RewindModule';
+
+        // Rewind system to track and revert tool actions
+        const RewindSystem = {
+            STORAGE_CARD_PREFIX: '[GS_REWIND] History',  // Keep GS prefix for compatibility
+            MAX_HISTORY: 100,  // Store all 100 entries
+            MAX_REWIND: 99,    // Can rewind 99 (need 1 for verification)
+            MAX_CARD_SIZE: 9000, // Max characters per card
+
+            // Get all rewind cards
+            getAllCards: function() {
+                const cards = [];
+                let cardNum = 1;
+
+                while (true) {
+                    const cardTitle = cardNum === 1
+                        ? RewindSystem.STORAGE_CARD_PREFIX
+                        : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
+
+                    const card = Utilities.storyCard.get(cardTitle);
+                    if (!card) break;
+
+                    try {
+                        cards.push({
+                            title: cardTitle,
+                            data: JSON.parse(card.description || '{"entries":[]}')
+                        });
+                    } catch(e) {
+                        if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Failed to parse card ${cardTitle}: ${e}`);
+                    }
+                    cardNum++;
+                }
+
+                return cards;
+            },
+
+            // Get merged storage from all cards
+            getStorage: function() {
+                const cards = RewindSystem.getAllCards();
+
+                if (cards.length === 0) {
+                    // Create first card
+                    const firstTitle = RewindSystem.STORAGE_CARD_PREFIX;
+                    Utilities.storyCard.add({
+                        title: firstTitle,
+                        value: '# Rewind System Data\nTracks tool execution history for state consistency.',
+                        description: JSON.stringify({
+                            entries: [],
+                            position: -1
+                        }),
+                        type: 'data'
+                    });
+                    return { entries: [], position: -1 };
+                }
+
+                // Merge all entries from all cards
+                let allEntries = [];
+                let position = -1;
+
+                for (const card of cards) {
+                    allEntries = allEntries.concat(card.data.entries || []);
+                    if (card.data.position !== undefined && card.data.position > position) {
+                        position = card.data.position;
+                    }
+                }
+
+                return { entries: allEntries, position: position };
+            },
+
+            // Save storage across multiple cards
+            saveStorage: function(data) {
+                // Ensure we don't exceed max history
+                if (data.entries.length > RewindSystem.MAX_HISTORY) {
+                    data.entries = data.entries.slice(-RewindSystem.MAX_HISTORY);
+                }
+
+                // Check for suspicious data loss or hash mismatches
+                const existingData = RewindSystem.getStorage();
+                let shouldBackup = false;
+                let backupReason = '';
+
+                // Check if we're losing significant data
+                if (existingData.entries.length > 50 && data.entries.length < existingData.entries.length * 0.5) {
+                    shouldBackup = true;
+                    backupReason = `Data loss detected: ${existingData.entries.length} -> ${data.entries.length} entries`;
+                }
+
+                // Create backup if needed
+                if (shouldBackup) {
+                    const backupTitle = `[GS_REWIND] Backup ${Date.now()}`;
+                    Utilities.storyCard.add({
+                        title: backupTitle,
+                        value: `# Rewind Backup\nReason: ${backupReason}`,
+                        description: JSON.stringify(existingData),
+                        type: 'data'
+                    });
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Created backup: ${backupReason}`);
+                }
+
+                // Split entries across multiple cards if needed
+                const cardsToSave = [];
+                let currentCard = { entries: [], position: data.position };
+                let currentSize = 0;
+
+                for (const entry of data.entries) {
+                    const entrySize = JSON.stringify(entry).length;
+
+                    if (currentSize + entrySize > RewindSystem.MAX_CARD_SIZE && currentCard.entries.length > 0) {
+                        // Save current card and start new one
+                        cardsToSave.push({...currentCard});
+                        currentCard = { entries: [], position: data.position };
+                        currentSize = 0;
+                    }
+
+                    currentCard.entries.push(entry);
+                    currentSize += entrySize;
+                }
+
+                // Add the last card
+                if (currentCard.entries.length > 0) {
+                    cardsToSave.push(currentCard);
+                }
+
+                // Update or create cards using upsert
+                for (let i = 0; i < cardsToSave.length; i++) {
+                    const cardTitle = i === 0
+                        ? RewindSystem.STORAGE_CARD_PREFIX
+                        : `${RewindSystem.STORAGE_CARD_PREFIX} ${i + 1}`;
+
+                    Utilities.storyCard.upsert({
+                        title: cardTitle,
+                        value: `# Rewind System Data - Part ${i + 1}/${cardsToSave.length}\nTracks tool execution history.`,
+                        description: JSON.stringify(cardsToSave[i]),
                         type: 'data'
                     });
                 }
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: Saved ${data.entries.length} entries across ${cards.length} cards`);
-        },
-        
-        // Quick hash function for text comparison
-        quickHash: function(text) {
-            if (!text) return '';
-            let hash = 0;
-            // Hash the entire text to detect any changes
-            for (let i = 0; i < text.length; i++) {
-                const char = text.charCodeAt(i);
-                hash = ((hash << 5) - hash) + char;
-                hash = hash & hash; // Convert to 32bit integer
-            }
-            return hash.toString(36);
-        },
-        
-        // Store action at specific position
-        recordAction: function(text, tools, position = null) {
-            const data = RewindSystem.getStorage();
-            const hash = RewindSystem.quickHash(text);
-            
-            // Position is ALWAYS bounded to 0-99 (for MAX_HISTORY of 100)
-            // If no position specified, use current entries length
-            if (position === null) {
-                position = Math.min(data.entries.length, RewindSystem.MAX_HISTORY - 1);
-            }
-            
-            // Ensure position is within bounds
-            position = Math.min(position, RewindSystem.MAX_HISTORY - 1);
-            
-            // If we're recording at a position that's less than the current array length,
-            // and the hash is different, we're creating a new timeline branch
-            if (position < data.entries.length && data.entries[position]) {
-                const existingHash = data.entries[position].h;
-                if (existingHash !== hash) {
-                    // Different content at this position - truncate everything after it
-                    data.entries = data.entries.slice(0, position);
-                    if (debug) console.log(`${MODULE_NAME}: New timeline branch at position ${position}, truncated future entries`);
+
+                // Remove any extra cards that are no longer needed
+                let cardNum = cardsToSave.length + 1;
+                while (true) {
+                    const cardTitle = cardNum === 1
+                        ? RewindSystem.STORAGE_CARD_PREFIX
+                        : `${RewindSystem.STORAGE_CARD_PREFIX} ${cardNum}`;
+
+                    if (!Utilities.storyCard.get(cardTitle)) break;
+                    Utilities.storyCard.remove(cardTitle);
+                    cardNum++;
                 }
-            }
-            
-            // Store tools with their revert data at the specified position
-            data.entries[position] = {
-                h: hash,
-                t: tools.map(t => [t.tool, t.params, t.revertData || {}])
-            };
-            
-            // Update position to match where we just stored
-            data.position = position;
-            
-            // Maintain max history - when we exceed max, remove oldest entry
-            while (data.entries.length > RewindSystem.MAX_HISTORY) {
-                data.entries.shift();
-                // Adjust position since we removed an entry
-                data.position = Math.max(0, data.position - 1);
-            }
-            
-            RewindSystem.saveStorage(data);
-            if (debug) console.log(`${MODULE_NAME}: Recorded action at position ${position} with ${tools.length} tools`);
-        },
-        
-        // Find current position by matching history
-        findCurrentPosition: function() {
-            const data = RewindSystem.getStorage();
-            if (!history || history.length === 0) {
-                if (debug) console.log(`${MODULE_NAME}: No history available`);
-                return { matched: false, position: -1 };
-            }
-            
-            if (data.entries.length === 0) {
-                if (debug) console.log(`${MODULE_NAME}: No stored entries yet`);
-                return { matched: false, position: -1 };
-            }
-            
-            // The current history length tells us where we are
-            // If history has 1 entry, we're at position 0
-            // If history has 2 entries, we're at position 1, etc.
-            const historyLength = history.length;
-            const expectedPosition = historyLength - 1;
-            
-            // Verify this matches our stored data
-            if (expectedPosition >= 0 && expectedPosition < data.entries.length) {
-                // Quick verification: check if the last few entries match
+            },
+
+            // Quick hash function for text comparison
+            quickHash: function(text) {
+                if (!text) return '';
+                let hash = 0;
+                for (let i = 0; i < text.length; i++) {
+                    const char = text.charCodeAt(i);
+                    hash = ((hash << 5) - hash) + char;
+                    hash = hash & hash;
+                }
+                return hash.toString(36);
+            },
+
+            // Verify position using hash
+            verifyPosition: function(expectedHash) {
+                const data = RewindSystem.getStorage();
+                const currentEntry = data.entries[data.position];
+
+                if (!currentEntry || currentEntry.h !== expectedHash) {
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`${MODULE_NAME}: Hash mismatch at position ${data.position}`);
+                        console.log(`Expected: ${expectedHash}, Found: ${currentEntry ? currentEntry.h : 'none'}`);
+                    }
+                    return false;
+                }
+                return true;
+            },
+
+            // Find position by hash
+            findPositionByHash: function(targetHash) {
+                const data = RewindSystem.getStorage();
+
+                // Search backwards from current position
+                for (let i = data.position; i >= 0; i--) {
+                    if (data.entries[i] && data.entries[i].h === targetHash) {
+                        return i;
+                    }
+                }
+
+                // Search forward if not found backwards
+                for (let i = data.position + 1; i < data.entries.length; i++) {
+                    if (data.entries[i] && data.entries[i].h === targetHash) {
+                        return i;
+                    }
+                }
+
+                return -1;
+            },
+
+            // Record action at position with automatic positioning
+            recordAction: function(text, tools, hash = null) {
+                const data = RewindSystem.getStorage();
+
+                // Use provided hash or calculate it
+                if (!hash) {
+                    hash = RewindSystem.quickHash(text);
+                }
+
+                // Position is based on history length
+                const position = Math.min(history.length - 1, RewindSystem.MAX_HISTORY - 1);
+
+                // Check for duplicate hash
+                if (position > 0 && data.entries[position - 1]) {
+                    const prevEntry = data.entries[position - 1];
+                    if (prevEntry.h === hash) {
+                        // Duplicate hash, skip recording
+                        if (MODULE_CONFIG.debug) {
+                            console.log(`${MODULE_NAME}: Duplicate hash detected at position ${position}, skipping`);
+                        }
+                        return;
+                    }
+                }
+
+                // Store the action
+                data.entries[position] = {
+                    h: hash,
+                    t: tools || []
+                };
+
+                data.position = position;
+                RewindSystem.saveStorage(data);
+
+                if (MODULE_CONFIG.debug) {
+                    console.log(`${MODULE_NAME}: Recorded action at position ${position} (hash: ${hash.substring(0, 8)})`);
+                }
+            },
+
+            // Get entries for rewind
+            getEntriesForRewind: function(targetPosition) {
+                const data = RewindSystem.getStorage();
+
+                if (targetPosition < 0 || targetPosition >= data.entries.length) {
+                    return null;
+                }
+
+                // Get all entries from target to current position
+                const entriesToRevert = [];
+                for (let i = data.position; i > targetPosition; i--) {
+                    if (data.entries[i] && data.entries[i].t) {
+                        entriesToRevert.push({
+                            position: i,
+                            tools: data.entries[i].t
+                        });
+                    }
+                }
+
+                return entriesToRevert;
+            },
+
+            // Revert tools for a rewind
+            revertTools: function(tools) {
+                if (!tools || tools.length === 0) return;
+
+                // Revert tools in reverse order
+                for (let i = tools.length - 1; i >= 0; i--) {
+                    const toolData = tools[i];
+                    if (!toolData) continue;
+
+                    const [toolName, params, revertData] = toolData;
+
+                    // If we have revert data, use it to restore original values
+                    if (revertData && Object.keys(revertData).length > 0) {
+                        RewindSystem.applyRevertData(toolName, params, revertData);
+                    } else {
+                        // Fall back to inverse operations
+                        switch(toolName) {
+                            case 'add_item':
+                                if (ModuleAPI.tools['add_item'] && params && params[2]) {
+                                    // Subtract the quantity that was added
+                                    ModuleAPI.tools['add_item']([params[0], params[1], -params[2]]);
+                                }
+                                break;
+                            case 'remove_item':
+                                if (ModuleAPI.tools['add_item'] && params) {
+                                    ModuleAPI.tools['add_item'](params);
+                                }
+                                break;
+                            case 'add_levelxp':
+                                // Revert by subtracting the XP
+                                if (params && params[1] && ModuleAPI.tools['add_levelxp']) {
+                                    ModuleAPI.tools['add_levelxp']([params[0], -params[1]]);
+                                }
+                                break;
+                            case 'add_skillxp':
+                                // Revert by subtracting the XP
+                                if (params && params[2] && ModuleAPI.tools['add_skillxp']) {
+                                    ModuleAPI.tools['add_skillxp']([params[0], params[1], -params[2]]);
+                                }
+                                break;
+                            case 'deal_damage':
+                                // Cannot revert damage without heal_damage tool
+                                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Cannot revert damage (heal_damage tool removed)`);
+                                break;
+                            default:
+                                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Cannot revert tool: ${toolName}`);
+                        }
+                    }
+                }
+            },
+
+            // Perform rewind to target position
+            rewind: function(targetPosition) {
+                const entriesToRevert = RewindSystem.getEntriesForRewind(targetPosition);
+
+                if (!entriesToRevert) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Invalid rewind position: ${targetPosition}`);
+                    return false;
+                }
+
+                // Revert all tools from current to target position
+                for (const entry of entriesToRevert) {
+                    RewindSystem.revertTools(entry.tools);
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Reverted tools at position ${entry.position}`);
+                }
+
+                // Update position
+                const data = RewindSystem.getStorage();
+                data.position = targetPosition;
+                RewindSystem.saveStorage(data);
+
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Rewound to position ${targetPosition}`);
+                return true;
+            },
+
+            // Find current position by matching history
+            findCurrentPosition: function() {
+                const data = RewindSystem.getStorage();
+                if (!history || history.length === 0) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: No history available`);
+                    return { matched: false, position: -1 };
+                }
+
+                if (data.entries.length === 0) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: No stored entries yet`);
+                    return { matched: false, position: -1 };
+                }
+
+                // First try to match based on stored position
+                const expectedPosition = Math.min(history.length - 1, data.entries.length - 1);
+
+                // Verify by checking the last few hashes
+                const checkCount = Math.min(3, history.length, data.entries.length);
                 let verified = true;
-                const checkCount = Math.min(3, historyLength, data.entries.length);
-                
+
                 for (let i = 0; i < checkCount; i++) {
-                    const historyIndex = historyLength - 1 - i;
+                    const historyIndex = history.length - 1 - i;
                     const dataIndex = expectedPosition - i;
-                    
+
                     if (historyIndex >= 0 && dataIndex >= 0) {
                         const historyHash = RewindSystem.quickHash(history[historyIndex].text);
                         const storedHash = data.entries[dataIndex].h;
-                        
+
                         if (historyHash !== storedHash) {
                             verified = false;
                             break;
                         }
                     }
                 }
-                
+
                 if (verified) {
-                    if (debug) console.log(`${MODULE_NAME}: Current position: ${expectedPosition} (history length: ${historyLength})`);
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Found current position: ${expectedPosition}`);
                     return { matched: true, position: expectedPosition };
-                } else {
-                    if (debug) console.log(`${MODULE_NAME}: Position mismatch - history doesn't match stored data`);
                 }
-            }
-            
-            return { matched: false, position: -1 };
-        },
-        
-        // Detect if history was edited
-        detectEdit: function() {
-            const data = RewindSystem.getStorage();
-            const position = RewindSystem.findCurrentPosition();
-            
-            if (!position.matched) {
-                // Can't determine position - possible major edit
-                return { edited: true, position: 0, confidence: 'low' };
-            }
-            
-            // Check if all hashes match up to current position
-            const currentHashes = history.map(h => RewindSystem.quickHash(h.text));
-            
-            for (let i = 0; i < Math.min(currentHashes.length, data.entries.length); i++) {
-                if (currentHashes[i] !== data.entries[i].h) {
-                    return { edited: true, position: i, confidence: 'high' };
-                }
-            }
-            
-            return { edited: false };
-        },
-        
-        // Rehash from a certain position forward (after edit)
-        rehashFrom: function(position) {
-            const data = RewindSystem.getStorage();
-            
-            // When an edit is detected, everything after the edit point is invalid
-            // We should discard those entries and start fresh from the edit point
-            if (position < data.entries.length) {
-                // Keep entries up to AND including the edit position
-                data.entries = data.entries.slice(0, position + 1);
-                
-                // Update position to match current history length
-                data.position = Math.min(position, history.length - 1);
-                
-                if (debug) console.log(`${MODULE_NAME}: Discarded entries after position ${position}, keeping ${data.entries.length} entries`);
-            }
-            
-            // Now rehash the current history entries from the edit point forward
-            for (let i = position; i < history.length; i++) {
-                const newHash = RewindSystem.quickHash(history[i].text);
-                
-                // If this position exists in our data, update its hash
-                if (i < data.entries.length) {
-                    data.entries[i].h = newHash;
-                }
-                // Otherwise we'll add new entries as they come in during output processing
-            }
-            
-            RewindSystem.saveStorage(data);
-            if (debug) console.log(`${MODULE_NAME}: Rehashed from position ${position}`);
-        },
-        
-        // Get tool reversions for rewinding
-        getReversions: function() {
-            // Tool-specific reversions
-            return {
-                'add_item': (params) => ['add_item', [params[0], params[1], -params[2]]],  // Negate quantity
-                'remove_item': (params) => ['remove_item', [params[0], params[1], -params[2]]],  // Negate quantity
-                'deal_damage': (params) => ['heal', params],
-                'heal': (params) => ['deal_damage', params],
-                'add_tag': (params) => ['remove_tag', params],
-                'remove_tag': (params) => ['add_tag', params],
-                'transfer_item': (params) => ['transfer_item', [params[1], params[0], params[2], params[3]]],
-                'add_levelxp': (params) => ['add_levelxp', [params[0], -params[1]]],
-                'add_skillxp': (params) => ['add_skillxp', [params[0], params[1], -params[2]]],
-                'update_relationship': (params) => ['update_relationship', [params[0], params[1], -params[2]]],
-                'update_location': () => null,  // Can't revert without stored old location
-                // Non-reversible tools return null
-                'offer_quest': () => null,
-                'check_threshold': () => null
-            };
-        },
-        
-        // Get revert info for a specific tool
-        getRevertInfo: function(toolName, params) {
-            const reversions = RewindSystem.getReversions();
-            const reverter = reversions[toolName];
-            if (reverter) {
-                return reverter(params);
-            }
-            return null;
-        },
-        
-        // Rewind to a specific position
-        rewindTo: function(targetPosition) {
-            const data = RewindSystem.getStorage();
-            const currentPos = data.position;
-            
-            if (targetPosition >= currentPos) {
-                if (debug) console.log(`${MODULE_NAME}: Cannot rewind forward`);
-                return false;
-            }
-            
-            // Revert tools from current back to target
-            for (let i = currentPos; i > targetPosition; i--) {
-                const entry = data.entries[i];
-                if (!entry) continue;
-                
-                // Process tools in reverse order
-                for (let j = entry.t.length - 1; j >= 0; j--) {
-                    const toolData = entry.t[j];
-                    const [tool, params, revertData] = toolData;
-                    
-                    // Use the captured revert data if available
-                    if (revertData && Object.keys(revertData).length > 0) {
-                        // Apply the captured revert data directly
-                        if (debug) console.log(`${MODULE_NAME}: Reverting ${tool} using captured data:`, revertData);
-                        
-                        // Different tools need different reversion approaches
-                        switch(tool) {
-                            case 'update_location':
-                                if (revertData.oldLocation) {
-                                    const result = processToolCall('update_location', [params[0], revertData.oldLocation]);
-                                    if (debug) console.log(`${MODULE_NAME}: Reverted location for ${params[0]} to ${revertData.oldLocation}: ${result}`);
-                                }
-                                break;
-                                
-                            case 'add_item':
-                                if (revertData.oldQuantity !== undefined) {
-                                    // Set the item quantity back to what it was
-                                    const charName = String(params[0]).toLowerCase();
-                                    const itemName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                                    const quantity = revertData.oldQuantity;
-                                    
-                                    if (quantity === 0) {
-                                        // Remove the item entirely
-                                        const result = processToolCall('remove_item', [params[0], params[1], params[2]]);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted add_item by removing ${itemName} from ${charName}: ${result}`);
-                                    } else {
-                                        // Set to old quantity
-                                        const char = load('Character', charName);
-                                        if (char && char.inventory) {
-                                            if (!char.inventory[itemName]) char.inventory[itemName] = {};
-                                            char.inventory[itemName].quantity = quantity;
-                                            save('Character', char);
-                                            if (debug) console.log(`${MODULE_NAME}: Reverted add_item by setting ${itemName} quantity to ${quantity} for ${charName}`);
-                                        }
-                                    }
-                                }
-                                break;
-                                
-                            case 'remove_item':
-                                if (revertData.oldQuantity !== undefined) {
-                                    // Restore the item to its old quantity
-                                    const result = processToolCall('add_item', [params[0], params[1], revertData.oldQuantity]);
-                                    if (debug) console.log(`${MODULE_NAME}: Reverted remove_item by adding ${params[1]} x${revertData.oldQuantity} to ${params[0]}: ${result}`);
-                                }
-                                break;
-                                
-                            case 'transfer_item':
-                                // Restore both characters to their old quantities
-                                if (revertData.fromOldQuantity !== undefined && revertData.toOldQuantity !== undefined) {
-                                    const fromChar = load('Character', String(params[0]).toLowerCase());
-                                    const toChar = load('Character', String(params[1]).toLowerCase());
-                                    const itemName = String(params[2]).toLowerCase().replace(/\s+/g, '_');
-                                    
-                                    if (fromChar && fromChar.inventory) {
-                                        if (!fromChar.inventory[itemName]) fromChar.inventory[itemName] = {};
-                                        fromChar.inventory[itemName].quantity = revertData.fromOldQuantity;
-                                        save('Character', fromChar);
-                                    }
-                                    
-                                    if (toChar && toChar.inventory) {
-                                        if (revertData.toOldQuantity === 0) {
-                                            delete toChar.inventory[itemName];
-                                        } else {
-                                            if (!toChar.inventory[itemName]) toChar.inventory[itemName] = {};
-                                            toChar.inventory[itemName].quantity = revertData.toOldQuantity;
-                                        }
-                                        save('Character', toChar);
-                                    }
-                                    
-                                    if (debug) console.log(`${MODULE_NAME}: Reverted transfer_item: restored ${itemName} quantities`);
-                                }
-                                break;
-                                
-                            case 'deal_damage':
-                                if (revertData.oldHp !== undefined) {
-                                    const targetName = params[1];
-                                    const char = load('Character', String(targetName).toLowerCase());
-                                    if (char && char.stats && char.stats.hp) {
-                                        char.stats.hp.current = revertData.oldHp;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted deal_damage for ${targetName}, restored HP to ${revertData.oldHp}`);
-                                    }
-                                }
-                                break;
-                                
-                            case 'update_relationship':
-                                if (revertData.oldValue !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
-                                    if (char && char.relationships) {
-                                        const char2Name = String(params[1]).toLowerCase();
-                                        char.relationships[char2Name] = revertData.oldValue;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted relationship ${params[0]}->${params[1]} to ${revertData.oldValue}`);
-                                    }
-                                }
-                                break;
-                                
-                            case 'add_levelxp':
-                                if (revertData.oldLevel !== undefined && revertData.oldXp !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
-                                    if (char && char.stats && char.stats.level) {
-                                        char.stats.level.value = revertData.oldLevel;
-                                        if (!char.stats.level.xp) char.stats.level.xp = {};
-                                        char.stats.level.xp.current = revertData.oldXp;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted level/XP for ${params[0]} to level ${revertData.oldLevel}, XP ${revertData.oldXp}`);
-                                    }
-                                }
-                                break;
-                                
-                            case 'add_skillxp':
-                                if (revertData.oldLevel !== undefined && revertData.oldXp !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
-                                    const skillName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                                    if (char && char.skills && char.skills[skillName]) {
-                                        char.skills[skillName].level = revertData.oldLevel;
-                                        if (!char.skills[skillName].xp) char.skills[skillName].xp = {};
-                                        char.skills[skillName].xp.current = revertData.oldXp;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted skill ${skillName} for ${params[0]} to level ${revertData.oldLevel}, XP ${revertData.oldXp}`);
-                                    }
-                                }
-                                break;
-                                
-                            case 'unlock_newskill':
-                                // Skip reverting skill unlocks for now - would need to track if it was truly new
-                                break;
-                                
-                            default:
-                                // Check if this is an update_[stat] tool
-                                if (tool.startsWith('update_') && revertData.statName && revertData.oldValue !== undefined) {
-                                    const char = load('Character', String(params[0]).toLowerCase());
-                                    if (char && char.attributes && char.attributes[revertData.statName]) {
-                                        char.attributes[revertData.statName].value = revertData.oldValue;
-                                        save('Character', char);
-                                        if (debug) console.log(`${MODULE_NAME}: Reverted ${tool} for ${params[0]}, restored ${revertData.statName} to ${revertData.oldValue}`);
-                                    }
-                                } else {
-                                    // For unknown tools
-                                    if (debug) console.log(`${MODULE_NAME}: No specific revert handler for ${tool}`);
-                                }
-                        }
-                    } else {
-                        // Fallback to old reversion system if no revert data captured
-                        const reversions = RewindSystem.getReversions();
-                        const reverter = reversions[tool];
-                        
-                        if (reverter) {
-                            const reversion = reverter(params);
-                            if (reversion) {
-                                const [revertTool, revertParams] = reversion;
-                                const result = processToolCall(revertTool, revertParams);
-                                if (debug) console.log(`${MODULE_NAME}: Reverted (fallback): ${tool}(${params.join(',')}) -> ${revertTool}(${revertParams.join(',')}): ${result}`);
-                            }
-                        }
-                    }
-                }
-            }
-            
-            data.position = targetPosition;
-            RewindSystem.saveStorage(data);
-            return true;
-        },
-        
-        // Extract and execute tools from text
-        extractAndExecuteTools: function(text) {
-            const executedTools = [];
-            if (!text) return executedTools;
-            
-            // Find all tool calls in the text using the same pattern as processTools
-            let match;
-            while ((match = TOOL_PATTERN.exec(text)) !== null) {
-                const [fullMatch, toolName, paramString] = match;
-                
-                // Use the same parameter parser as processTools
-                const params = parseParameters(paramString);
-                
-                // Skip if this is a getter function (get_*)
-                if (toolName.startsWith('get')) continue;
-                
-                // Capture revert data BEFORE executing
-                // Skip revert data capture here since captureRevertData is not accessible
-                // This is called from RewindSystem which doesn't have access to the main scope
-                const revertData = null;
-                
-                // Execute the tool
-                const result = processToolCall(toolName, params);
-                
-                // Only track if successfully executed (ignore malformed/unknown)
-                if (result === 'executed') {
-                    executedTools.push({
-                        tool: toolName.toLowerCase(),
-                        params: params,
-                        executed: true,
-                        revertData: revertData
-                    });
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Executed tool from history: ${toolName}(${params.join(', ')})`);
-                }
-            }
-            
-            return executedTools;
-        },
-        
-        // Process tools and add to history (called from processTools)
-        trackTools: function(text, executedTools) {
-            if (!executedTools || executedTools.length === 0) return;
-            
-            RewindSystem.recordAction(text, executedTools);
-        },
-        
-        // Handle context updates (check for edits and rewinds)
-        handleContext: function() {
-            // Check if history is available
-            if (typeof history === 'undefined' || !history) {
-                if (debug) console.log(`${MODULE_NAME}: History not available in context`);
-                return;
-            }
-            
-            const data = RewindSystem.getStorage();
-            const historyLength = history.length;
-            const oldLength = data.entries.length;
-            const oldPosition = data.position || -1;  // Track our last known position
-            
-            // Detect if history array has shifted (when at max capacity)
-            let shifted = false;
-            if (historyLength === 100 && oldLength >= 100) {
-                // Check if the entries have shifted by comparing a few positions
-                // If history[0] doesn't match our entries[0], we've shifted
-                if (history[0] && data.entries[0]) {
-                    const historyHash = RewindSystem.quickHash(history[0].text);
-                    if (data.entries[0].h !== historyHash) {
-                        shifted = true;
-                        if (debug) console.log(`${MODULE_NAME}: History array shifted - realigning entries`);
-                    }
-                }
-            }
-            
-            // If shifted, remove the oldest entry from our data
-            if (shifted) {
-                data.entries.shift();
-            }
-            
-            // Track new entries but DON'T execute tools (assume already executed)
-            // Only truly new entries at the very end should execute
-            
-            for (let i = data.entries.length; i < historyLength; i++) {
-                const historyEntry = history[i];
-                if (!historyEntry || !historyEntry.text) {
-                    data.entries[i] = null;
-                    continue;
-                }
-                
-                const hash = RewindSystem.quickHash(historyEntry.text);
-                
-                // Check if this is the LAST entry in the history (genuinely new)
-                // All other entries are assumed to be restored/already executed
-                if (i === historyLength - 1 && i > oldPosition) {
-                    // This is the newest entry and it's beyond our last position - execute tools
-                    if (debug) console.log(`${MODULE_NAME}: Processing genuinely new entry at position ${i}`);
-                    const tools = RewindSystem.extractAndExecuteTools(historyEntry.text);
-                    data.entries[i] = {
-                        h: hash,
-                        t: tools.map(t => [t.tool, t.params, t.revertData || {}])
-                    };
-                } else {
-                    // This is either:
-                    // 1. A restored entry from history (middle entries)
-                    // 2. Not beyond our last known position
-                    // Just track hash, don't execute tools
-                    if (debug) console.log(`${MODULE_NAME}: Tracking entry at position ${i} without execution (restored or old)`);
-                    
-                    // Extract tools without executing them (for tracking purposes)
-                    const toolMatches = [];
-                    const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/g;
-                    let match;
-                    while ((match = TOOL_PATTERN.exec(historyEntry.text)) !== null) {
-                        const toolName = match[1];
-                        const paramString = match[2];
-                        const params = paramString ? paramString.split(',').map(p => p.trim()) : [];
-                        toolMatches.push([toolName, params, {}]);
-                    }
-                    
-                    data.entries[i] = {
-                        h: hash,
-                        t: toolMatches  // Tools that were in the text but we're not executing
-                    };
-                }
-            }
-            
-            // Verify existing entries haven't been edited
-            const checkLength = Math.min(data.entries.length, historyLength);
-            let editedPosition = -1;
-            
-            // First, find if any entry was edited
-            for (let i = 0; i < checkLength; i++) {
-                if (!history[i] || !data.entries[i]) continue;
-                
-                const historyHash = RewindSystem.quickHash(history[i].text);
-                
-                if (data.entries[i].h !== historyHash) {
-                    editedPosition = i;
-                    if (debug) console.log(`${MODULE_NAME}: History entry ${i} was edited - will revert from current back to ${i}, then replay`);
-                    break;
-                }
-            }
-            
-            // If an edit was found, revert everything from current position back to the edit
-            if (editedPosition >= 0) {
-                // Step 1: Revert ALL tools from current position back to edited position (reverse order)
-                for (let i = checkLength - 1; i >= editedPosition; i--) {
-                    if (!data.entries[i]) continue;
-                    
-                    const oldTools = data.entries[i].t || [];
-                    for (let j = oldTools.length - 1; j >= 0; j--) {
-                        const [toolName, params, storedRevertData] = oldTools[j];
-                        
-                        // Use stored revert data for precise reversions
-                        if (toolName === 'add_item' && storedRevertData && storedRevertData.oldQuantity !== undefined) {
-                            const addedQty = parseInt(params[2]);
-                            const revertQty = -(addedQty);
-                            const revertText = `add_item(${params[0]}, ${params[1]}, ${revertQty})`;
-                            RewindSystem.extractAndExecuteTools(revertText);
-                            if (debug) console.log(`${MODULE_NAME}: Reverting entry ${i}: add_item via ${revertText}`);
-                        } else if (toolName === 'update_location' && storedRevertData && storedRevertData.oldLocation) {
-                            const revertText = `update_location(${params[0]}, ${storedRevertData.oldLocation})`;
-                            RewindSystem.extractAndExecuteTools(revertText);
-                            if (debug) console.log(`${MODULE_NAME}: Reverting entry ${i}: location via ${revertText}`);
-                        } else {
-                            const revertInfo = RewindSystem.getRevertInfo(toolName, params);
-                            if (revertInfo) {
-                                const [revertTool, revertParams] = revertInfo;
-                                const revertText = `${revertTool}(${revertParams.join(',')})`;
-                                RewindSystem.extractAndExecuteTools(revertText);
-                                if (debug) console.log(`${MODULE_NAME}: Reverting entry ${i}: ${toolName} via ${revertText}`);
-                            }
-                        }
-                    }
-                }
-                
-                // Step 2: Re-execute ALL tools from edited position to current position (forward order)
-                for (let i = editedPosition; i < checkLength; i++) {
-                    if (!history[i]) continue;
-                    
-                    const historyHash = RewindSystem.quickHash(history[i].text);
-                    const tools = RewindSystem.extractAndExecuteTools(history[i].text);
-                    
-                    // Update the stored entry with new hash and tool data
-                    data.entries[i] = {
-                        h: historyHash,
-                        t: tools.map(t => [t.tool, t.params, t.revertData || {}])
-                    };
-                    
-                    if (debug && tools.length > 0) {
-                        console.log(`${MODULE_NAME}: Re-executed entry ${i} with ${tools.length} tools`);
-                    }
-                }
-            }
-            
-            // Update position
-            data.position = historyLength - 1;
-            RewindSystem.saveStorage(data);
-            
-            if (debug) console.log(`${MODULE_NAME}: History check complete - ${data.entries.length} entries tracked`);
-        }
-    };
-    
-    
-    function createEntityTrackerCards() {
-        // Create entity tracker config
-        if (!Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker')) {
-            Utilities.storyCard.add({
-                title: '[SANE_CONFIG] Entity Tracker',
-                type: 'data',
-                entry: (
-                    `# entity_threshold\n` +
-                    `3\n` +
-                    `# auto_generate\n` +
-                    `true\n` +
-                    `# entity_blacklist\n` +
-                    `player, self, me, you, unknown`
-                ),
-                description: `// Entity tracking data\n`
-            });
-        }
-        
 
-        
-        if (debug) console.log(`${MODULE_NAME}: Created entity tracker cards`);
-    }
-    
-    // ==========================
-    // RPG Schema Management
-    // ==========================
-    // schemaCache already declared at top of file
-    
-    function calculateLevelXPRequirement(level) {
-        // Get stats component for level progression formula
-        const statsComp = Utilities.storyCard.get('[SANE_COMP] stats');
-        if (statsComp && statsComp.description) {
-            try {
-                const schema = JSON.parse(statsComp.description);
-                if (schema.level_progression) {
-                    // Check for level override first
-                    if (schema.level_progression.xp_overrides && schema.level_progression.xp_overrides[String(level)]) {
-                        return schema.level_progression.xp_overrides[String(level)];
-                    }
-                    // Use formula: level * (level - 1) * 500
-                    if (schema.level_progression.xp_formula) {
-                        // Simple eval replacement for safety
-                        if (schema.level_progression.xp_formula === "level * (level - 1) * 500") {
-                            return level * (level - 1) * 500;
-                        }
-                    }
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse stats schema`);
-            }
-        }
-        // Fallback formula
-        return level * 500;
-    }
-    
-    function calculateMaxHP(level) {
-        // Get stats component for HP progression
-        const statsComp = Utilities.storyCard.get('[SANE_COMP] stats');
-        if (statsComp && statsComp.description) {
-            try {
-                const schema = JSON.parse(statsComp.description);
-                if (schema.hp_progression) {
-                    const base = schema.hp_progression.base || 100;
-                    const perLevel = schema.hp_progression.per_level || 20;
-                    return base + ((level - 1) * perLevel);
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse stats schema`);
-            }
-        }
-        // Fallback: 100 + 20 per level
-        return 100 + ((level - 1) * 20);
-    }
-    
-    function calculateSkillXPRequirement(skillName, level) {
-        // Check skills component for formula
-        const skillsComp = Utilities.storyCard.get('[SANE_COMP] skills');
-        if (skillsComp && skillsComp.description) {
-            try {
-                const schema = JSON.parse(skillsComp.description);
-                if (schema.registry && schema.registry[skillName]) {
-                    const skillDef = schema.registry[skillName];
-                    
-                    // Check for skill-specific formula first
-                    if (skillDef.xp_formula) {
-                        const match = skillDef.xp_formula.match(/level\s*\*\s*(\d+)/);
-                        if (match) {
-                            return level * parseInt(match[1]);
-                        }
-                    }
-                    
-                    // Check category formula
-                    if (skillDef.category && schema.categories && schema.categories[skillDef.category]) {
-                        const categoryDef = schema.categories[skillDef.category];
-                        if (categoryDef.xp_formula) {
-                            const match = categoryDef.xp_formula.match(/level\s*\*\s*(\d+)/);
-                            if (match) {
-                                return level * parseInt(match[1]);
-                            }
-                        }
-                    }
-                }
-                
-                // Use default category if exists
-                if (schema.categories && schema.categories.default && schema.categories.default.xp_formula) {
-                    const match = schema.categories.default.xp_formula.match(/level\s*\*\s*(\d+)/);
-                    if (match) {
-                        return level * parseInt(match[1]);
-                    }
-                }
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse skill registry`);
-            }
-        }
-        // Fallback formula
-        return level * 100;
-    }
-    
-    function getSkillRegistry() {
-        // Get the list of valid skills from component schema
-        const skillsComp = Utilities.storyCard.get('[SANE_COMP] skills');
-        if (skillsComp && skillsComp.description) {
-            try {
-                const schema = JSON.parse(skillsComp.description);
-                return schema.registry || {};
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Failed to parse skill registry`);
-            }
-        }
-        return {};
-    }
-    
-    // ==========================
-    // Relationship System
-    // ==========================
-    function loadRelationshipThresholds() {
-        // Load from relationships component schema
-        const relationshipSchema = Utilities.storyCard.get('[SANE_COMP] relationships');
-        if (!relationshipSchema || !relationshipSchema.description) {
-            // No component = no relationship system
-            if (debug) console.log(`${MODULE_NAME}: Relationships component not found - relationship system disabled`);
-            return [];
-        }
-        
-        try {
-            const schema = JSON.parse(relationshipSchema.description);
-            if (schema.thresholds && Array.isArray(schema.thresholds)) {
-                return schema.thresholds;
-            }
-            // Component exists but no thresholds defined
-            if (debug) console.log(`${MODULE_NAME}: Relationships component has no thresholds defined`);
-            return [];
-        } catch (e) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to parse relationship schema`);
-            return [];
-        }
-    }
-    
-    function getRelationshipFlavor(value, fromName, toName) {
-        const thresholds = loadRelationshipThresholds();
-        
-        // Find matching threshold
-        for (const threshold of thresholds) {
-            if (value >= threshold.min && value <= threshold.max) {
-                // Replace placeholders in flavor text if present
-                return threshold.flavor
-                    .replace(/\{from\}/g, fromName || '')
-                    .replace(/\{to\}/g, toName || '')
-                    .replace(/\{value\}/g, value);
-            }
-        }
-        
-        // Default if no threshold matches
-        return `${value} points`;
-    }
-    
-    
-    // ==========================
-    // Initialize APIs
-    // ==========================
-    if (typeof Calendar !== 'undefined' && typeof Calendar === 'function') {
-        Calendar('api', null);
-    }
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Could not verify position`);
+                return { matched: false, position: -1 };
+            },
 
-    if (typeof GenerationWizard !== 'undefined' && typeof GenerationWizard === 'function') {
-        GenerationWizard('api', null);
-    }
-    
-    // ==========================
-    // Universal Format System
-    // ==========================
-    
-    const formatCaches = {}; // Cache for all object formats
-    
-    // Resolve object type aliases using schema definitions
-    function resolveObjectAlias(objectType) {
-        if (!objectType) return objectType;
-        
-        // Initialize schemas and alias map if needed
-        if (!schemaAliasMap) initializeSchemaRegistry();
-        
-        // Simple O(1) lookup in pre-built map
-        const lowerType = objectType.toLowerCase();
-        const resolved = schemaAliasMap[lowerType];
-        
-        // Return resolved name or original if not found
-        return resolved || objectType;
-    }
-    
-    // REMOVED loadObjectFormat - redundant with direct FORMAT card loading in saveEntityCard
-    
-    function parseFormatCard(card) {
-        const format = {
-            template: '',      // The template from description
-            fields: {},        // Field parsing patterns from entry (for reading existing cards)
-            computed: {},      // Computed field templates from entry (for building new cards)
-            formats: {}        // Format hints for how to display specific fields
-        };
-        
-        // Description IS the template
-        format.template = card.description || '';
-        
-        // Entry contains computed fields and format hints
-        // Two formats supported:
-        // 1. fieldname: template_expression (for computed fields like prefix, info_line)
-        // 2. format:fieldname: format_type (for display format hints)
-        if (card.entry) {
-            const lines = card.entry.split('\n');
-            
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed || trimmed.startsWith('//') || trimmed.startsWith('#')) continue;
-                
-                // Parse field definition - find the first colon
-                const colonIdx = trimmed.indexOf(':');
-                if (colonIdx === -1) continue;
-                
-                const fieldName = trimmed.substring(0, colonIdx).trim();
-                const rest = trimmed.substring(colonIdx + 1).trim();
-                
-                // Check if this is a format hint
-                if (fieldName.startsWith('format:')) {
-                    // format:fieldname: format_type
-                    const actualField = fieldName.substring(7); // Remove 'format:'
-                    format.formats[actualField] = rest;
-                }
-                // Check if this looks like a template expression (contains { } or $())
-                else if ((rest.includes('{') && rest.includes('}')) || (rest.includes('$(') && rest.includes(')'))) {
-                    // This is a computed field template
-                    // Keep the original template as-is
-                    format.computed[fieldName] = rest;
-                } else {
-                    // Deprecated: regex patterns for parsing
-                    // We now use JSON data storage, so these patterns are no longer used
-                    // Skip storing them to avoid confusion
-                    if (debug) console.log(`${MODULE_NAME}: Skipping deprecated parsing pattern: ${fieldName}`);
-                }
-            }
-        }
-        
-        return format;
-    }
-    
-    
-    // ==========================
-    // Entity Data Parsing
-    // ==========================
-    
-    // Build structured data for DESCRIPTION field
-    function buildEntityData(entity) {
-        // Build clean entity with proper field order
-        const cleanEntity = {};
-        
-        // Add primary fields first (in order)
-        if (entity.name) cleanEntity.name = entity.name;
-        if (entity._type) cleanEntity.type = entity._type;
-        if (entity._subtype) cleanEntity.subtype = entity._subtype;  // e.g., 'Player' for PLAYER cards
-        if (entity.aliases) cleanEntity.aliases = entity.aliases;
-        
-        // Skip these fields entirely
-        const skipFields = ['name', '_type', '_subtype', 'aliases', '_cardTitle', '_isPlayer', '_title', 
-                           'info_line', 'attributes_formatted', 'skills_formatted', 
-                           'inventory_formatted', 'relationships_formatted'];
-        
-        // Add all other fields
-        for (const [key, value] of Object.entries(entity)) {
-            // Skip internal fields, already-added fields, and computed fields
-            if (skipFields.includes(key) || key.startsWith('_') || key.endsWith('_formatted')) continue;
-            
-            // Skip empty objects and null values
-            if (value !== null && value !== undefined && 
-                !(typeof value === 'object' && Object.keys(value).length === 0)) {
-                cleanEntity[key] = value;
-            }
-        }
-        
-        // Build the JSON data with markers
-        let data = '<== REAL DATA ==>\n';
-        data += JSON.stringify(cleanEntity, null, 2);
-        data += '\n<== END DATA ==>';
-        return data;
-    }
-    
-    
-    // Parse structured data from DESCRIPTION field
-    function parseEntityData(description) {
-        // Extract data between markers
-        const dataMatch = description.match(/<== REAL DATA ==>([\s\S]*?)<== END DATA ==>/);
-        if (!dataMatch) {
-            console.log(`${MODULE_NAME}: WARNING - No data section found in card description`);
-            return {}; // No data section - return empty entity
-        }
-        
-        const dataSection = dataMatch[1].trim();
-        
-        try {
-            // Simply parse the entire JSON object
-            const entity = JSON.parse(dataSection);
-            
-            // Convert 'type' back to '_type' for internal use
-            if (entity.type) {
-                entity._type = entity.type;
-                delete entity.type;
-            }
-            
-            return entity;
-        } catch (e) {
-            console.log(`${MODULE_NAME}: ERROR - Failed to parse entity JSON: ${e.message}`);
-            console.log(`${MODULE_NAME}: Data section: ${dataSection.substring(0, 200)}...`);
-            return {}; // Return empty entity if parsing fails
-        }
-    }
-    
-    // ==========================
-    // Display Card Building from Template
-    // ==========================
-    
-    function formatFieldValue(value, formatType) {
-        if (!value || !formatType) return value;
-        
-        switch(formatType.toLowerCase()) {
-            case 'braced':
-            case 'inventory':
-                // Always format inventory as bulleted list for consistency
-                if (typeof value === 'object') {
-                    const items = [];
-                    
-                    for (const [key, val] of Object.entries(value)) {
-                        const itemName = key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                        
-                        if (typeof val === 'object') {
-                            const qty = val.quantity || 1;
-                            const props = [];
-                            if (val.equipped) props.push('equipped');
-                            if (val.enhancement) props.push(`+${val.enhancement}`);
-                            if (val.durability) props.push(`durability: ${val.durability}`);
-                            if (val.bound_to) props.push(`bound: ${val.bound_to}`);
-                            
-                            if (props.length > 0) {
-                                items.push(`• ${itemName} x${qty} (${props.join(', ')})`);
-                            } else {
-                                items.push(`• ${itemName} x${qty}`);
-                            }
-                        } else if (typeof val === 'number') {
-                            items.push(`• ${itemName} x${val}`);
-                        } else {
-                            items.push(`• ${itemName}: ${val}`);
-                        }
-                    }
-                    
-                    return items.join('\n');
-                }
-                return value;
-                
-            case 'json':
-                // Format as JSON
-                return JSON.stringify(value);
-                
-            case 'bullets':
-            case 'bulleted':
-                // Format as bulleted list
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        if (typeof val === 'object' && val.name) {
-                            items.push(`• ${val.name}: ${val.status || val.value || JSON.stringify(val)}`);
-                        } else {
-                            items.push(`• ${key}: ${val}`);
-                        }
-                    }
-                    return items.join('\n');
-                }
-                return value;
-                
-            case 'pipe':
-                // Format as pipe-delimited
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        if (typeof val === 'object' && val.name) {
-                            items.push(`${val.name}: ${val.status || val.value}`);
-                        } else {
-                            items.push(`${key}: ${val}`);
-                        }
-                    }
-                    return items.join(' | ');
-                }
-                return value;
-                
-            case 'multiline':
-                // Format as one per line
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        if (typeof val === 'object') {
-                            items.push(`${key}: ${JSON.stringify(val)}`);
-                        } else {
-                            items.push(`${key}: ${val}`);
-                        }
-                    }
-                    return items.join('\n');
-                }
-                return value;
-                
-            case 'comma':
-                // Format as comma-separated list
-                if (Array.isArray(value)) {
-                    return value.join(', ');
-                } else if (typeof value === 'object') {
-                    return Object.keys(value).join(', ');
-                }
-                return value;
-                
-            case 'skills_with_xp':
-                // Format skills with XP progress
-                if (typeof value === 'object') {
-                    const formatted = [];
-                    for (const [skillName, skillData] of Object.entries(value)) {
-                        // Format skill names nicely (one_handed_sword -> One Handed Sword)
-                        const displayName = skillName.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                        if (typeof skillData === 'object' && skillData.level) {
-                            const xp = skillData.xp || 0;
-                            const maxXp = skillData.max_xp || 100;
-                            formatted.push(`• ${displayName}: Level ${skillData.level} (${xp}/${maxXp} XP)`);
-                        } else {
-                            formatted.push(`• ${displayName}: ${JSON.stringify(skillData)}`);
-                        }
-                    }
-                    return formatted.join('\n');
-                }
-                return value;
-                
-            case 'inline_pipes':
-                // Format attributes as pipe-separated (VITALITY: 10 | STRENGTH: 10)
-                if (typeof value === 'object') {
-                    const items = [];
-                    for (const [key, val] of Object.entries(value)) {
-                        // Keep attributes uppercase
-                        const displayKey = key.toUpperCase();
-                        items.push(`${displayKey}: ${val}`);
-                    }
-                    return items.join(' | ');
-                }
-                return value;
-                
-            default:
-                return value;
-        }
-    }
-    
-    function buildDisplayCard(data, template, cardTitle) {
-        // The template IS the description field - just parse it directly
-        // Debug logging removed for cleaner output
-        
-        const parser = new TemplateParser(data);
-        return parser.parse(template);
-    }
-    
-    // Process the ENTRY field to extract and evaluate computed fields
-    // The DESCRIPTION field IS the template, used directly by buildDisplayCard
-    
-    // Template Parser Class
-    class TemplateParser {
-        constructor(data) {
-            this.data = data;
-            this.pos = 0;
-            this.template = '';
-        }
-        
-        // Check if value is truthy for conditionals
-        isTruthy(value) {
-            if (value === undefined || value === null || value === '') return false;
-            if (value === false || value === 0) return false;
-            if (typeof value === 'object' && Object.keys(value).length === 0) return false;
-            return true;
-        }
-        
-        // Main parse function
-        parse(template) {
-            this.template = template;
-            this.pos = 0;
-            return this.parseTemplate();
-        }
-        
-        // Parse the entire template
-        parseTemplate() {
-            let result = '';
-            
-            while (this.pos < this.template.length) {
-                const char = this.template[this.pos];
-                
-                // Handle $() syntax ONLY at the top level, not inside {}
-                if (char === '$' && this.pos + 1 < this.template.length && this.template[this.pos + 1] === '(') {
-                    const dollarResult = this.parseDollarExpression();
-                    if (dollarResult !== null) {
-                        result += dollarResult;
-                    } else {
-                        result += char;
-                        this.pos++;
-                    }
-                } else if (char === '{') {
-                    // Check for escaped braces {{
-                    if (this.template[this.pos + 1] === '{') {
-                        result += '{';
-                        this.pos += 2;
-                        continue;
-                    }
-                    
-                    // Parse template expression
-                    const expr = this.parseExpression();
-                    if (expr !== null) {
-                        result += expr;
-                    } else {
-                        // Failed to parse, treat as literal
-                        result += char;
-                        this.pos++;
-                    }
-                } else if (char === '}' && this.template[this.pos + 1] === '}') {
-                    // Escaped closing braces
-                    result += '}';
-                    this.pos += 2;
-                } else {
-                    result += char;
-                    this.pos++;
-                }
-            }
-            
-            return result;
-        }
-        
-        // Parse a $() expression
-        parseDollarExpression() {
-            const start = this.pos;
-            
-            if (this.template.substring(this.pos, this.pos + 2) !== '$(') {
-                return null;
-            }
-            
-            this.pos += 2; // Skip $(
-            
-            // Find the closing )
-            let parenDepth = 1;
-            let exprEnd = this.pos;
-            
-            while (exprEnd < this.template.length && parenDepth > 0) {
-                if (this.template[exprEnd] === '(') {
-                    parenDepth++;
-                } else if (this.template[exprEnd] === ')') {
-                    parenDepth--;
-                }
-                exprEnd++;
-            }
-            
-            if (parenDepth !== 0) {
-                // Unmatched parentheses
-                this.pos = start;
-                return null;
-            }
-            
-            const fieldPath = this.template.substring(this.pos, exprEnd - 1);
-            this.pos = exprEnd; // Move past the closing )
-            
-            // Process as a simple field reference
-            return this.processField(fieldPath);
-        }
-        
-        // Parse a template expression {...}
-        parseExpression() {
-            const start = this.pos;
-            
-            if (this.template[this.pos] !== '{') {
-                return null;
-            }
-            
-            this.pos++; // Skip opening brace
-            
-            // Find the matching closing brace, accounting for nesting
-            let braceDepth = 1;
-            let exprEnd = this.pos;
-            
-            while (exprEnd < this.template.length && braceDepth > 0) {
-                if (this.template[exprEnd] === '{') {
-                    braceDepth++;
-                } else if (this.template[exprEnd] === '}') {
-                    braceDepth--;
-                }
-                exprEnd++;
-            }
-            
-            if (braceDepth !== 0) {
-                // Unmatched braces
-                this.pos = start;
-                return null;
-            }
-            
-            const content = this.template.substring(this.pos, exprEnd - 1);
-            this.pos = exprEnd; // Move past the closing brace
-            
-            
-            // Parse the expression content
-            return this.parseExpressionContent(content);
-        }
-        
-        // Parse the content inside {...}
-        parseExpressionContent(content) {
-            
-            // Check for loop syntax: field.*:template or field.*|template
-            const loopMatch = content.match(/^([^.*]+)\.\*([:|])(.+)$/s);
-            if (loopMatch) {
-                // Pass the delimiter as part of the template only if it's a pipe
-                const template = loopMatch[2] === '|' ? loopMatch[2] + loopMatch[3] : loopMatch[3];
-                return this.processLoop(loopMatch[1], template);
-            }
-            
-            // Check for conditional/ternary: field?content or field?true:false
-            const condMatch = content.match(/^([^?]+)\?(.+)$/s);
-            if (condMatch) {
-                return this.processConditional(condMatch[1], condMatch[2]);
-            }
-            
-            // Simple field replacement
-            return this.processField(content);
-        }
-        
-        // Process a loop expression
-        processLoop(objectPath, template) {
-            const obj = getNestedValue(this.data, objectPath);
-            if (!obj || typeof obj !== 'object') return '';
-            
-            // Check for pipe delimiter at start of template
-            let delimiter = '\n';
-            let actualTemplate = template;
-            if (template.startsWith('|')) {
-                delimiter = ' | ';
-                actualTemplate = template.substring(1);
-            }
-            
-            const results = [];
-            
-            for (const [key, value] of Object.entries(obj)) {
-                // Create a new parser with loop context
-                const loopData = { ...this.data };
-                
-                // Process template with loop replacements
-                let processed = actualTemplate;
-                
-                // Replace {*} with key (format nicely)
-                processed = processed.replace(/\{\*\}/g, () => {
-                    // Format snake_case to Title Case, or just capitalize single words
-                    if (key.includes('_')) {
-                        return key.replace(/_/g, ' ').replace(/\b\w/g, l => l.toUpperCase());
-                    }
-                    // Capitalize first letter of single words
-                    return key.charAt(0).toUpperCase() + key.slice(1);
-                });
-                
-                // Replace {*.prop} with value properties
-                processed = processed.replace(/\{\*\.([^}]*)\}/g, (m, prop) => {
-                    // Special case: {*.} means the value itself
-                    if (prop === '') {
-                        return typeof value === 'object' ? JSON.stringify(value) : String(value);
-                    }
-                    
-                    // Special handling for inventory items
-                    if (prop === 'quantity') {
-                        // For inventory, the value itself IS the quantity
-                        if (typeof value === 'number') {
-                            return String(value);
-                        } else if (typeof value === 'object' && value !== null && value.hasOwnProperty('quantity')) {
-                            // If it's an object with quantity property
-                            return String(value.quantity);
-                        }
-                        // Default to the value itself if it's not an object
-                        return String(value);
-                    }
-                    
-                    // For other properties, use normal nested access
-                    const propValue = getNestedValue(value, prop);
-                    return propValue !== undefined ? String(propValue) : '';
-                });
-                
-                // Handle nested conditionals within the loop
-                processed = processed.replace(/\{([^?}]+)\?([^}]*)\}/g, (m, condition, condContent) => {
-                    const condValue = condition.startsWith('*.') 
-                        ? getNestedValue(value, condition.slice(2))
-                        : getNestedValue(this.data, condition);
-                    return this.isTruthy(condValue) ? condContent : '';
-                });
-                
-                // Process any remaining field references
-                const subParser = new TemplateParser(loopData);
-                processed = subParser.parse(processed);
-                
-                if (processed.trim()) {
-                    results.push(processed);
-                }
-            }
-            
-            // Join results with the chosen delimiter
-            return results.join(delimiter);
-        }
-        
-        // Process a conditional expression
-        processConditional(fieldPath, content) {
-            const value = getNestedValue(this.data, fieldPath.trim());
-            const truthy = this.isTruthy(value);
-            
-            
-            // Check for ternary operator
-            // Need to find the : that's not inside nested braces and not escaped with \
-            let braceDepth = 0;
-            let colonIndex = -1;
-            
-            for (let i = 0; i < content.length; i++) {
-                if (content[i] === '{') {
-                    braceDepth++;
-                } else if (content[i] === '}') {
-                    braceDepth--;
-                } else if (content[i] === ':' && braceDepth === 0) {
-                    // Check if this colon is escaped with a backslash
-                    if (i > 0 && content[i - 1] === '\\') {
-                        // This is an escaped colon, not a ternary separator
-                        continue;
-                    }
-                    colonIndex = i;
-                    break;
-                }
-            }
-            
-            if (colonIndex !== -1) {
-                // Ternary operator
-                const trueContent = content.substring(0, colonIndex);
-                const falseContent = content.substring(colonIndex + 1);
-                
-                
-                const selectedContent = truthy ? trueContent : falseContent;
-                
-                // Process the selected content for nested templates
-                const subParser = new TemplateParser(this.data);
-                return subParser.parse(selectedContent);
-            }
-            
-            // Simple conditional
-            if (truthy) {
-                // Remove escaped colons before parsing
-                const unescapedContent = content.replace(/\\:/g, ':');
-                // Parse the content, which may contain $() or {} expressions
-                const subParser = new TemplateParser(this.data);
-                return subParser.parse(unescapedContent);
-            }
-            
-            return '';
-        }
-        
-        // Process a simple field reference
-        processField(fieldPath) {
-            // Handle nested resolution like {character.{name}.location}
-            if (fieldPath.includes('{') && fieldPath.includes('}')) {
-                const innerPattern = /\{([^}]+)\}/;
-                const resolved = fieldPath.replace(innerPattern, (m, innerField) => {
-                    const innerValue = getNestedValue(this.data, innerField);
-                    return innerValue || '';
-                });
-                
-                // Now get the value from the resolved path
-                // Check if it's an entity reference (character.Name, Location.Name, etc.)
-                const parts = resolved.split('.');
-                if (parts.length >= 2) {
-                    // Initialize schema registry if needed
-                    if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-                    
-                    // Check if first part might be an entity type
-                    const possibleType = parts[0];
-                    const capitalizedType = possibleType.charAt(0).toUpperCase() + possibleType.slice(1).toLowerCase();
-                    
-                    // Check if this is a valid entity type in the schema registry
-                    if (schemaRegistry[capitalizedType]) {
-                        const entityName = parts[1];
-                        const field = parts.slice(2).join('.');
-                        const entity = load(capitalizedType, entityName);
-                        if (entity) {
-                            return field ? getNestedValue(entity, field) || '' : JSON.stringify(entity);
-                        }
-                    }
-                }
-                return getNestedValue(this.data, resolved) || '';
-            }
-            
-            // Handle direct entity references (character.Name.field, Location.Name.field, etc.)
-            const parts = fieldPath.split('.');
-            if (parts.length >= 2) {
-                // Initialize schema registry if needed
-                if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-                
-                const possibleType = parts[0];
-                const capitalizedType = possibleType.charAt(0).toUpperCase() + possibleType.slice(1).toLowerCase();
-                
-                // Check if this is a valid entity type in the schema registry
-                if (schemaRegistry[capitalizedType]) {
-                    const entityName = parts[1];
-                    const field = parts.slice(2).join('.');
-                    const entity = load(capitalizedType, entityName);
-                    if (entity) {
-                        return field ? getNestedValue(entity, field) || '' : JSON.stringify(entity);
-                    }
-                }
-            }
-            
-            // Simple field reference
-            const value = getNestedValue(this.data, fieldPath);
-            
-            // Debug logging removed
-            
-            if (value === undefined || value === null) {
-                if (debug && (fieldPath.includes('gender') || fieldPath.includes('level'))) {
-                    console.log(`  Returning empty (undefined/null)`);
-                }
-                return '';
-            }
-            
-            if (typeof value === 'object') {
-                // Don't output raw objects unless it's intentional
-                if (debug && (fieldPath.includes('gender') || fieldPath.includes('level'))) {
-                    console.log(`  Returning empty (object)`);
-                }
-                return '';
-            }
-            
-            const result = String(value);
-            // Debug logging removed
-            return result;
-        }
-    }
-    
-    // ==========================
-    // Universal Entity Saving
-    // ==========================
-    
-    function saveEntityCard(entity, objectType) {
-        // Normalize object type
-        objectType = resolveObjectAlias(objectType || entity._type);
-        
-        // Get schema for prefixes
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[objectType];
-        if (!schema || !schema.prefixes || schema.prefixes.length === 0) {
-            if (debug) console.log(`${MODULE_NAME}: No schema found for ${objectType}`);
-            return false;
-        }
-        
-        // Check if this entity type is data-only (no display cards)
-        if (schema.dataOnly) {
-            // This entity type doesn't use display cards
-            if (debug) console.log(`${MODULE_NAME}: ${objectType} is data-only, no display card needed`);
-            return true; // Successfully "saved" (no display card needed)
-        }
-        
-        // Determine card title - check for existing card first
-        let title = null;
-        let prefix = null;
-        
-        // Check all possible prefixes for an existing card
-        for (const checkPrefix of schema.prefixes) {
-            const checkTitle = `[${checkPrefix}] ${entity.name}`;
-            if (Utilities.storyCard.get(checkTitle)) {
-                prefix = checkPrefix;
-                title = checkTitle;
-                break;
-            }
-        }
-        
-        // If no existing card, we should NOT create one automatically for PLAYER prefix
-        // PLAYER cards are only created manually by users
-        if (!title) {
-            // Use the first non-PLAYER prefix, or just the first prefix if that's all we have
-            prefix = schema.prefixes.find(p => p !== 'PLAYER') || schema.prefixes[0];
-            title = `[${prefix}] ${entity.name}`;
-        }
-        
-        // Set subtype based on the prefix we're using
-        if (prefix === 'PLAYER') {
-            entity._subtype = 'Player';
-        } else if (prefix !== schema.prefixes[0]) {
-            // If using a non-default prefix, store it as subtype
-            entity._subtype = prefix.charAt(0).toUpperCase() + prefix.slice(1).toLowerCase();
-        }
-        
-        
-        // Load FORMAT card - try prefix-specific first, then fall back to type
-        let formatCard = Utilities.storyCard.get(`[SANE_FORMAT] ${prefix}`);
-        if (!formatCard) {
-            // Try object type as fallback
-            formatCard = Utilities.storyCard.get(`[SANE_FORMAT] ${objectType}`);
-            if (!formatCard) {
-                // No FORMAT card - cannot save display card
-                if (debug) console.log(`${MODULE_NAME}: No FORMAT card for ${prefix} or ${objectType} - cannot save display card`);
-                return false;
-            }
-        }
-        
-        // Parse FORMAT card
-        const formatConfig = parseFormatCard(formatCard);
-        
-        // Always rebuild - no surgical updates in new system
-        const existingCard = Utilities.storyCard.get(title);
-        
-        // Start with entity data
-        const mergedData = { ...entity };
-        
-        // Ensure name is set
-        mergedData.name = entity.name;
-        
-        // Apply format hints to data fields before computing
-        if (formatConfig.formats && Object.keys(formatConfig.formats).length > 0) {
-            if (debug) {
-                console.log(`${MODULE_NAME}: Applying ${Object.keys(formatConfig.formats).length} format hints`);
-                console.log(`${MODULE_NAME}: Format config entries:`, Object.entries(formatConfig.formats));
-                console.log(`${MODULE_NAME}: MergedData keys:`, Object.keys(mergedData));
-            }
-            for (const [fieldPath, formatType] of Object.entries(formatConfig.formats)) {
-                const value = getNestedField(mergedData, fieldPath);
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Looking for field '${fieldPath}', found:`, value !== undefined ? 'YES' : 'NO');
-                    if (value !== undefined) {
-                        console.log(`${MODULE_NAME}: Field value:`, JSON.stringify(value));
-                    }
-                }
-                if (value !== undefined) {
-                    const formatted = formatFieldValue(value, formatType);
-                    setNestedField(mergedData, fieldPath + '_formatted', formatted);
-                    if (debug) {
-                        const preview = typeof formatted === 'string' ? formatted.substring(0, 50) : JSON.stringify(formatted);
-                        console.log(`${MODULE_NAME}: Formatted ${fieldPath} as ${formatType}: ${preview}...`);
-                    }
-                } else {
-                    if (debug) console.log(`${MODULE_NAME}: Field '${fieldPath}' not found in entity data`);
-                }
-            }
-        }
-        
-        // Compute fields from ENTRY before building display
-        if (formatConfig.computed && Object.keys(formatConfig.computed).length > 0) {
-            for (const [fieldName, templateExpr] of Object.entries(formatConfig.computed)) {
-                // Evaluate the template expression with current data
-                const parser = new TemplateParser(mergedData);
-                const computedValue = parser.parse(templateExpr);
-                // Add computed field to data
-                mergedData[fieldName] = computedValue;
-            }
-        }
-        
-        
-        // Build new display card from template
-        const newCardContent = buildDisplayCard(mergedData, formatConfig.template, title);
-        
-        // Build structured data for DESCRIPTION field
-        const structuredData = buildEntityData(mergedData);
-        
-        // Generate keys for character cards
-        let keys = null;
-        if (objectType === 'Character') {
-            // Format: " name,(name, trigger_name,(trigger_name" for characters
-            // Space before names WITHOUT parenthesis, no space before names WITH parenthesis
-            const name = entity.name || '';
-            const triggerName = entity.info?.trigger_name || '';
-            if (triggerName && triggerName.toLowerCase() !== name.toLowerCase()) {
-                keys = ` ${name.toLowerCase()},(${name.toLowerCase()}, ${triggerName.toLowerCase()},(${triggerName.toLowerCase()}`;
-            } else {
-                keys = ` ${name.toLowerCase()},(${name.toLowerCase()}`;
-            }
-        } else if (objectType === 'Location') {
-            // Format: "Snake_Case, Normal Case" for locations
-            const snakeCased = entity.name.replace(/\s+/g, '_');
-            const normalCased = entity.name.replace(/_/g, ' ');
-            keys = `${snakeCased}, ${normalCased}`;
-        }
-        
-        // Save or update the card
-        if (existingCard) {
-            // Preserve existing description content outside data markers
-            let updatedDescription = existingCard.description || '';
-            
-            // Check if there's existing data section to replace
-            if (updatedDescription.includes('<== REAL DATA ==>')) {
-                // Replace just the data section
-                updatedDescription = updatedDescription.replace(
-                    /<== REAL DATA ==>([\s\S]*?)<== END DATA ==>/,
-                    structuredData
-                );
-            } else {
-                // No data section yet - append it
-                if (updatedDescription && !updatedDescription.endsWith('\n')) {
-                    updatedDescription += '\n';
-                }
-                updatedDescription += structuredData;
-            }
-            
-            const updateData = { 
-                entry: newCardContent.trim(),
-                description: updatedDescription
-            };
-            if (keys) updateData.keys = keys;
-            
-            Utilities.storyCard.update(title, updateData);
-        } else {
-            const cardData = {
-                title: title,
-                type: 'data',
-                entry: newCardContent.trim(),
-                description: structuredData
-            };
-            if (keys) cardData.keys = keys;
-            
-            Utilities.storyCard.add(cardData);
-        }
-        
-        // Update the entity card map
-        if (!entityCardMap) entityCardMap = {};
-        if (!entityCardMap[objectType]) entityCardMap[objectType] = {};
-        entityCardMap[objectType][entity.name.toLowerCase()] = title;
-        
-        if (debug) console.log(`${MODULE_NAME}: Saved ${objectType} display card for ${entity.name}`);
-        return true;
-    }
-    
-    // ==========================
-    // Inventory Management
-    // ==========================
-    
-    function normalizeInventory(inventory) {
-        // Convert old format to new format if needed
-        // Old: { "sword": 1, "potion": 3 }
-        // New: { "sword": { "quantity": 1 }, "potion": { "quantity": 3 } }
-        
-        if (!inventory || typeof inventory !== 'object') return {};
-        
-        const normalized = {};
-        for (const [item, value] of Object.entries(inventory)) {
-            if (typeof value === 'number') {
-                // Old format - convert to new
-                normalized[item] = { quantity: value };
-            } else if (typeof value === 'object' && value !== null) {
-                // Already new format
-                normalized[item] = value;
-            }
-        }
-        return normalized;
-    }
-    
-    function getItemQuantity(inventory, itemName) {
-        if (!inventory || !inventory[itemName]) return 0;
-        const item = inventory[itemName];
-        return typeof item === 'number' ? item : (item.quantity || 0);
-    }
-    
-    function setItemQuantity(inventory, itemName, quantity) {
-        if (!inventory) inventory = {};
-        
-        if (quantity <= 0) {
-            delete inventory[itemName];
-        } else {
-            // Preserve other properties if they exist
-            if (typeof inventory[itemName] === 'object') {
-                inventory[itemName].quantity = quantity;
-            } else {
-                inventory[itemName] = { quantity: quantity };
-            }
-        }
-        return inventory;
-    }
-    
-    // ==========================
-    // Character Field Accessors
-    // ==========================
-    
-    // Simple wrappers for component-based field access
-    function getCharacterField(character, fieldPath) {
-        if (!character || !fieldPath) return null;
-        return getNestedField(character, fieldPath);
-    }
-    
-    function setCharacterField(character, fieldPath, value) {
-        if (!character || !fieldPath) return false;
-        setNestedField(character, fieldPath, value);
-        return true;
-    }
-    
-    
-    // ==========================
-    // Faction Helper Functions
-    // ==========================
-    function getFactionMembers(factionName) {
-        const faction = load('Faction', factionName);
-        return faction?.members || [];
-    }
-    
-    function getCharacterFaction(characterName) {
-        // Search all factions for this character
-        const factions = loadAll('Faction');
-        for (const [name, faction] of Object.entries(factions || {})) {
-            if (faction.members && faction.members.includes(characterName)) {
-                return name;
-            }
-        }
-        return null;
-    }
-    
-    function getFactionRelations(factionName) {
-        const faction = load('Faction', factionName);
-        if (!faction) return { allies: [], enemies: [] };
-        return {
-            allies: faction.allied_factions || faction.allies || [],
-            enemies: faction.enemy_factions || faction.enemies || []
-        };
-    }
+            // Detect if history was edited
+            detectEdit: function() {
+                const data = RewindSystem.getStorage();
+                const position = RewindSystem.findCurrentPosition();
 
-    
-    // ==========================
-    // Unified Entity Creation System
-    // ==========================
-    
-    // Initialize entity with default component values
-    function initializeEntityComponents(entityType, data = {}) {
-        // Initialize schema registry if needed
-        if (!schemaRegistry) {
-            initializeSchemaRegistry();
-        }
-        
-        const schema = schemaRegistry[entityType];
-        if (!schema) return null;
-        
-        const entity = {
-            name: data.name || 'Unknown',
-            type: entityType
-        };
-        
-        // Initialize each component
-        if (schema.components && schemaRegistry._components) {
-            for (const compName of schema.components) {
-                const compSchema = schemaRegistry._components[compName];
-                if (!compSchema) continue;
-                
-                // Initialize component with defaults
-                entity[compName] = {};
-                
-                // Apply defaults from component schema
-                if (compSchema.defaults) {
-                    entity[compName] = JSON.parse(JSON.stringify(compSchema.defaults));
+                if (!position.matched) {
+                    // Can't determine position - possible major edit
+                    return { edited: true, position: 0, confidence: 'low' };
                 }
-                
-                // Apply data for this component if provided
-                if (data[compName]) {
-                    // Deep merge data into component
-                    entity[compName] = mergeDeep(entity[compName], data[compName]);
-                }
-            }
-        }
-        
-        // Don't apply root-level data that should be in components
-        // Only apply special fields like _triggerName
-        for (const [key, value] of Object.entries(data)) {
-            if (key.startsWith('_') && !entity[key]) {
-                entity[key] = value;
-            }
-        }
-        
-        return entity;
-    }
-    
-    // Deep merge helper
-    function mergeDeep(target, source) {
-        if (!source) return target;
-        if (!target) return source;
-        
-        // If target is not an object, just return source
-        if (typeof target !== 'object' || Array.isArray(target)) {
-            return source;
-        }
-        
-        // If source is not an object, just return it
-        if (typeof source !== 'object' || Array.isArray(source)) {
-            return source;
-        }
-        
-        const output = Object.assign({}, target);
-        
-        for (const key in source) {
-            if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
-                if (target[key] && typeof target[key] === 'object' && !Array.isArray(target[key])) {
-                    output[key] = mergeDeep(target[key], source[key]);
-                } else {
-                    output[key] = source[key];
-                }
-            } else {
-                output[key] = source[key];
-            }
-        }
-        
-        return output;
-    }
-    
-    /**
-     * Create any entity type with initial data
-     * @param {string} entityType - Type of entity (Character, Location, Item, Faction, etc.)
-     * @param {object} data - Initial data for the entity (can use flat, component, or dot notation)
-     * @returns {object|null} The created entity or null if failed
-     */
-    function create(entityType, data = {}) {
-        // Normalize entity type
-        entityType = String(entityType).charAt(0).toUpperCase() + String(entityType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Initialize entity with components
-        const entity = initializeEntityComponents(singularType, data);
-        if (!entity) {
-            if (debug) console.log(`${MODULE_NAME}: Failed to initialize entity of type ${singularType}`);
-            return null;
-        }
-        
-        // Apply entity-specific initialization
-        switch (singularType) {
-            case 'Character':
-                // Ensure info component exists
-                if (!entity.info) entity.info = {};
-                
-                // Set isPlayer flag if provided
-                const isPlayer = data.isPlayer || data['info.isPlayer'] || false;
-                entity.info.isPlayer = isPlayer;
-                
-                // Merge info component fields for backward compatibility
-                const infoFields = ['full_name', 'gender', 'race', 'class', 'appearance', 'personality', 'background', 'goals'];
-                for (const field of infoFields) {
-                    // Check both root level (backward compat) and info.field
-                    if (data[field] !== undefined) {
-                        entity.info[field] = data[field];
-                    } else if (data[`info.${field}`] !== undefined) {
-                        entity.info[field] = data[`info.${field}`];
-                    }
-                }
-                break;
-                
-            case 'Location':
-                // Location-specific initialization
-                if (!entity.info) entity.info = {};
-                
-                // Handle location type
-                if (data.type !== undefined) {
-                    entity.info.type = data.type;
-                } else if (data['info.type'] !== undefined) {
-                    entity.info.type = data['info.type'];
-                }
-                break;
-                
-            case 'Item':
-                // Item-specific initialization
-                if (!entity.info) entity.info = {};
-                
-                // Handle item type and properties
-                const itemFields = ['type', 'rarity', 'damage', 'defense', 'value'];
-                for (const field of itemFields) {
-                    if (data[field] !== undefined) {
-                        entity.info[field] = data[field];
-                    } else if (data[`info.${field}`] !== undefined) {
-                        entity.info[field] = data[`info.${field}`];
-                    }
-                }
-                break;
-                
-            case 'Faction':
-                // Faction-specific initialization
-                if (!entity.info) entity.info = {};
-                
-                // Handle faction properties
-                const factionFields = ['leader', 'type', 'alignment', 'headquarters'];
-                for (const field of factionFields) {
-                    if (data[field] !== undefined) {
-                        entity.info[field] = data[field];
-                    } else if (data[`info.${field}`] !== undefined) {
-                        entity.info[field] = data[`info.${field}`];
-                    }
-                }
-                break;
-        }
-        
-        // Save the entity using universal system
-        if (save(singularType, entity)) {
-            // Clear cached version of this entity
-            delete entityCache[`${singularType}.${entity.name}`];
-            
-            if (debug) console.log(`${MODULE_NAME}: Created ${singularType} '${entity.name}' with components`);
-            return entity;
-        }
-        
-        if (debug) console.log(`${MODULE_NAME}: Failed to save ${singularType} '${entity.name}'`);
-        return null;
-    }
-    
-    function createCharacter(characterData) {
-        // Redirect to unified create function
-        return create('Character', characterData);
-    }
-    
-    // ==========================
-    // Player Command Processing
-    // ==========================
-    function processPlayerCommand(text) {
-        const command = text.toLowerCase().trim();
-        
-        // Handle /GW abort command
-        if (command === '/gw abort' || command === '/gw cancel') {
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
-                GenerationWizard.cancelGeneration();
-                if (debug) console.log(`${MODULE_NAME}: Generation aborted by player`);
-                // Show message to player but hide from LLM
-                return {
-                    handled: true,
-                    output: '\n<<<Generation cancelled>>>\n'
-                };
-            }
-            // If no generation active, show message to player
-            return {
-                handled: true,
-                output: '\n<<<No generation in progress>>>\n'
-            };
-        }
-        
-        // Add other player commands here in the future
-        
-        return { handled: false };
-    }
-    
-    // ==========================
-    // Parse Function Parameters
-    // ==========================
-    function parseParameters(paramString) {
-        if (!paramString || !paramString.trim()) return [];
-        
-        const params = [];
-        let current = '';
-        let inQuotes = false;
-        let quoteChar = null;
-        let depth = 0;
-        
-        for (let i = 0; i < paramString.length; i++) {
-            const char = paramString[i];
-            const nextChar = paramString[i + 1];
-            
-            // Handle quotes
-            if ((char === '"' || char === "'") && !inQuotes) {
-                inQuotes = true;
-                quoteChar = char;
-                // Don't include the quote in the parameter
-            } else if (char === quoteChar && inQuotes) {
-                inQuotes = false;
-                quoteChar = null;
-                // Don't include the quote in the parameter
-            }
-            // Handle nested parentheses (for complex expressions)
-            else if (char === '(' && !inQuotes) {
-                depth++;
-                current += char;
-            } else if (char === ')' && !inQuotes) {
-                depth--;
-                current += char;
-            }
-            // Handle parameter separation
-            else if (char === ',' && !inQuotes && depth === 0) {
-                params.push(current.trim());
-                current = '';
-            } else {
-                current += char;
-            }
-        }
-        
-        // Add the last parameter
-        if (current.trim()) {
-            params.push(current.trim());
-        }
-        
-        // Process parameters to handle types
-        return params.map(param => {
-            // Remove outer quotes if present
-            if ((param.startsWith('"') && param.endsWith('"')) ||
-                (param.startsWith("'") && param.endsWith("'"))) {
-                return param.slice(1, -1);
-            }
-            
-            // Check for numbers
-            if (/^-?\d+$/.test(param)) {
-                return parseInt(param);
-            }
-            if (/^-?\d*\.\d+$/.test(param)) {
-                return parseFloat(param);
-            }
-            
-            // Check for booleans
-            if (param === 'true') return true;
-            if (param === 'false') return false;
-            
-            // Check for fractions (e.g., "3/10")
-            if (/^\d+\/\d+$/.test(param)) {
-                return param; // Keep as string for special parsing
-            }
-            
-            return param;
-        });
-    }
-    
-    // ==========================
-    // Getter System - Process Dynamic Placeholders
-    // ==========================
-    // Helper function to navigate nested object paths
-    function navigatePath(obj, path) {
-        if (!obj || !path) return obj;
-        
-        const parts = path.split('.');
-        let current = obj;
-        
-        for (const part of parts) {
-            // Handle array notation [0]
-            const arrayMatch = part.match(/^(\w+)\[(\d+)\]$/);
-            if (arrayMatch) {
-                const field = arrayMatch[1];
-                const index = parseInt(arrayMatch[2]);
-                current = current?.[field]?.[index];
-            } else {
-                current = current?.[part];
-            }
-            
-            if (current === undefined || current === null) {
-                return null;
-            }
-        }
-        
-        return current;
-    }
-    
-    // Helper to find first [PLAYER] card
-    function loadFirstPlayer() {
-        const playerCard = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[PLAYER]')
-        );
-        
-        if (!playerCard) return null;
-        
-        const nameMatch = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-        if (!nameMatch) return null;
-        
-        return loadCharacter(nameMatch[1]);
-    }
-    
-    // New flexible getter system with $() syntax
-    function processFlexibleGetters(text) {
-        if (!text) return text;
-        
-        let recursionDepth = 0;
-        const MAX_RECURSION = 10;
-        
-        function resolveGetters(str) {
-            if (recursionDepth++ > MAX_RECURSION) {
-                console.log(`${MODULE_NAME}: Max recursion depth reached in getter resolution`);
-                return str;
-            }
-            
-            // First, resolve any $() expressions
-            str = str.replace(/\$\(([^)]+)\)/g, (match, expr) => {
-                // Resolve the inner expression as a getter
-                const resolved = resolveGetters(`get[${expr}]`);
-                // Extract just the value (remove get[] wrapper if present)
-                return resolved.replace(/^get\[|\]$/g, '');
-            });
-            
-            // Pattern: get[type.key] or get[key] followed by optional .path.to.field
-            const FLEX_GETTER = /get\[([^\]]+)\](?:\.([\w\d_.\[\]]+))?/g;
-            
-            return str.replace(FLEX_GETTER, (match, selector, pathAfterBracket) => {
-                // Parse selector (e.g., "character.Bob.level" or "character.Bob")
-                const parts = selector.split('.');
-                let entity = null;
-                let fieldPath = null;
-                
-                // Determine the type and entity name
-                if (parts[0] === 'character' || parts[0] === 'char') {
-                    // For character.NAME.FIELD or character.NAME
-                    // Try loading with just the name first
-                    entity = loadCharacter(parts[1]);
-                    // If there are more parts, they're the field path
-                    if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
-                    }
-                } else if (parts[0] === 'location' || parts[0] === 'loc') {
-                    // For location.NAME.FIELD or location.NAME
-                    // Use universal load function instead of quick cache
-                    entity = load('Location', parts[1]);
-                    if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
-                    }
-                } else if (parts[0] === 'faction') {
-                    // For faction.NAME.FIELD or faction.NAME
-                    // Use universal load function instead of quick cache
-                    entity = load('Faction', parts[1]);
-                    if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
-                    }
-                } else if (parts[0] === 'player') {
-                    // Special case: player.FIELD or just player
-                    entity = loadFirstPlayer();
-                    if (parts.length > 1) {
-                        fieldPath = parts.slice(1).join('.');
-                    }
-                } else if (parts[0] === 'global' || parts[0] === 'var') {
-                    // Access global variables: runtime.VAR_NAME or runtime.VAR_NAME.FIELD
-                    const varName = parts[1];
-                    entity = getGlobalValue(varName);
-                    if (parts.length > 2) {
-                        fieldPath = parts.slice(2).join('.');
-                    }
-                } else {
-                    // Auto-detect type by trying each loader
-                    const name = parts[0];
-                    entity = loadCharacter(name);
-                    
-                    if (!entity) {
-                        // Try loading as location
-                        entity = load('Location', name);
-                    }
-                    
-                    if (!entity) {
-                        // Try loading as faction
-                        entity = load('Faction', name);
-                    }
-                    
-                    // If there are more parts, they're the field path
-                    if (parts.length > 1) {
-                        fieldPath = parts.slice(1).join('.');
-                    }
-                }
-                
-                // Combine internal field path with any path after the bracket
-                if (pathAfterBracket) {
-                    fieldPath = fieldPath ? `${fieldPath}.${pathAfterBracket}` : pathAfterBracket;
-                }
-                
-                // Navigate to the field if specified
-                if (fieldPath && entity) {
-                    const value = navigatePath(entity, fieldPath);
-                    // Convert objects/arrays to JSON, primitives to string
-                    if (value !== null && typeof value === 'object') {
-                        return JSON.stringify(value);
-                    }
-                    return value !== null && value !== undefined ? String(value) : '???';
-                }
-                
-                // Return the entity or ??? if not found
-                if (entity !== null && entity !== undefined) {
-                    if (typeof entity === 'object') {
-                        return JSON.stringify(entity);
-                    }
-                    return String(entity);
-                }
-                
-                return '???';
-            });
-        }
-        
-        return resolveGetters(text);
-    }
-    
-    function processGetters(text) {
-        if (!text) return text;
-        
-        // First try the new flexible getter system
-        text = processFlexibleGetters(text);
-        
-        // Then handle legacy function-style getters for Calendar API only
-        return text.replace(FUNCTION_GETTER_PATTERN, function(match) {
-            // Parse the function getter: get_something(parameters)
-            const innerMatch = match.match(/get_([a-z_]+)\s*\(([^)]*)\)/i);
-            if (!innerMatch) return match;
-            
-            const getterType = innerMatch[1];
-            const paramString = innerMatch[2];
-            const params = parseParameters(paramString);
-            
-            // Process different getter types
-            switch(getterType) {
-                // Character getters - redirect to flexible getter system
-                case 'location':
-                case 'hp':
-                case 'level':
-                case 'xp':
-                case 'name':
-                case 'attribute':
-                case 'skill':
-                case 'inventory':
-                case 'stat':
-                    // These should use get[character.NAME.field] syntax instead
-                    // But keep for backward compatibility
-                    let charName = params[0];
-                    if (!charName) return match;
-                    
-                    // Special case: resolve "player" to actual player name
-                    if (charName.toLowerCase() === 'player') {
-                        // Find the first [PLAYER] card
-                        const playerCard = Utilities.storyCard.find(card => {
-                            return card.title && card.title.startsWith('[PLAYER]');
-                        }, false);
-                        
-                        if (playerCard) {
-                            const titleMatch = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-                            if (titleMatch) {
-                                charName = titleMatch[1].trim();
-                            }
-                        }
-                    }
-                    
-                    // Convert to new syntax and process
-                    let newGetter;
-                    if (getterType === 'attribute' || getterType === 'skill') {
-                        newGetter = `get[character.${charName}.${getterType}s.${params[1]}]`;
-                    } else if (getterType === 'stat') {
-                        newGetter = `get[character.${charName}.stats.${params[1]}]`;
-                    } else {
-                        // Map to component paths
-                        const fieldMap = {
-                            'location': 'info.location',
-                            'hp': 'stats.hp',
-                            'level': 'stats.level', 
-                            'xp': 'stats.xp',
-                            'name': 'name',
-                            'inventory': 'inventory'
-                        };
-                        newGetter = `get[character.${charName}.${fieldMap[getterType]}]`;
-                    }
-                    return processFlexibleGetters(newGetter);
-                    
-                // Time getters (Calendar API) - keep these as they interface with Calendar module
-                case 'time':
-                case 'currenttime':
-                    return getCurrentTime() || '00:00';
-                    
-                case 'formattedtime':
-                    return getFormattedTime() || '12:00 AM';
-                    
-                case 'timeofday':
-                    return getTimeOfDay() || 'Unknown';
-                    
-                case 'date':
-                case 'currentdate':
-                    return getCurrentDate() || 'Unknown Date';
-                    
-                case 'formatteddate':
-                    return getFormattedDate() || 'Unknown';
-                    
-                case 'daynumber':
-                    return getDayNumber() || '0';
-                    
-                case 'season':
-                    return getSeason() || 'Unknown';
-                    
-                default:
-                    // For any unknown getter, try to resolve it as a runtime variable
-                    // This allows custom getters defined in [SANE_RUNTIME] Variables
-                    const value = getGlobalValue(getterType);
-                    if (value !== null) {
-                        return typeof value === 'object' ? JSON.stringify(value) : String(value);
-                    }
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Unknown getter type: ${getterType}`);
-                    return match;
-            }
-        });
-    }
-    
-    // Character getter functions
-    // Helper function to get a character from cache efficiently
-    function getCharacterLocation(name) {
-        const character = load('Character', name);
-        return character?.info?.location || null;
-    }
-    
-    function getCharacterHP(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        const hp = character.stats?.hp;
-        return hp ? `${hp.current}/${hp.max}` : null;
-    }
-    
-    function getCharacterLevel(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        const level = character.stats?.level?.value;
-        return level ? level.toString() : null;
-    }
-    
-    function getCharacterXP(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        const xp = character.stats?.level?.xp;
-        return xp ? `${xp.current}/${xp.max}` : null;
-    }
-    
-    function getCharacterName(name) {
-        const character = load('Character', name);
-        return character ? character.name : null;
-    }
-    
-    function getCharacterAttribute(characterName, attrName) {
-        if (!attrName) return null;
-        
-        const character = load('Character', characterName);
-        if (!character) return null;
-        
-        const attrKey = String(attrName).toLowerCase();
-        const attributes = character.attributes || {};
-        const value = attributes[attrKey];
-        if (typeof value === 'object' && value.value !== undefined) {
-            return value.value.toString();
-        }
-        return value ? value.toString() : null;
-    }
-    
-    function getCharacterSkill(characterName, skillName) {
-        if (!skillName) return null;
-        
-        const character = load('Character', characterName);
-        if (!character) return null;
-        
-        const skillKey = String(skillName).toLowerCase();
-        const skills = character.skills || {};
-        const skill = skills[skillKey];
-        if (!skill) return null;
-        if (typeof skill === 'object' && skill.level !== undefined) {
-            return skill.xp ? `Level ${skill.level} (${skill.xp.current}/${skill.xp.max} XP)` : `Level ${skill.level}`;
-        }
-        return skill.toString();
-    }
-    
-    function getCharacterInventory(name) {
-        const character = load('Character', name);
-        if (!character) return null;
-        
-        const items = Object.entries(character.inventory || {})
-            .filter(([item, qty]) => qty !== 0)
-            .map(([item, qty]) => `${item}:${qty}`);
-        
-        return items.length > 0 ? `{${items.join(', ')}}` : '{}';
-    }
-    
-    function getCharacterStat(characterName, statName) {
-        if (!statName) return null;
-        
-        const character = load('Character', characterName);
-        if (!character) return null;
-        
-        const statKey = String(statName).toLowerCase();
-        
-        // Check if it's HP (special case)
-        if (statKey === 'hp') {
-            const hp = character.stats?.hp;
-            return hp ? `${hp.current}/${hp.max}` : null;
-        }
-        
-        // Check other core stats
-        const stat = character.coreStats[statKey];
-        return stat ? `${stat.current}/${stat.max}` : null;
-    }
-    
-    // Time getter functions (Calendar API)
-    function getCurrentTime() {
-        if (typeof Calendar === 'undefined' || !Calendar.getCurrentTime) return null;
-        return Calendar.getCurrentTime();
-    }
-    
-    function getFormattedTime() {
-        if (typeof Calendar === 'undefined' || !Calendar.getFormattedTime) return null;
-        return Calendar.getFormattedTime();
-    }
-    
-    function getTimeOfDay() {
-        if (typeof Calendar === 'undefined' || !Calendar.getTimeOfDay) return null;
-        return Calendar.getTimeOfDay();
-    }
-    
-    function getCurrentDate() {
-        if (typeof Calendar === 'undefined' || !Calendar.getCurrentDate) return null;
-        return Calendar.getCurrentDate();
-    }
-    
-    function getFormattedDate() {
-        if (typeof Calendar === 'undefined' || !Calendar.getDayNumber) return null;
-        
-        const dayNumber = Calendar.getDayNumber();
-        const startDate = new Date(2022, 10, 6); // Nov 6, 2022
-        const currentDateObj = new Date(startDate);
-        currentDateObj.setDate(startDate.getDate() + dayNumber);
-        
-        const year = currentDateObj.getFullYear();
-        const month = String(currentDateObj.getMonth() + 1).padStart(2, '0');
-        const day = String(currentDateObj.getDate()).padStart(2, '0');
-        
-        return `${year}-${month}-${day}`;
-    }
-    
-    function getDayNumber() {
-        if (typeof Calendar === 'undefined' || !Calendar.getDayNumber) return null;
-        return Calendar.getDayNumber().toString();
-    }
-    
-    function getSeason() {
-        if (typeof Calendar === 'undefined' || !Calendar.getCurrentSeason) return null;
-        return Calendar.getCurrentSeason();
-    }
-    
-    // ==========================
-    // Scene Injection into Context
-    // ==========================
-    function createDefaultCurrentScene() {
-        // Find the first [PLAYER] card to use as default
-        const playerCard = Utilities.storyCard.find(
-            card => card.title && card.title.startsWith('[PLAYER]'),
-            false // Just get the first one
-        );
-        
-        // Extract player name from card title or default to 'player'
-        let playerName = 'player';
-        if (playerCard) {
-            const titleMatch = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-            if (titleMatch) {
-                playerName = titleMatch[1].trim().toLowerCase();
-            }
-        }
-        
-        const defaultText = (
-            `[**Current Scene** Location: get_location(${playerName}) | get_formattedtime() (get_timeofday())\n` +
-            `**Available Tools:**\n` +
-            `• Location: update_location(name, place) discover_location(character, place, direction) connect_locations(placeA, placeB, direction)\n` +
-            `  - Directions: north, south, east, west, inside (enter), outside (exit)\n` +
-            `• Time: advance_time(hours, minutes)\n` +
-            `• Inventory: add_item(name, item, qty) remove_item(name, item, qty) transfer_item(giver, receiver, item, qty)\n` +
-            `• Relations: update_relationship(name1, name2, points)\n` +
-            `• Quests: offer_quest(npc, quest, type) update_quest(player, quest, stage) complete_quest(player, quest)\n` +
-            `• Progression: add_levelxp(name, amount) add_skillxp(name, skill, amount) unlock_newskill(name, skill)\n` +
-            `• Stats: update_attribute(name, attribute, value) update_hp(name, current, max)\n` +
-            `• Combat: deal_damage(source, target, amount)]`
-        );
-        
-        Utilities.storyCard.add({
-            title: '[CURRENT SCENE]',
-            type: 'data',
-            entry: defaultText,
-            description: 'Edit this card to customize what appears in the scene block. Use get_*(params) for dynamic values.',
-            keys: '.,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"'
-        });
-        
-        if (debug) console.log(`${MODULE_NAME}: Created default Current Scene template with player: ${playerName}`);
-        return defaultText;
-    }
-    
-    function moveCurrentSceneCard(contextText) {
-        // Get or create the Current Scene card
-        let sceneCard = Utilities.storyCard.get('[CURRENT SCENE]');
-        if (!sceneCard) {
-            // Create the default scene card
-            createDefaultCurrentScene();
-            sceneCard = Utilities.storyCard.get('[CURRENT SCENE]');
-        }
-        
-        // Get the scene content
-        const sceneContent = sceneCard.entry;
-        if (!sceneContent) {
-            return contextText;
-        }
-        
-        // Find where the scene starts in context (look for the pattern)
-        const sceneStartPattern = /\[\*\*Current Scene\*\*/;
-        const startMatch = contextText.match(sceneStartPattern);
-        
-        if (!startMatch) {
-            // Scene not found in context
-            return contextText;
-        }
-        
-        const startIdx = startMatch.index;
-        
-        // Find the end by looking for the closing bracket and newlines
-        // The scene ends with ")] followed by newlines
-        let endIdx = contextText.indexOf(')]', startIdx);
-        if (endIdx === -1) {
-            // Fallback: just remove from start to next double newline
-            endIdx = contextText.indexOf('\n\n', startIdx);
-            if (endIdx === -1) {
-                endIdx = contextText.length;
-            }
-        } else {
-            endIdx += 2; // Include the )]
-            // Skip any trailing whitespace/newlines
-            while (endIdx < contextText.length && /\s/.test(contextText[endIdx])) {
-                endIdx++;
-            }
-        }
-        
-        // Remove the scene from context
-        let modifiedContext = contextText.substring(0, startIdx) + contextText.substring(endIdx);
-        
-        // Clean up any resulting double/triple newlines
-        modifiedContext = modifiedContext.replace(/\n\n\n+/g, '\n\n');
-        
-        // If no history or very early in adventure, just return without the scene
-        if (!history || history.length < 3) {
-            return modifiedContext;
-        }
-        
-        // Now find where to reinsert it (after first sentence of entry at -3)
-        const targetIndex = history.length - 3;
-        const historyEntry = history[targetIndex];
-        
-        if (!historyEntry || !historyEntry.text) {
-            // If we can't find the target, put it back at the start
-            return sceneContent + '\n\n' + modifiedContext;
-        }
-        
-        const lastEntry = historyEntry.text;
-        
-        // Find where this history entry appears in the modified context
-        const entryIndex = modifiedContext.indexOf(lastEntry);
-        if (entryIndex === -1) {
-            // If we can't find the entry, put scene at the start
-            return sceneContent + '\n\n' + modifiedContext;
-        }
-        
-        // Find end of first sentence within that entry
-        const firstSentenceMatch = lastEntry.match(/^[^.!?]+[.!?]/);
-        if (!firstSentenceMatch) {
-            // No sentence found, put scene at start
-            return sceneContent + '\n\n' + modifiedContext;
-        }
-        
-        const firstSentence = firstSentenceMatch[0];
-        const insertPosition = entryIndex + firstSentence.length;
-        
-        // Build the new context with scene at new position
-        const beforeInsert = modifiedContext.substring(0, insertPosition);
-        const afterInsert = modifiedContext.substring(insertPosition);
-        
-        // Ensure proper spacing (entries should be separated by double \n)
-        let separator = '\n\n';
-        if (afterInsert.startsWith('\n')) {
-            // Already has at least one newline
-            separator = afterInsert.startsWith('\n\n') ? '' : '\n';
-        }
-        
-        return beforeInsert + separator + sceneContent + '\n\n' + afterInsert.trimStart();
-    }
-    
-    // ==========================
-    // Character Name Validation
-    // ==========================
-    const INVALID_CHARACTER_NAMES = [
-        // Generic references
-        'player', 'self', 'me', 'you', 'user', 'myself', 'yourself', 
-        'him', 'her', 'them', 'they', 'it', 'this', 'that',
-    ];
-    
-    function isValidCharacterName(name) {
-        if (!name || typeof name !== 'string') return false;
-        
-        // Convert to lowercase for checking
-        const normalized = name.toLowerCase().trim();
-        
-        // Check if empty or just whitespace
-        if (!normalized) return false;
-        
-        // Check against blacklist of generic terms (but allow compound names like "player_unknown")
-        if (INVALID_CHARACTER_NAMES.includes(normalized)) {
-            if (debug) console.log(`${MODULE_NAME}: Invalid character name detected: "${name}" (blacklisted)`);
-            return false;
-        }
-        
-        // Valid syntax - doesn't need to exist yet (allows hallucinated names)
-        return true;
-    }
-    
-    // ========================================
-    // Universal Data System
-    // ========================================
-    
-    // Entity card mapping - maps entity names AND aliases directly to card titles
-    // Both real names and aliases point to the same card title for single-lookup efficiency
-    let entityCardMap = null;
-    
-    function buildEntityCardMap() {
-        const map = {};
-        
-        // Initialize schema registry if needed
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        
-        // Build map for each entity type
-        for (const [entityType, schema] of Object.entries(schemaRegistry)) {
-            if (!schema.prefixes || schema.prefixes.length === 0) continue;
-            
-            map[entityType] = {};
-            
-            // Check ALL prefixes for this entity type
-            for (const prefix of schema.prefixes) {
-                const cards = Utilities.storyCard.find(
-                    c => c.title && c.title.startsWith(`[${prefix}] `),
-                    true // return all matches
-                );
-                
-                for (const card of cards) {
-                    // Parse DESCRIPTION to get actual entity ID
-                    if (card.description && card.description.includes('<== REAL DATA ==>')) {
-                        const data = parseEntityData(card.description);
-                        if (data.name) {
-                            // Map the entity ID to the card title
-                            const normalizedName = data.name.toLowerCase();
-                            map[entityType][normalizedName] = card.title;
-                            
-                            // Also map any aliases directly to the card title
-                            if (data.aliases) {
-                                const aliases = Array.isArray(data.aliases) ? data.aliases : 
-                                               typeof data.aliases === 'string' ? data.aliases.split(',').map(a => a.trim()) :
-                                               [];
-                                
-                                for (const alias of aliases) {
-                                    if (alias) {
-                                        const normalizedAlias = alias.toLowerCase();
-                                        // Map alias directly to card title (not to real name)
-                                        map[entityType][normalizedAlias] = card.title;
-                                        
-                                        if (debug) console.log(`${MODULE_NAME}: Mapped alias '${alias}' directly to card '${card.title}' for ${entityType}`);
-                                    }
-                                }
-                            }
-                        } else {
-                            console.log(`${MODULE_NAME}: WARNING - Card ${card.title} has no name in data, using fallback`);
-                            
-                            // Fallback: try to use title without prefix
-                            let fallbackId = card.title.replace(/^\[.*?\]\s*/, '').trim().toLowerCase();
-                            
-                            // If that ID is taken, generate random suffixes until unique
-                            let attempts = 0;
-                            while (map[entityType][fallbackId] && attempts < 100) {
-                                const randomSuffix = Math.random().toString(36).substring(2, 8);
-                                fallbackId = `${fallbackId}_${randomSuffix}`;
-                                attempts++;
-                            }
-                            
-                            if (attempts >= 100) {
-                                console.log(`${MODULE_NAME}: ERROR - Could not generate unique ID for ${card.title}`);
-                                continue;
-                            }
-                            
-                            map[entityType][fallbackId] = card.title;
-                            console.log(`${MODULE_NAME}: Mapped ${card.title} to fallback ID: ${fallbackId}`);
-                        }
-                    } else {
-                        // Card doesn't have structured data yet - skip it
-                        if (debug) console.log(`${MODULE_NAME}: Card ${card.title} has no structured data`);
-                    }
-                }
-            }
-        }
-        
-        entityCardMap = map;
-        return map;
-    }
-    
-    function getEntityCardTitle(entityType, entityId) {
-        // Build map if not exists
-        if (!entityCardMap) buildEntityCardMap();
-        
-        const normalizedId = entityId.toLowerCase();
-        const typeMap = entityCardMap[entityType];
-        if (!typeMap) return null;
-        
-        // Direct lookup - both real names and aliases are in the same map
-        return typeMap[normalizedId] || null;
-    }
-    
-    // Unified load function for ANY object type
-    function load(objectType, name) {
-        if (!objectType || !name) return null;
-        
-        // Normalize the entity type (Character, Location, etc.)
-        const entityType = String(objectType).charAt(0).toUpperCase() + String(objectType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Build cache key: "Character.Bob"
-        const cacheKey = `${singularType}.${name}`;
-        
-        // Check entity cache
-        if (entityCache[cacheKey]) {
-            return entityCache[cacheKey];
-        }
-        
-        // Check if this is a data-only entity type
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[singularType];
-        if (schema && schema.dataOnly) {
-            // Load from [SANE_DATA] card
-            const dataCard = Utilities.storyCard.get(`[SANE_DATA] ${singularType}`);
-            if (dataCard) {
-                try {
-                    const allData = JSON.parse(dataCard.description || '{}');
-                    const entity = allData[name];
-                    if (entity) {
-                        entityCache[cacheKey] = entity;
-                        return entity;
-                    }
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Failed to parse data-only entity ${singularType}.${name}`);
-                }
-            }
-            return null;
-        }
-        
-        // Get card title from mapping for display entities
-        const cardTitle = getEntityCardTitle(singularType, name);
-        if (!cardTitle) {
-            // Entity not found in mapping
-            return null;
-        }
-        
-        // Load the specific card
-        const displayCard = Utilities.storyCard.get(cardTitle);
-        if (!displayCard) {
-            // Card disappeared? Rebuild map
-            entityCardMap = null;
-            return null;
-        }
-        
-        // Parse structured data from DESCRIPTION field
-        let entity = null;
-        
-        if (displayCard.description && displayCard.description.includes('<== REAL DATA ==>')) {
-            entity = parseEntityData(displayCard.description);
-        } else {
-            // No structured data - this shouldn't happen in new system
-            if (debug) console.log(`${MODULE_NAME}: Card missing structured data for ${name}`);
-            return null;
-        }
-        
-        // Set metadata
-        entity._type = singularType;
-        entity._cardTitle = cardTitle; // Store for updates
-        
-        // For Characters, set subtype based on card prefix
-        if (singularType === 'Character') {
-            if (!entity.info) entity.info = {};
-            entity.info.isPlayer = cardTitle.startsWith('[PLAYER]');
-            // Set subtype for special prefixes
-            if (cardTitle.startsWith('[PLAYER]')) {
-                entity._subtype = 'Player';
-            }
-        }
-        
-        // Data comes from JSON.parse() so already in object format
-        // No text parsing needed
-        
-        // Store in cache
-        entityCache[cacheKey] = entity;
-        return entity;
-    }
-    
-    // Unified save function for ANY object type
-    function save(objectType, entity) {
-        if (!objectType || !entity) {
-            console.log(`${MODULE_NAME}: ERROR - save() called with invalid parameters`);
-            return false;
-        }
-        
-        if (!entity.name) {
-            console.log(`${MODULE_NAME}: ERROR - Cannot save entity without name field!`);
-            console.log('Entity:', JSON.stringify(entity));
-            return false;
-        }
-        
-        // Ensure name is a string and not empty
-        entity.name = String(entity.name).trim();
-        if (!entity.name) {
-            console.log(`${MODULE_NAME}: ERROR - Entity name cannot be empty!`);
-            return false;
-        }
-        
-        // Normalize entity type
-        const entityType = String(objectType).charAt(0).toUpperCase() + String(objectType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Check if this is a data-only entity type
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[singularType];
-        if (schema && schema.dataOnly) {
-            // Save to [SANE_DATA] card
-            const dataCardTitle = `[SANE_DATA] ${singularType}`;
-            let dataCard = Utilities.storyCard.get(dataCardTitle);
-            let allData = {};
-            
-            if (dataCard) {
-                try {
-                    allData = JSON.parse(dataCard.description || '{}');
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Failed to parse existing data card ${dataCardTitle}`);
-                }
-            }
-            
-            // Update or add the entity
-            allData[entity.name] = entity;
-            
-            // Save back to card
-            if (dataCard) {
-                Utilities.storyCard.update(dataCardTitle, {
-                    description: JSON.stringify(allData, null, 2)
-                });
-            } else {
-                Utilities.storyCard.add({
-                    title: dataCardTitle,
-                    description: JSON.stringify(allData, null, 2),
-                    type: 'data'
-                });
-            }
-            
-            // Update cache
-            const cacheKey = `${singularType}.${entity.name}`;
-            entityCache[cacheKey] = entity;
-            
-            return true;
-        }
-        
-        // Continue with display entity saving (CHARACTER, LOCATION, etc.)
-        
-        // Validation removed - components are flexible now
-        // const validation = validateEntityComponents(singularType, entity);
-        // if (!validation.valid) {
-        //     if (debug) {
-        //         console.log(`${MODULE_NAME}: Entity validation failed for ${entity.name}:`);
-        //         validation.errors.forEach(err => console.log(`  - ${err}`));
-        //     }
-        //     // Still save but log validation errors
-        // }
-        
-        // Build cache key
-        const cacheKey = `${singularType}.${entity.name}`;
-        
-        // Update cache
-        entityCache[cacheKey] = entity;
-        
-        // Save to display card (the ONLY source of truth)
-        return saveEntityCard(entity, singularType);
-    }
-    
-    // Unified loadAll function for ANY object type
-    function loadAll(objectType) {
-        // Normalize the entity type
-        const entityType = String(objectType).charAt(0).toUpperCase() + String(objectType).slice(1).toLowerCase();
-        const singularType = entityType.replace(/s$/, '');
-        
-        // Check if this is a data-only entity type
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        const schema = schemaRegistry[singularType];
-        if (schema && schema.dataOnly) {
-            // Load from [SANE_DATA] card
-            const dataCard = Utilities.storyCard.get(`[SANE_DATA] ${singularType}`);
-            if (dataCard) {
-                try {
-                    const allData = JSON.parse(dataCard.description || '{}');
-                    // Cache all entities
-                    for (const [name, entity] of Object.entries(allData)) {
-                        const cacheKey = `${singularType}.${name}`;
-                        entityCache[cacheKey] = entity;
-                    }
-                    return allData;
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Failed to parse data-only entities for ${singularType}`);
-                }
-            }
-            return {};
-        }
-        
-        // Build map if not exists for display entities
-        if (!entityCardMap) buildEntityCardMap();
-        
-        // Get all entities of this type from the map
-        const typeMap = entityCardMap[singularType];
-        if (!typeMap) {
-            if (debug) console.log(`${MODULE_NAME}: No entities found for type ${singularType}`);
-            return {};
-        }
-        
-        // Load all entities
-        const entities = {};
-        
-        for (const [entityId, cardTitle] of Object.entries(typeMap)) {
-            // Load each entity using the mapping
-            const entity = load(singularType, entityId);
-            if (entity) {
-                entities[entityId] = entity;
-            }
-        }
-        
-        return entities;
-    }
-    
-    function loadCharacter(name) {
-        // Delegate to unified load function
-        return load('Character', name);
-    }
-    
-    // Queue entity for generation wizard
-    function queueEntityGeneration(entity) {
-        // This would interface with GenerationWizard
-        // For now, just log that it needs generation
-        if (debug) console.log(`${MODULE_NAME}: Queued ${entity.name} for display card generation`);
-        
-        // Could add to [SANE_CONFIG] Entity Queue card
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-        if (queueCard) {
-            const lines = (queueCard.description || '').split('\n').filter(l => l.trim());
-            lines.push(`${entity.type}:${entity.name}`);
-            Utilities.storyCard.update('[SANE_CONFIG] Entity Queue', {
-                description: lines.join('\n')
-            });
-        }
-    }
-    
-    // ==========================
-    // Helper Functions for Tools
-    // ==========================
-    
-    // Process level ups using nested level.xp structure
-    function processLevelUp(character, schema) {
-        // Check for level up with nested level.xp structure
-        if (!character.stats || !character.stats.level || !character.stats.level.xp) return;
-        
-        while (character.stats.level.xp.current >= character.stats.level.xp.max) {
-            // Subtract XP for this level
-            character.stats.level.xp.current -= character.stats.level.xp.max;
-            
-            // Level up!
-            character.stats.level.value = (character.stats.level.value || 1) + 1;
-            console.log(character.name + ' reached level ' + character.stats.level.value + '!');
-            
-            // Calculate new max XP for next level
-            const nextLevelXP = calculateLevelXPRequirement(character.stats.level.value + 1);
-            character.stats.level.xp.max = nextLevelXP;
-            
-            // Increase max HP based on level
-            const newMaxHP = calculateMaxHP(character.stats.level.value);
-            if (!character.stats.hp) character.stats.hp = { current: 100, max: 100 };
-            
-            // Increase current HP by the difference (heal on level up)
-            const hpGain = newMaxHP - character.stats.hp.max;
-            character.stats.hp.max = newMaxHP;
-            character.stats.hp.current = Math.min(character.stats.hp.max, character.stats.hp.current + hpGain);
-            
-            console.log(`  HP increased to ${character.stats.hp.current}/${character.stats.hp.max}`);
-            
-            // TODO: Process attribute gains if configured
-            
-            // Continue checking for multiple level ups
-        }
-    }
-    
-    // Process skill level ups
-    function processSkillLevelUp(skill, skillName, schema) {
-        // Simple skill level up processing
-        // Calculate XP needed for next level
-        let xpNeeded = calculateSkillXPRequirement(skillName, (skill.level || 1) + 1);
-        
-        // Initialize skill XP if needed
-        if (!skill.xp) {
-            skill.xp = { current: 0, max: xpNeeded };
-        }
-        
-        // Check for level up
-        while (skill.xp.current >= skill.xp.max) {
-            skill.xp.current -= skill.xp.max;
-            skill.level = (skill.level || 1) + 1;
-            
-            console.log('  Skill leveled up to ' + skill.level);
-            
-            // Recalculate XP needed for next level
-            xpNeeded = calculateSkillXPRequirement(skillName, skill.level + 1);
-            skill.xp.max = xpNeeded;
-        }
-    }
-    
-    // ==========================
-    // Tool Processors
-    // ==========================
-    const toolProcessors = {
-        advance_time: function(hours, minutes) {
-            hours = parseInt(hours) || 0;
-            minutes = parseInt(minutes) || 0;
-            
-            // Both being 0 is malformed
-            if (hours === 0 && minutes === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid advance_time (0h 0m) - removing`);
-                return 'malformed';
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: Advancing time by ${hours}h ${minutes}m`);
-            
-            if (typeof Calendar !== 'undefined' && Calendar.advanceTime) {
-                let timeStr = '';
-                if (hours > 0) timeStr += hours + 'h';
-                if (minutes > 0) timeStr += (timeStr ? ', ' : '') + minutes + 'm';
-                
-                const result = Calendar.advanceTime(timeStr);
-                return result ? 'executed' : 'malformed';
-            }
-            return 'executed';
-        },
-        
-        update_location: function(characterName, location) {
-            if (!characterName || !location) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            location = String(location).toLowerCase().replace(/\s+/g, '_');
-            
-            // Check if character exists using universal system
-            const character = loadCharacter(characterName);
-            if (character) {
-                // Character exists, update location using component structure
-                if (!character.info) {
-                    if (debug) console.log(`${MODULE_NAME}: Character ${character.name} missing info component`);
-                    return 'malformed';
-                }
-                character.info.location = location;
-                save('Character', character);
-                if (debug) console.log(`${MODULE_NAME}: ${character.name} moved to ${location}`);
-                return 'executed';
-            }
-            
-            // Character not found - do a full check
-            const fullCheckCharacter = loadCharacter(characterName);
-            
-            if (!fullCheckCharacter) {
-                // Character doesn't exist
-                trackUnknownEntity(characterName, 'update_location', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Unknown character ${characterName} referenced in update_location`);
-                }
-            } else {
-                // Found character - update location
-                if (fullCheckCharacter.info) {
-                    fullCheckCharacter.info.location = location;
-                } else {
-                    fullCheckCharacter.location = location;
-                }
-                save('Character', fullCheckCharacter);
-                if (debug) console.log(`${MODULE_NAME}: ${fullCheckCharacter.name} moved to ${location}`);
-            }
-            
-            return 'executed';
-        },
-        
-        add_item: function(characterName, itemName, quantity) {
-            if (!characterName || !itemName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
-            const qtyStr = String(quantity).trim();
-            if (!/^-?\d+$/.test(qtyStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for add_item: ${quantity}`);
-                return 'malformed';
-            }
-            quantity = parseInt(qtyStr);
-            
-            // 0 or invalid quantity is malformed
-            if (isNaN(quantity) || quantity === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity for add_item: ${quantity}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                }
-                return 'executed'; // Still executed, just no character
-            }
-            
-            // Access inventory through component or fallback to direct access
-            if (!character.inventory) character.inventory = {};
-            const inventory = character.inventory;
-            
-            // Always convert to object format
-            let currentQty = 0;
-            if (typeof inventory[itemName] === 'object') {
-                currentQty = inventory[itemName].quantity || 0;
-            } else if (typeof inventory[itemName] === 'number') {
-                currentQty = inventory[itemName];
-            }
-            
-            const newQty = Math.max(0, currentQty + quantity);
-            
-            // Always store as object with quantity
-            inventory[itemName] = { quantity: newQty };
-            
-            if (debug) {
-                console.log(`${MODULE_NAME}: ${character.name}'s ${itemName}: ${currentQty} → ${newQty}`);
-            }
-            
-            save('Character', character);
-            return 'executed';
-        },
-        
-        remove_item: function(characterName, itemName, quantity) {
-            if (!characterName || !itemName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
-            const qtyStr = String(quantity).trim();
-            if (!/^\d+$/.test(qtyStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for remove_item: ${quantity}`);
-                return 'malformed';
-            }
-            quantity = parseInt(qtyStr);
-            
-            // 0 or invalid quantity is malformed
-            if (isNaN(quantity) || quantity <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity for remove_item: ${quantity}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) return 'executed';
-            
-            // Access inventory through component or fallback to direct access
-            const inventory = character.inventory || {};
-            
-            // Always convert to object format for reading
-            let currentQty = 0;
-            if (typeof inventory[itemName] === 'object') {
-                currentQty = inventory[itemName].quantity || 0;
-            } else if (typeof inventory[itemName] === 'number') {
-                currentQty = inventory[itemName];
-            }
-            
-            const removeQty = Math.min(currentQty, quantity);
-            const newQty = currentQty - removeQty;
-            
-            if (newQty === 0) {
-                delete inventory[itemName];
-                if (debug) console.log(`${MODULE_NAME}: Removed all ${itemName} from ${character.name}`);
-            } else {
-                // Always store as object with quantity
-                inventory[itemName] = { quantity: newQty };
-                if (debug) console.log(`${MODULE_NAME}: Removed ${removeQty} ${itemName} from ${character.name} (${currentQty} → ${newQty})`);
-            }
-            
-            // Ensure inventory is set back on character
-            character.inventory = inventory;
-            
-            save('Character', character);
-            return 'executed';
-        },
-        
-        use_consumable: function(characterName, itemName, quantity) {
-            // Identical validation to remove_item
-            return toolProcessors.remove_item(characterName, itemName, quantity);
-        },
-        
-        transfer_item: function(giverName, receiverName, itemName, quantity) {
-            if (!giverName || !receiverName || !itemName) return 'malformed';
-            
-            // Validate both character names before processing
-            if (!isValidCharacterName(giverName) || !isValidCharacterName(receiverName)) {
-                return 'malformed';
-            }
-            
-            giverName = String(giverName).toLowerCase();
-            receiverName = String(receiverName).toLowerCase();
-            itemName = String(itemName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
-            const qtyStr = String(quantity).trim();
-            if (!/^\d+$/.test(qtyStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity format for transfer_item: ${quantity}`);
-                return 'malformed';
-            }
-            const requestedQty = parseInt(qtyStr);
-            
-            // 0 or invalid quantity is malformed
-            if (isNaN(requestedQty) || requestedQty <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quantity for transfer_item: ${quantity}`);
-                return 'malformed';
-            }
-            
-            const characters = loadAll('Character');
-            const giver = characters[giverName];
-            const receiver = characters[receiverName];
-            
-            // Track unknown entities
-            if (!giver) {
-                trackUnknownEntity(giverName, 'transfer_item', info?.actionCount);
-                if (shouldTriggerGeneration(giverName)) {
-                    addToEntityQueue(giverName);
-                }
-            }
-            if (!receiver) {
-                trackUnknownEntity(receiverName, 'transfer_item', info?.actionCount);
-                if (shouldTriggerGeneration(receiverName)) {
-                    addToEntityQueue(receiverName);
-                }
-            }
-            
-            let anySuccess = false;
-            let transferQty = requestedQty;
-            
-            if (giver) {
-                // Normalize inventory to new format if needed
-                giver.inventory = normalizeInventory(giver.inventory);
-                
-                const availableQty = getItemQuantity(giver.inventory, itemName);
-                transferQty = Math.min(availableQty, requestedQty);
-                
-                if (transferQty > 0) {
-                    setItemQuantity(giver.inventory, itemName, availableQty - transferQty);
-                    
-                    save('Character', giver);
-                    anySuccess = true;
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Removed ${transferQty} ${itemName} from ${giver.name}`);
-                } else {
-                    if (debug) console.log(`${MODULE_NAME}: ${giver.name} has no ${itemName} to transfer`);
-                    return 'executed'; // Valid attempt, just no items
-                }
-            }
-            
-            if (receiver) {
-                // Normalize inventory to new format if needed
-                receiver.inventory = normalizeInventory(receiver.inventory);
-                
-                const currentReceiverQty = getItemQuantity(receiver.inventory, itemName);
-                setItemQuantity(receiver.inventory, itemName, currentReceiverQty + transferQty);
-                
-                save('Character', receiver);
-                anySuccess = true;
-                
-                if (debug) console.log(`${MODULE_NAME}: Added ${transferQty} ${itemName} to ${receiver.name}`);
-            }
-            
-            return anySuccess ? 'executed' : 'executed';
-        },
-        
-        deal_damage: function(sourceName, targetName, damageAmount) {
-            if (!targetName) return 'malformed';
-            
-            // Validate target name syntax (but allow non-existent/hallucinated names)
-            if (!isValidCharacterName(targetName)) {
-                return 'malformed';
-            }
-            
-            sourceName = sourceName ? String(sourceName).toLowerCase() : 'unknown';
-            targetName = String(targetName).toLowerCase();
-            
-            // Strict number validation - must be a clean integer
-            const damageStr = String(damageAmount).trim();
-            if (!/^\d+$/.test(damageStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid damage amount format: ${damageAmount}`);
-                return 'malformed';
-            }
-            damageAmount = parseInt(damageStr);
-            
-            // 0 or negative damage is malformed
-            if (isNaN(damageAmount) || damageAmount <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid damage amount: ${damageAmount}`);
-                return 'malformed';
-            }
-            
-            // Load the target character directly
-            const target = loadCharacter(targetName);
-            if (!target) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Target ${targetName} not found`);
-                }
-                return 'executed';
-            }
-            
-            // Only load source if needed and exists
-            const source = (sourceName !== 'unknown') 
-                ? loadCharacter(sourceName) : null;
-            
-            const sourceDisplay = source ? source.name : sourceName;
-            
-            // Support both old (hp) and new (stats.hp) structures
-            let currentHP, maxHP;
-            if (target.stats && target.stats.hp) {
-                currentHP = target.stats.hp.current;
-                maxHP = target.stats.hp.max;
-            } else if (target.hp) {
-                // Migrate from old structure
-                currentHP = target.hp.current;
-                maxHP = target.hp.max;
-                // Initialize new structure
-                if (!target.stats) target.stats = {};
-                target.stats.hp = { current: currentHP, max: maxHP };
-            } else {
-                // Initialize if missing
-                if (!target.stats) target.stats = {};
-                target.stats.hp = { current: 100, max: 100 };
-                currentHP = 100;
-                maxHP = 100;
-            }
-            
-            const oldHP = currentHP;
-            const newHP = Math.max(0, currentHP - damageAmount);
-            const actualDamage = oldHP - newHP;
-            
-            // Update in new structure
-            target.stats.hp.current = newHP;
-            
-            // Also update old structure for backward compatibility
-            if (target.hp) {
-                target.hp.current = newHP;
-            }
-            
-            if (debug) {
-                console.log(`${MODULE_NAME}: ${sourceDisplay} dealt ${actualDamage} damage to ${target.name} (${oldHP} → ${newHP}/${maxHP})`);
-            }
-            
-            save('Character', target);
-            return 'executed';
-        },
-        
-        add_levelxp: function(characterName, xpAmount) {
-            if (!characterName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            
-            // Allow negative numbers for XP removal
-            const xpStr = String(xpAmount).trim();
-            if (!/^-?\d+$/.test(xpStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid XP format for add_levelxp: ${xpAmount}`);
-                return 'malformed';
-            }
-            xpAmount = parseInt(xpStr);
-            
-            // 0 is malformed (use positive/negative for actual changes)
-            if (isNaN(xpAmount) || xpAmount === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid XP amount: ${xpAmount}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) {
-                trackUnknownEntity(characterName, 'add_levelxp', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                return 'executed';
-            }
-            
-            // Update XP using nested level.xp structure
-            if (!character.stats || !character.stats.level || !character.stats.level.xp) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${character.name} missing stats.level.xp component`);
-                return 'malformed';
-            }
-            character.stats.level.xp.current += xpAmount;
-            
-            // Ensure XP doesn't go below 0
-            if (character.stats.level.xp.current < 0) {
-                character.stats.level.xp.current = 0;
-            }
-            
-            const action = xpAmount > 0 ? 'Added' : 'Removed';
-            if (debug) console.log(`${MODULE_NAME}: ${action} ${Math.abs(xpAmount)} XP ${xpAmount > 0 ? 'to' : 'from'} ${character.name} (${character.stats.level.xp.current}/${character.stats.level.xp.max})`);
-            
-            processLevelUp(character);
-            save('Character', character);
-            return 'executed';
-        },
-        
-        add_skillxp: function(characterName, skillName, xpAmount) {
-            if (!characterName || !skillName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Strict number validation
-            const xpStr = String(xpAmount).trim();
-            if (!/^\d+$/.test(xpStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid XP format for add_skillxp: ${xpAmount}`);
-                return 'malformed';
-            }
-            xpAmount = parseInt(xpStr);
-            
-            // 0 or invalid XP is malformed
-            if (isNaN(xpAmount) || xpAmount <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid skill XP amount: ${xpAmount}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) {
-                trackUnknownEntity(characterName, 'add_skillxp', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                return 'executed';
-            }
-            
-            // Initialize skills component if needed
-            if (!character.skills) {
-                character.skills = {};
-            }
-            
-            if (!character.skills[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: Skill ${skillName} not found on ${character.name}`);
-                return 'malformed';
-            }
-            
-            const skill = character.skills[skillName];
-            skill.xp.current += xpAmount;
-            
-            if (debug) console.log(`${MODULE_NAME}: Added ${xpAmount} XP to ${character.name}'s ${skillName} (${skill.xp.current}/${skill.xp.max})`);
-            
-            processSkillLevelUp(skill, skillName);
-            save('Character', character);
-            return 'executed';
-        },
-        
-        unlock_newskill: function(characterName, skillName) {
-            if (!characterName || !skillName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            skillName = String(skillName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Check if skill exists in registry
-            const skillRegistry = getSkillRegistry();
-            if (!skillRegistry[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: Unknown skill: ${skillName}. Valid skills: ${Object.keys(skillRegistry).join(', ')}`);
-                return 'malformed';
-            }
-            
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) {
-                trackUnknownEntity(characterName, 'unlock_newskill', info?.actionCount);
-                if (shouldTriggerGeneration(characterName)) {
-                    addToEntityQueue(characterName);
-                }
-                return 'executed';
-            }
-            
-            // Initialize skills component if needed
-            if (!character.skills) {
-                character.skills = {};
-            }
-            
-            // Check if character already has this skill
-            if (character.skills[skillName]) {
-                if (debug) console.log(`${MODULE_NAME}: ${character.name} already has ${skillName}`);
-                return 'malformed';
-            }
-            
-            const maxXP = calculateSkillXPRequirement(skillName, 2);
-            character.skills[skillName] = {
-                level: 1,
-                xp: {
-                    current: 0,
-                    max: maxXP
-                }
-            };
-            
-            if (debug) console.log(`${MODULE_NAME}: ${character.name} learned ${skillName}!`);
-            
-            save('Character', character);
-            return 'executed';
-        },
-        
-        update_attribute: function(characterName, attrName, value) {
-            if (!characterName || !attrName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            attrName = String(attrName).toLowerCase();
-            value = parseInt(value);
-            
-            if (isNaN(value) || value <= 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid attribute value: ${value}`);
-                return 'malformed';
-            }
-            
-            // Validate against field config
-            const attrConfig = null; // Attributes handled by component system
-            if (attrConfig && attrConfig.required) {
-                const requiredAttrs = attrConfig.required.split(',').map(a => a.trim().toLowerCase());
-                const optionalAttrs = attrConfig.optional ? attrConfig.optional.split(',').map(a => a.trim().toLowerCase()) : [];
-                const allAttrs = [...requiredAttrs, ...optionalAttrs];
-                
-                if (!allAttrs.includes(attrName)) {
-                    if (debug) console.log(`${MODULE_NAME}: Invalid attribute '${attrName}' - must be one of: ${allAttrs.join(', ')}`);
-                    return 'malformed';
-                }
-            }
-            
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) return 'executed';
-            
-            character.attributes[attrName] = value;
-            
-            if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s ${attrName} to ${value}`);
-            
-            save('Character', character);
-            return 'executed';
-        },
-        
-        update_relationship: function(name1, name2, changeAmount) {
-            if (!name1 || !name2) return 'malformed';
-            
-            // Validate both character names before processing
-            if (!isValidCharacterName(name1) || !isValidCharacterName(name2)) {
-                return 'malformed';
-            }
-            
-            name1 = String(name1).toLowerCase();
-            name2 = String(name2).toLowerCase();
-            
-            // Strict number validation (can be negative)
-            const changeStr = String(changeAmount).trim();
-            if (!/^-?\d+$/.test(changeStr)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid change amount format: ${changeAmount}`);
-                return 'malformed';
-            }
-            changeAmount = parseInt(changeStr);
-            
-            // 0 change is malformed (why call it?)
-            if (isNaN(changeAmount) || changeAmount === 0) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid relationship change: ${changeAmount}`);
-                return 'malformed';
-            }
-            
-            const characters = loadAll('Character');
-            const char1 = characters[name1];
-            const char2 = characters[name2];
-            
-            // Track unknown entities
-            if (!char1) {
-                trackUnknownEntity(name1, 'update_relationship', info?.actionCount);
-                if (shouldTriggerGeneration(name1)) {
-                    addToEntityQueue(name1);
-                }
-            }
-            if (!char2) {
-                trackUnknownEntity(name2, 'update_relationship', info?.actionCount);
-                if (shouldTriggerGeneration(name2)) {
-                    addToEntityQueue(name2);
-                }
-            }
-            
-            if (!char1 || !char2) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: One or both characters not found: ${name1}, ${name2}`);
-                }
-                return 'executed';
-            }
-            
-            // Ensure relationships is an object (not a string or undefined)
-            if (typeof char1.relationships !== 'object' || char1.relationships === null) {
-                char1.relationships = {};
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Fixed relationships for ${char1.name} - was type: ${typeof char1.relationships}`);
-                }
-            }
-            if (typeof char2.relationships !== 'object' || char2.relationships === null) {
-                char2.relationships = {};
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Fixed relationships for ${char2.name} - was type: ${typeof char2.relationships}`);
-                }
-            }
-            
-            // Update bidirectional relationships
-            if (!char1.relationships[name2]) char1.relationships[name2] = 0;
-            if (!char2.relationships[name1]) char2.relationships[name1] = 0;
-            
-            char1.relationships[name2] += changeAmount;
-            char2.relationships[name1] += changeAmount;
-            
-            const flavorText1 = getRelationshipFlavor(char1.relationships[name2], char1.name, char2.name);
-            const flavorText2 = getRelationshipFlavor(char2.relationships[name1], char2.name, char1.name);
-            
-            save('Character', char1);
-            save('Character', char2);
-            
-            if (debug) {
-                console.log(`${MODULE_NAME}: ${char1.name}→${char2.name}: ${flavorText1}`);
-                console.log(`${MODULE_NAME}: ${char2.name}→${char1.name}: ${flavorText2}`);
-            }
-            
-            return 'executed';
-        },
-        
-        discover_location: function(characterName, locationName, direction) {
-            // Validate inputs
-            if (!characterName || !locationName || !direction) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            locationName = String(locationName).replace(/\s+/g, '_');
-            direction = String(direction).toLowerCase();
-            
-            // Validate direction (cardinal directions + inside/outside for nested locations)
-            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
-            if (!validDirections.includes(direction)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${direction}. Valid: ${validDirections.join(', ')}`);
-                return 'malformed';
-            }
-            
-            // Get character's current location
-            // Selectively load only the character needed
-            const character = loadCharacter(characterName);
-            
-            if (!character) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                }
-                return 'malformed';
-            }
-            
-            const currentLocation = character.location;
-            
-            // Check if location already exists
-            const existingLocation = Utilities.storyCard.get(`[LOCATION] ${locationName}`);
-            if (existingLocation) {
-                if (debug) console.log(`${MODULE_NAME}: Location ${locationName} already exists - use connect_locations instead`);
-                return 'malformed';
-            }
-            
-            // Dynamically determine location header based on player's floor
-            let locationHeaders = '<$# Locations>';
-            
-            // First, check the player's current floor
-            // Find the first [PLAYER] card
-            const playerCard = Utilities.storyCard.find(card => {
-                return card.title && card.title.startsWith('[PLAYER]');
-            }, false);
-            
-            let playerName = null;
-            if (playerCard) {
-                const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-                if (match) {
-                    playerName = match[1].trim();
-                }
-            }
-            
-            // Allow override via global variable if set
-            const customHeader = getGlobalValue('location_header');
-            if (customHeader) {
-                locationHeaders = customHeader; // User override takes precedence
-            }
-            
-            // Create basic location card (will be enhanced by generation)
-            // For inside/outside locations, adjust pathways accordingly
-            let pathwaysList;
-            if (direction === 'inside') {
-                // Interior location - minimal pathways
-                pathwaysList = (
-                    '- Outside: ' + currentLocation + '\n' +
-                    '- Inside: (unexplored)'  // For buildings with multiple rooms
-                );
-            } else if (direction === 'outside') {
-                // Exterior location from interior - include all directions
-                pathwaysList = (
-                    '- Inside: ' + currentLocation + '\n' +
-                    '- North: (unexplored)\n' +
-                    '- South: (unexplored)\n' +
-                    '- East: (unexplored)\n' +
-                    '- West: (unexplored)'
-                );
-            } else {
-                // Standard cardinal direction - include all options
-                pathwaysList = (
-                    '- ' + getOppositeDirection(direction) + ': ' + currentLocation + '\n' +
-                    '- North: (unexplored)\n' +
-                    '- South: (unexplored)\n' +
-                    '- East: (unexplored)\n' +
-                    '- West: (unexplored)\n' +
-                    '- Inside: (unexplored)'  // Buildings can have interiors
-                );
-            }
-            
-            // Create basic location data
-            const locationData = {
-                name: locationName,
-                type: 'Unknown',
-                terrain: 'Unexplored'
-            };
-            
-            // Use default header and info line since we removed formatTemplate
-            let headerLine = `## **${locationName}**`;
-            let infoLine = 'Type: Unknown | Terrain: Unexplored';
-            
-            const locationEntry = (
-                locationHeaders + '\n' +
-                headerLine + '\n' +
-                infoLine + '\n' +
-                '### Description\n' +
-                'An unexplored location. Details will be revealed upon first visit.\n' +
-                '### Pathways\n' +
-                pathwaysList
-            );
-            
-            const snakeCased = locationName.toLowerCase();
-            const spacedName = locationName.replace(/_/g, ' ');
-            
-            const locationCard = {
-                title: `[LOCATION] ${locationName}`,
-                type: 'Location',
-                keys: `${snakeCased}, ${spacedName}`,  // Keys as comma-separated string
-                entry: locationEntry,
-                description: `Discovered by ${character.name} on turn ${info?.actionCount || 0}`
-            };
-            
-            Utilities.storyCard.add(locationCard);
-            
-            // Update current location's pathway
-            updateLocationPathway(currentLocation, direction, locationName);
-            
-            // Queue for generation if GenerationWizard is available
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startGeneration) {
-                GenerationWizard.startGeneration('Location', null, {
-                    NAME: locationName,
-                    metadata: {
-                        from: currentLocation,
-                        direction: direction,
-                        discoveredBy: character.name
-                    }
-                });
-            }
-            
-            if (debug) console.log(`${MODULE_NAME}: ${character.name} discovered ${locationName} to the ${direction}`);
-            return 'executed';
-        },
-        
-        connect_locations: function(locationA, locationB, directionFromA) {
-            if (!locationA || !locationB || !directionFromA) return 'malformed';
-            
-            locationA = String(locationA).replace(/\s+/g, '_');
-            locationB = String(locationB).replace(/\s+/g, '_');
-            directionFromA = String(directionFromA).toLowerCase();
-            
-            // Validate direction (cardinal directions + inside/outside for nested locations)
-            const validDirections = ['north', 'south', 'east', 'west', 'inside', 'outside'];
-            if (!validDirections.includes(directionFromA)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid direction: ${directionFromA}. Valid: ${validDirections.join(', ')}`);
-                return 'malformed';
-            }
-            
-            // Check both locations exist
-            const cardA = Utilities.storyCard.get(`[LOCATION] ${locationA}`);
-            const cardB = Utilities.storyCard.get(`[LOCATION] ${locationB}`);
-            
-            if (!cardA || !cardB) {
-                if (debug) console.log(`${MODULE_NAME}: One or both locations not found`);
-                return 'malformed';
-            }
-            
-            // Update pathways bidirectionally
-            updateLocationPathway(locationA, directionFromA, locationB);
-            updateLocationPathway(locationB, getOppositeDirection(directionFromA), locationA);
-            
-            if (debug) console.log(`${MODULE_NAME}: Connected ${locationA} ${directionFromA} to ${locationB}`);
-            return 'executed';
-        },
-        
-        accept_quest: function(playerName, questName, questGiver, questType) {
-            // Must have all 4 parameters
-            if (!playerName || !questName || !questGiver || !questType) return 'malformed';
-            
-            // CRITICAL: Convert quest name and giver to snake_case to prevent system breakage
-            questName = String(questName).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            questGiver = String(questGiver).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
-            
-            // Normalize quest type to lowercase - handle both "story" and "story_quest" formats
-            let normalizedType = String(questType).toLowerCase();
-            
-            // Strip "_quest" suffix if present
-            if (normalizedType.endsWith('_quest')) {
-                normalizedType = normalizedType.substring(0, normalizedType.length - 6);
-            }
-            
-            // Load quest types from schema
-            const questSchema = null; // Quest types handled by scenario
-            let validTypes = ['story', 'side', 'hidden', 'raid']; // Default fallback
-            let stageRanges = {};
-            
-            if (questSchema && questSchema.value) {
-                try {
-                    const parsed = null; // Quest types handled by scenario
-                    if (parsed && typeof parsed === 'object') {
-                        validTypes = [];
-                        
-                        // Parse quest types and their stage counts
-                        for (const [type, stages] of Object.entries(parsed)) {
-                    const typeLower = type.toLowerCase();
-                    validTypes.push(typeLower);
-                    
-                    // Parse stage count - can be "min-max" or single number
-                    const stageStr = String(stages);
-                    if (stageStr.includes('-')) {
-                        const [min, max] = stageStr.split('-').map(s => parseInt(s.trim()));
-                        stageRanges[typeLower] = { min, max };
-                    } else {
-                        const exact = parseInt(stageStr);
-                        stageRanges[typeLower] = { min: exact, max: exact };
-                    }
-                }
-                    }
-                } catch (e) {
-                    if (debug) console.log(`${MODULE_NAME}: Error parsing quest types schema: ${e.message}`);
-                    // Keep default fallback values
-                }
-            } else {
-                // Fallback to defaults if schema not found
-                stageRanges = {
-                    'story': { min: 3, max: 7 },
-                    'side': { min: 2, max: 5 },
-                    'hidden': { min: 3, max: 7 },
-                    'raid': { min: 3, max: 7 }
-                };
-            }
-            
-            if (!validTypes.includes(normalizedType)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid quest type: ${questType} (normalized: ${normalizedType}). Valid types: ${validTypes.join(', ')}`);
-                return 'malformed';
-            }
-            
-            // Check GenerationWizard availability
-            if (typeof GenerationWizard === 'undefined') {
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available`);
-                return 'executed';
-            }
-            
-            // Check if already generating
-            if (GenerationWizard.isActive()) {
-                if (debug) console.log(`${MODULE_NAME}: Generation already in progress`);
-                return 'executed';
-            }
-            
-            // Determine stage count based on type (using lowercase)
-            const range = stageRanges[normalizedType];
-            const stageCount = Math.floor(Math.random() * (range.max - range.min + 1)) + range.min;
-            
-            if (debug) console.log(`${MODULE_NAME}: Starting quest generation - Name: ${questName}, Type: ${normalizedType}, Stages: ${stageCount}`);
-            
-            // Start generation with normalized lowercase type
-            const started = GenerationWizard.startQuestGeneration(
-                questName,
-                questGiver,
-                normalizedType,  // Pass lowercase version
-                stageCount
-            );
-            
-            if (debug) console.log(`${MODULE_NAME}: Quest generation ${started ? 'started' : 'failed to start'}`);
-            
-            return started ? 'executed' : 'malformed';
-        },
-        
-        offer_quest: function(npcName, questName, questGiver, questType) {
-            // Dummy tool - does nothing but is recognized as valid
-            // NPC quest offering not yet implemented
-            if (!npcName || !questName) return 'malformed';
-            
-            if (debug) console.log(`${MODULE_NAME}: offer_quest not yet implemented: ${npcName} offers ${questName}`);
-            return 'executed';
-        },
-        
-        update_quest: function(characterName, questName, objective, progress, total) {
-            if (!questName) return 'malformed';
-            
-            // If characterName is provided, validate it
-            if (characterName && !isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            questName = String(questName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Get the quest card
-            const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
-            if (!questCard) {
-                if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                return 'unknown';  // Return unknown so it gets removed
-            }
-            
-            // Parse the new stage number
-            let newStage = 1;
-            if (objective && !isNaN(parseInt(objective))) {
-                newStage = parseInt(objective);
-            } else if (progress && !isNaN(parseInt(progress))) {
-                newStage = parseInt(progress);
-            }
-            
-            // Replace "Current Stage: X" with the new value
-            let entry = questCard.entry;
-            entry = entry.replace(/Current Stage:\s*\d+/i, `Current Stage: ${newStage}`);
-            
-            // Update the card
-            Utilities.storyCard.update(questCard.title, { entry: entry });
-            
-            if (debug) console.log(`${MODULE_NAME}: Updated ${questName} to stage ${newStage}`);
-            return 'executed';
-        },
-        
-        complete_quest: function(characterName, questName) {
-            if (!characterName || !questName) return 'malformed';
-            
-            try {
-                // Validate character name before processing
-                if (!isValidCharacterName(characterName)) {
-                    return 'malformed';
-                }
-                
-                characterName = String(characterName).toLowerCase();
-                questName = String(questName).toLowerCase().replace(/\s+/g, '_');
-                
-                // Find the quest card
-                const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
-                if (!questCard) {
-                    if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                    return 'executed';
-                }
-                
-                // Replace the first line to mark as completed
-                let entry = questCard.entry;
-                entry = entry.replace(
-                    '<\$# Quests><\$## Active Quests>',
-                    '<\$# Quests><\$## Completed Quests>'
-                );
-                
-                // Update the card
-                Utilities.storyCard.update(questCard.title, { entry: entry });
-                
-                if (debug) console.log(`${MODULE_NAME}: Completed quest: ${questName}`);
-                return 'executed';
-            } catch (e) {
-                if (debug) console.log(`${MODULE_NAME}: Error in complete_quest: ${e.message}`);
-                return 'malformed';
-            }
-        },
 
-        abandon_quest: function(characterName, questName) {
-            if (!characterName || !questName) return 'malformed';
-            
-            characterName = String(characterName).toLowerCase();
-            questName = String(questName).toLowerCase().replace(/\s+/g, '_');
-            
-            // Find the quest card
-            const questCard = Utilities.storyCard.get(`[QUEST] ${questName}`);
-            if (!questCard) {
-                if (debug) console.log(`${MODULE_NAME}: Quest ${questName} not found`);
-                return 'executed';
-            }
-            
-            // Replace the first line to mark as abandoned
-            let entry = questCard.entry;
-            entry = entry.replace(
-                '<\$# Quests><\$## Active Quests>',
-                '<\$# Quests><\$## Abandoned Quests>'
-            );
-            
-            // Update the card
-            Utilities.storyCard.update(questCard.title, { entry: entry });
-            
-            if (debug) console.log(`${MODULE_NAME}: Abandoned quest: ${questName}`);
-            return 'executed';
-        },
-        
-        death: function(characterName) {
-            if (!characterName) return 'malformed';
-            
-            // Validate character name before processing
-            if (!isValidCharacterName(characterName)) {
-                return 'malformed';
-            }
-            
-            characterName = String(characterName).toLowerCase();
-            if (debug) console.log(`${MODULE_NAME}: Death recorded for: ${characterName}`);
-            return 'executed';
-        }
-    };
-    
-    // ==========================
-    // Entity Tracking System
-    // ==========================
-    function loadEntityTrackerConfig() {
-        // Use centralized sectioned config loader
-        const sections = Utilities.config.loadSectioned('[SANE_CONFIG] Entity Tracker', '# ');
-        
-        if (Object.keys(sections).length === 0) {
-            createEntityTrackerCards();
-            return {
-                threshold: 5,
-                autoGenerate: true,
-                blacklist: ['player', 'self', 'me', 'you', 'unknown']
-            };
-        }
-        
-        return {
-            threshold: parseInt(sections.entity_threshold) || 5,
-            autoGenerate: (sections.auto_generate || 'true').toLowerCase() === 'true',
-            blacklist: sections.entity_blacklist ? 
-                sections.entity_blacklist.split(',').map(s => s.trim().toLowerCase()) : 
-                ['player', 'self', 'me', 'you', 'unknown']
-        };
-    }
-    
-    function trackUnknownEntity(entityName, toolName, turnNumber) {
-        if (!entityName) return;
-        
-        // Normalize entity name to lowercase for consistent tracking
-        entityName = entityName.toLowerCase();
-        
-        // First check if character exists in the loaded character cache
-        // This is the most reliable way to check for existing characters
-        const allCharacters = loadAll('Character');
-        if (allCharacters[entityName]) {
-            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character in cache: ${entityName}`);
-            return;
-        }
-        
-        // Check if any character has this as a trigger_name
-        for (const charName in allCharacters) {
-            const character = allCharacters[charName];
-            if (character.info && character.info.trigger_name) {
-                // Check if trigger_name matches (could be string or array)
-                const triggers = Array.isArray(character.info.trigger_name) 
-                    ? character.info.trigger_name 
-                    : [character.info.trigger_name];
-                
-                const normalizedTriggers = triggers.map(t => String(t).toLowerCase());
-                if (normalizedTriggers.includes(entityName)) {
-                    if (debug) console.log(`${MODULE_NAME}: Skipping tracking - ${entityName} is trigger_name for character: ${character.name}`);
-                    // Clean up any existing tracking data for this entity
-                    removeFromTracker(entityName);
+                // Check if all hashes match up to current position
+                const currentHashes = history.map(h => RewindSystem.quickHash(h.text));
+
+                for (let i = 0; i < Math.min(currentHashes.length, data.entries.length); i++) {
+                    if (currentHashes[i] !== data.entries[i].h) {
+                        return { edited: true, position: i, confidence: 'high' };
+                    }
+                }
+
+                return { edited: false };
+            },
+
+            // Rehash from a certain position forward (after edit)
+            rehashFrom: function(position) {
+                const data = RewindSystem.getStorage();
+
+                // When an edit is detected, everything after the edit point is invalid
+                if (position < data.entries.length) {
+                    // Keep entries up to AND including the edit position
+                    data.entries = data.entries.slice(0, position + 1);
+
+                    // Update position to match current history length
+                    data.position = Math.min(position, history.length - 1);
+
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Discarded entries after position ${position}`);
+                }
+
+                // Now rehash the current history entries from the edit point forward
+                for (let i = position; i < history.length; i++) {
+                    const newHash = RewindSystem.quickHash(history[i].text);
+
+                    // If this position exists in our data, update its hash
+                    if (i < data.entries.length) {
+                        data.entries[i].h = newHash;
+                    }
+                }
+
+                RewindSystem.saveStorage(data);
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Rehashed from position ${position}`);
+            },
+
+            // Capture revert data before executing a tool
+            captureRevertData: function(toolName, params) {
+                const normalizedTool = toolName.toLowerCase();
+                const strategy = ModuleAPI.rewindableTools[normalizedTool];
+
+                if (!strategy) {
+                    // Tool is not registered as rewindable
+                    return {};
+                }
+
+                // Handle based on strategy type
+                if (strategy.type === 'stateful' && strategy.captureState) {
+                    // Capture state using tool-specific logic
+                    return strategy.captureState(params);
+                } else if (strategy.type === 'inverse') {
+                    // Inverse operations don't need state capture
+                    return {};
+                }
+
+                return {};
+            },
+
+            // Apply revert data to restore original state
+            applyRevertData: function(toolName, params, revertData) {
+                const normalizedTool = toolName.toLowerCase();
+                const strategy = ModuleAPI.rewindableTools[normalizedTool];
+
+                if (!strategy) {
+                    // Tool is not registered as rewindable
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`${MODULE_NAME}: Tool ${normalizedTool} is not registered as rewindable`);
+                    }
                     return;
                 }
-            }
-        }
-        
-        // Also check story cards directly as a fallback
-        const characterCards = Utilities.storyCard.find(card => {
-            if (!card.title.startsWith('[CHARACTER]') && !card.title.startsWith('[PLAYER]')) {
-                return false;
-            }
-            
-            // Check if title matches (case-insensitive)
-            const titleMatch = card.title.match(/\[(CHARACTER|PLAYER)\]\s+(.+)/);
-            if (titleMatch && titleMatch[2] && titleMatch[2].toLowerCase() === entityName) {
-                return true;
-            }
-            
-            // Don't try to parse - just check title
-            // (parsing without FORMAT card would fail anyway)
-            
-            return false;
-        }, true);
-        
-        // If character already exists, don't track
-        if (characterCards && characterCards.length > 0) {
-            if (debug) console.log(`${MODULE_NAME}: Skipping tracking for existing character card: ${entityName}`);
-            return;
-        }
-        
-        // Load and check blacklist from config
-        const config = loadEntityTrackerConfig();
-        if (config.blacklist && config.blacklist.includes(entityName)) return;
-        
-        // Load tracker from config card's description field
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
-        if (!configCard) {
-            createEntityTrackerCards();
-            return;
-        }
-        
-        let tracker = {};
-        if (configCard.description) {
-            try {
-                // Parse tracker data from description
-                const lines = configCard.description.split('\n');
-                let currentEntity = null;
-                
-                for (const line of lines) {
-                    if (line.startsWith('# ')) {
-                        currentEntity = line.substring(2).trim();
-                        tracker[currentEntity] = { count: 0, uniqueTurns: [], lastTool: '' };
-                    } else if (currentEntity && line.includes(':')) {
-                        const [key, value] = line.split(':').map(s => s.trim());
-                        if (key === 'turns') {
-                            tracker[currentEntity].uniqueTurns = value ? value.split(',').map(Number) : [];
-                            tracker[currentEntity].count = tracker[currentEntity].uniqueTurns.length;
-                        } else if (key === 'tool') {
-                            tracker[currentEntity].lastTool = value || '';
+
+                // Handle based on strategy type
+                if (strategy.type === 'inverse' && strategy.getInverse) {
+                    // Execute inverse operation
+                    const inverseOp = strategy.getInverse(params, revertData);
+                    if (inverseOp) {
+                        const [inverseTool, inverseParams] = inverseOp;
+                        const result = ModuleAPI.processTool(inverseTool, inverseParams);
+                        if (MODULE_CONFIG.debug) {
+                            console.log(`${MODULE_NAME}: Applied inverse operation ${inverseTool} with result: ${result}`);
+                        }
+                    }
+                } else if (strategy.type === 'stateful' && strategy.restoreState) {
+                    // Restore captured state
+                    strategy.restoreState(params, revertData);
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`${MODULE_NAME}: Restored state for ${normalizedTool}`);
+                    }
+                } else {
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`${MODULE_NAME}: Unknown strategy type for ${normalizedTool}`);
+                    }
+                }
+            },
+
+            // Extract and execute tools from text
+            extractAndExecuteTools: function(text) {
+                const executedTools = [];
+                if (!text) return executedTools;
+
+                // Parse tool calls from text
+                const toolCalls = ModuleAPI.parseToolCall(text);
+
+                // Execute each tool and track successful executions
+                for (const toolCall of toolCalls) {
+                    // Capture revert data BEFORE executing the tool
+                    const revertData = RewindSystem.captureRevertData(toolCall.name, toolCall.params);
+
+                    const result = ModuleAPI.processTool(toolCall.name, toolCall.params, 'rewind');
+
+                    // Only track if successfully executed (not malformed or unknown)
+                    if (result === 'executed') {
+                        executedTools.push([
+                            toolCall.name,
+                            toolCall.params,
+                            revertData  // Store revert data with the tool
+                        ]);
+
+                        if (MODULE_CONFIG.debug) {
+                            console.log(`${MODULE_NAME}: Executed ${toolCall.name} during rewind`);
                         }
                     }
                 }
-            } catch (e) {
-                tracker = {};
-            }
-        }
-        
-        // Use provided turn number or default to 0
-        const currentTurn = turnNumber || 0;
-        
-        // Clean up old entries (older than 100 turns)
-        const cutoffTurn = currentTurn - 100;
-        for (const [name, data] of Object.entries(tracker)) {
-            // Filter out turns older than cutoff
-            const recentTurns = data.uniqueTurns.filter(turn => turn > cutoffTurn);
-            
-            // If no recent turns remain, remove the entity from tracking
-            if (recentTurns.length === 0) {
-                delete tracker[name];
-                if (debug) console.log(`${MODULE_NAME}: Removed stale entity from tracker: ${name} (all turns older than ${cutoffTurn})`);
-            } else if (recentTurns.length < data.uniqueTurns.length) {
-                // Update with only recent turns
-                tracker[name].uniqueTurns = recentTurns;
-                tracker[name].count = recentTurns.length;
-                if (debug) console.log(`${MODULE_NAME}: Cleaned up old turns for ${name}: kept ${recentTurns.length} recent turns`);
-            }
-        }
-        
-        // Initialize entity tracking if needed
-        if (!tracker[entityName]) {
-            tracker[entityName] = {
-                count: 0,
-                uniqueTurns: [],
-                lastTool: ''
-            };
-        }
-        
-        // Only track if this is a new turn for this entity
-        if (!tracker[entityName].uniqueTurns.includes(currentTurn)) {
-            tracker[entityName].uniqueTurns.push(currentTurn);
-            tracker[entityName].count++;
-        }
-        
-        tracker[entityName].lastTool = toolName;
-        
-        // Save updated tracker to config card's description
-        let description = '// Entity tracking data\n';
-        for (const [name, data] of Object.entries(tracker)) {
-            description += `# ${name}\n`;
-            description += `turns: ${data.uniqueTurns.join(',')}\n`;
-            description += `tool: ${data.lastTool}\n`;
-        }
-        
-        Utilities.storyCard.update('[SANE_CONFIG] Entity Tracker', {
-            description: description
-        });
-        
-        if (debug) {
-            console.log(`${MODULE_NAME}: Tracked unknown entity ${entityName} (unique turns: ${tracker[entityName].uniqueTurns.length})`);
-        }
-    }
-    
-    function removeFromTracker(entityName) {
-        // Load tracker from config card's description field
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
-        if (!configCard || !configCard.description) return;
-        
-        let tracker = {};
-        try {
-            // Parse tracker data from description
-            const lines = configCard.description.split('\n');
-            let currentEntity = null;
-            
-            for (const line of lines) {
-                if (line.startsWith('# ')) {
-                    currentEntity = line.substring(2).trim();
-                    tracker[currentEntity] = { count: 0, uniqueTurns: [], lastTool: '' };
-                } else if (currentEntity && line.includes(':')) {
-                    const [key, value] = line.split(':').map(s => s.trim());
-                    if (key === 'turns') {
-                        tracker[currentEntity].uniqueTurns = value ? value.split(',').map(Number) : [];
-                        tracker[currentEntity].count = tracker[currentEntity].uniqueTurns.length;
-                    } else if (key === 'tool') {
-                        tracker[currentEntity].lastTool = value || '';
+
+                return executedTools;
+            },
+
+            // Handle context updates (check for edits and rewinds)
+            handleContext: function() {
+                // Check if history is available
+                if (typeof history === 'undefined' || !history) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: History not available in context`);
+                    return;
+                }
+
+                const data = RewindSystem.getStorage();
+                const historyLength = history.length;
+                const oldLength = data.entries.length;
+                const oldPosition = data.position || -1;  // Track our last known position
+
+                // Detect if history array has shifted (when at max capacity)
+                let shifted = false;
+                if (historyLength === 100 && oldLength >= 100) {
+                    // Check if the entries have shifted by comparing a few positions
+                    if (history[0] && data.entries[0]) {
+                        const historyHash = RewindSystem.quickHash(history[0].text);
+                        if (data.entries[0].h !== historyHash) {
+                            shifted = true;
+                            if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: History array shifted - realigning entries`);
+                        }
                     }
                 }
-            }
-        } catch (e) {
-            return;
-        }
-        
-        // Remove the entity from tracker
-        if (tracker[entityName]) {
-            delete tracker[entityName];
-            
-            // Save updated tracker to config card's description
-            let description = '// Entity tracking data\n';
-            for (const [name, data] of Object.entries(tracker)) {
-                description += `# ${name}\n`;
-                description += `turns: ${data.uniqueTurns.join(',')}\n`;
-                description += `tool: ${data.lastTool}\n`;
-            }
-            
-            Utilities.storyCard.update('[SANE_CONFIG] Entity Tracker', {
-                description: description
-            });
-            
-            if (debug) console.log(`${MODULE_NAME}: Removed ${entityName} from entity tracker`);
-        }
-    }
-    
-    function shouldTriggerGeneration(entityName) {
-        const config = loadEntityTrackerConfig();
-        if (!config.autoGenerate) return false;
-        
-        // Normalize entity name
-        entityName = entityName.toLowerCase();
-        
-        // Check if any existing character has this as a trigger_name
-        const allCharacters = loadAll('Character');
-        for (const charName in allCharacters) {
-            const character = allCharacters[charName];
-            if (character.info && character.info.trigger_name) {
-                const triggers = Array.isArray(character.info.trigger_name) 
-                    ? character.info.trigger_name 
-                    : [character.info.trigger_name];
-                
-                const normalizedTriggers = triggers.map(t => String(t).toLowerCase());
-                if (normalizedTriggers.includes(entityName)) {
-                    if (debug) console.log(`${MODULE_NAME}: Not triggering generation - ${entityName} already exists as trigger_name for: ${character.name}`);
-                    removeFromTracker(entityName);
-                    return false;
+
+                // If shifted, remove the oldest entry from our data
+                if (shifted) {
+                    data.entries.shift();
                 }
-            }
-        }
-        
-        // Load tracker from config card's description
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
-        if (!configCard || !configCard.description) return false;
-        
-        let tracker = {};
-        try {
-            // Parse tracker data from description
-            const lines = configCard.description.split('\n');
-            let currentEntity = null;
-            
-            for (const line of lines) {
-                if (line.startsWith('# ')) {
-                    currentEntity = line.substring(2).trim();
-                    tracker[currentEntity] = { count: 0, uniqueTurns: [], lastTool: '' };
-                } else if (currentEntity && line.includes(':')) {
-                    const [key, value] = line.split(':').map(s => s.trim());
-                    if (key === 'turns') {
-                        tracker[currentEntity].uniqueTurns = value ? value.split(',').map(Number) : [];
-                        tracker[currentEntity].count = tracker[currentEntity].uniqueTurns.length;
-                    } else if (key === 'tool') {
-                        tracker[currentEntity].lastTool = value || '';
+
+                // Track new entries but DON'T execute tools (assume already executed)
+                // Only truly new entries at the very end should execute
+
+                for (let i = data.entries.length; i < historyLength; i++) {
+                    const historyEntry = history[i];
+                    if (!historyEntry || !historyEntry.text) {
+                        data.entries[i] = null;
+                        continue;
+                    }
+
+                    const hash = RewindSystem.quickHash(historyEntry.text);
+
+                    // Check if this is the LAST entry in the history (genuinely new)
+                    // All other entries are assumed to be restored/already executed
+                    if (i === historyLength - 1 && i > oldPosition) {
+                        // This is the newest entry and it's beyond our last position - execute tools
+                        if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Processing genuinely new entry at position ${i}`);
+                        const tools = RewindSystem.extractAndExecuteTools(historyEntry.text);
+                        data.entries[i] = {
+                            h: hash,
+                            t: tools,
+                            rd: {} // Revert data would be populated if we captured it
+                        };
+
+                    } else {
+                        // This is either:
+                        // 1. A restored entry from history (middle entries)
+                        // 2. Not beyond our last known position
+                        // Just track hash and tools, don't execute
+                        if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Tracking entry at position ${i} without execution (restored or old)`);
+
+                        // Extract tools without executing them (for tracking purposes)
+                        const toolMatches = [];
+                        const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/g;
+                        let match;
+                        while ((match = TOOL_PATTERN.exec(historyEntry.text)) !== null) {
+                            const toolName = match[1];
+                            const paramString = match[2];
+                            const params = paramString ? paramString.split(',').map(p => p.trim()) : [];
+                            toolMatches.push([toolName, params, {}]);
+                        }
+
+                        data.entries[i] = {
+                            h: hash,
+                            t: toolMatches  // Tools tracked but not executed
+                        };
                     }
                 }
-            }
-        } catch (e) {
-            return false;
-        }
-        
-        const entityData = tracker[entityName];
-        if (!entityData) return false;
-        
-        // Check if already in queue or being generated
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-        let queue = [];
-        if (queueCard) {
-            try {
-                queue = JSON.parse(queueCard.entry || '[]');
-            } catch (e) {
-                queue = [];
-            }
-        }
-        
-        if (queue.includes(entityName) || currentEntityGeneration === entityName) {
-            return false;
-        }
-        
-        // Check that we have enough unique turns (not total references)
-        const hasEnoughUniqueTurns = entityData.uniqueTurns && entityData.uniqueTurns.length >= config.threshold;
-        
-        return hasEnoughUniqueTurns;
-    }
-    
-    function addToEntityQueue(entityName) {
-        // Normalize entity name
-        entityName = entityName.toLowerCase();
-        
-        // Get entity tracker data to see what tool referenced this entity
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
-        let lastTool = null;
-        if (configCard && configCard.description) {
-            try {
-                const lines = configCard.description.split('\n');
-                let currentEntity = null;
-                for (const line of lines) {
-                    if (line.startsWith('# ')) {
-                        currentEntity = line.substring(2).trim();
-                    } else if (currentEntity === entityName && line.startsWith('tool:')) {
-                        lastTool = line.substring(5).trim();
+
+                // Verify existing entries haven't been edited
+                const checkLength = Math.min(data.entries.length, historyLength);
+                let editedPosition = -1;
+
+                // First, find if any entry was edited
+                for (let i = 0; i < checkLength; i++) {
+                    if (!history[i] || !data.entries[i]) continue;
+
+                    const historyHash = RewindSystem.quickHash(history[i].text);
+
+                    if (data.entries[i].h !== historyHash) {
+                        editedPosition = i;
+                        if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: History entry ${i} was edited - will revert from current back to ${i}, then replay`);
                         break;
                     }
                 }
-            } catch (e) {
-                // Continue without tool context
-            }
-        }
-        
-        // Instead of queuing, directly trigger GenerationWizard if available
-        if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startGeneration) {
-            if (debug) console.log(`${MODULE_NAME}: Triggering GenerationWizard for entity: ${entityName}`);
-            // Start NPC generation with just the name
-            GenerationWizard.startGeneration('NPC', { name: entityName });
-            return;
-        }
-        
-        // Fallback to queue system if GenerationWizard not available
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-        let queue = [];
-        if (queueCard) {
-            try {
-                queue = JSON.parse(queueCard.entry || '[]');
-            } catch (e) {
-                queue = [];
-            }
-        }
-        
-        // Avoid duplicates
-        if (!queue.includes(entityName)) {
-            queue.push(entityName);
-            
-            // Save queue to Story Card
-            Utilities.storyCard.update('[SANE_CONFIG] Entity Queue', {
-                entry: JSON.stringify(queue, null, 2),
-                type: 'data'
-            });
-            
-            if (debug) console.log(`${MODULE_NAME}: Added ${entityName} to entity generation queue`);
-        }
-    }
-    
-    function queuePendingEntities() {
-        // Load queue from Story Card
-        const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-        if (!queueCard) return false;
-        
-        let queue = [];
-        try {
-            queue = JSON.parse(queueCard.entry || '[]');
-        } catch (e) {
-            return false;
-        }
-        
-        // If already generating something, wait
-        if (currentEntityGeneration) {
-            if (debug) console.log(`${MODULE_NAME}: Already generating ${currentEntityGeneration}, waiting...`);
-            return false;
-        }
-        
-        // If queue is empty, nothing to do
-        if (queue.length === 0) {
-            return false;
-        }
-        
-        // Pop the first entity from queue
-        const nextEntity = queue.shift();
-        
-        // Save updated queue
-        Utilities.storyCard.update('[SANE_CONFIG] Entity Queue', {
-            entry: JSON.stringify(queue, null, 2),
-            type: 'data'
-        });
-        
-        // Mark as currently generating
-        currentEntityGeneration = nextEntity;
-        
-        if (debug) console.log(`${MODULE_NAME}: Starting generation for ${nextEntity}`);
-        
-        // Trigger GenerationWizard if available
-        if (typeof GenerationWizard !== 'undefined' && GenerationWizard.startEntityGeneration) {
-            // Start the classification query process
-            const classificationData = {
-                name: nextEntity,
-                stage: 'classification'
-            };
-            GenerationWizard.startEntityGeneration(classificationData);
-            return true;
-        } else {
-            if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available for entity generation`);
-            // Clear the current generation flag since we can't proceed
-            currentEntityGeneration = null;
-            return false;
-        }
-    }
-    
-    function completeLocationGeneration(locationName, metadata) {
-        // Location generation complete
-        if (debug) console.log(`${MODULE_NAME}: Location generation complete for ${locationName}`);
-        
-        // Could add any location-specific completion logic here
-        // For now, just log completion
-        return true;
-    }
-    
-    function completeEntityGeneration(entityName) {
-        // Normalize entity name
-        entityName = entityName.toLowerCase();
-        
-        // Clear from tracker in config card's description
-        const configCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
-        if (configCard && configCard.description) {
-            try {
-                // Parse tracker data from description
-                const lines = configCard.description.split('\n');
-                let tracker = {};
-                let currentEntity = null;
-                
-                for (const line of lines) {
-                    if (line.startsWith('# ')) {
-                        currentEntity = line.substring(2).trim();
-                        if (currentEntity !== entityName) {
-                            tracker[currentEntity] = { uniqueTurns: [], lastTool: '' };
-                        }
-                    } else if (currentEntity && currentEntity !== entityName && line.includes(':')) {
-                        const [key, value] = line.split(':').map(s => s.trim());
-                        if (key === 'turns') {
-                            tracker[currentEntity].uniqueTurns = value ? value.split(',').map(Number) : [];
-                        } else if (key === 'tool') {
-                            tracker[currentEntity].lastTool = value || '';
+
+                // If an edit was found, revert everything from current position back to AND INCLUDING the edit
+                if (editedPosition >= 0) {
+                    // Step 1: Revert ALL tools from current position back to AND INCLUDING edited position (reverse order)
+                    for (let i = checkLength - 1; i >= editedPosition; i--) {
+                        if (!data.entries[i]) continue;
+
+                        const oldTools = data.entries[i].t || [];
+                        // Revert tools in reverse order
+                        RewindSystem.revertTools(oldTools);
+                        if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Reverted tools at position ${i}`);
+                    }
+
+                    // Step 2: Re-execute ALL tools from edited position to current position (forward order)
+                    for (let i = editedPosition; i < checkLength; i++) {
+                        if (!history[i]) continue;
+
+                        const historyHash = RewindSystem.quickHash(history[i].text);
+                        const tools = RewindSystem.extractAndExecuteTools(history[i].text);
+
+                        // Update the stored entry with new hash and tool data
+                        data.entries[i] = {
+                            h: historyHash,
+                            t: tools
+                        };
+
+                        if (MODULE_CONFIG.debug && tools.length > 0) {
+                            console.log(`${MODULE_NAME}: Re-executed entry ${i} with ${tools.length} tools`);
                         }
                     }
                 }
-                
-                // Rebuild description without the completed entity
-                let description = '// Entity tracking data\n';
-                for (const [name, data] of Object.entries(tracker)) {
-                    description += `# ${name}\n`;
-                    description += `turns: ${data.uniqueTurns.join(',')}\n`;
-                    description += `tool: ${data.lastTool}\n`;
-                }
-                
-                Utilities.storyCard.update('[SANE_CONFIG] Entity Tracker', {
-                    description: description
-                });
-            } catch (e) {
-                // Ignore parse errors
+
+                // Update position
+                data.position = historyLength - 1;
+                RewindSystem.saveStorage(data);
             }
-        }
-        
-        // Clear current generation flag
-        currentEntityGeneration = null;
-        
-        if (debug) console.log(`${MODULE_NAME}: Completed generation for ${entityName}`);
-        
-        // Process next in queue if any
-        queuePendingEntities();
-    }
-    
-    // ==========================
-    // Process Tools in Text
-    // ==========================
-    function processTools(text) {
-        if (!text) return text;
-        
-        let modifiedText = text;
-        let toolsToRemove = [];
-        let toolsToModify = [];
-        let executedTools = [];  // Track for RewindSystem
-        
-        // Only load characters if there are actually tools to process
-        let charactersLoaded = false;
-        
-        // First pass: find and execute all tools, track malformed ones and ones to modify
-        let match;
-        TOOL_PATTERN.lastIndex = 0;
-        
-        while ((match = TOOL_PATTERN.exec(text)) !== null) {
-            const fullMatch = match[0];
-            const toolName = match[1];
-            const paramString = match[2];
-            const matchIndex = match.index;
-            
-            // Skip getter functions (they're not tools)
-            if (toolName.startsWith('get_')) {
-                continue;
-            }
-            
-            // Tool found - will log execution result below
-            
-            // Parse parameters
-            const params = parseParameters(paramString);
-            
-            // Load characters on first tool that needs them
-            if (!charactersLoaded) {
-                // Set cache for all tools to use
-                // Load all characters into entity cache
-                try {
-                    const allChars = loadAll('Character');
-                    for (const [name, char] of Object.entries(allChars || {})) {
-                        entityCache[`Character.${name}`] = char;
-                    }
-                } catch(e) {
-                    // Fall back to GameState.loadAll if available
-                    if (GameState && GameState.loadAll) {
-                        const allChars = GameState.loadAll('Character');
-                        for (const [name, char] of Object.entries(allChars || {})) {
-                            entityCache[`Character.${name}`] = char;
-                        }
-                    } else {
-                        if (debug) console.log(`${MODULE_NAME}: Unable to load characters: ${e}`);
-                    }
+        };
+
+        // Tools for manual rewind operations
+        const tools = {
+            rewind_to_position: function(params) {
+                const [position] = params;
+
+                if (position === undefined) return 'malformed';
+
+                const targetPos = parseInt(position);
+                if (isNaN(targetPos) || targetPos < 0 || targetPos >= RewindSystem.MAX_HISTORY) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Invalid position: ${position}`);
+                    return 'malformed';
                 }
-                charactersLoaded = true;
-            }
-            
-            // Capture revert data BEFORE executing the tool
-            const revertData = captureRevertData(toolName.toLowerCase(), params, getCachedEntitiesOfType('Character'));
-            
-            let result = processToolCall(toolName, params, getCachedEntitiesOfType('Character'));
-            
-            // Log tool result
-            if (debug) {
-                const toolCall = `${toolName}(${params.join(',')})`;
-                if (result === 'executed') {
-                    console.log(`${MODULE_NAME}: Tool EXECUTED: ${toolCall}`);
-                } else if (result === 'malformed') {
-                    console.log(`${MODULE_NAME}: Tool MALFORMED: ${toolCall}`);
-                } else if (result === 'unknown') {
-                    console.log(`${MODULE_NAME}: Tool UNKNOWN: ${toolCall}`);
+
+                if (RewindSystem.rewind(targetPos)) {
+                    return 'executed';
+                } else {
+                    return 'malformed';
                 }
-            }
-            
-            // Track executed tools for RewindSystem
-            if (result === 'executed') {
-                executedTools.push({
-                    tool: toolName.toLowerCase(),
-                    params: params,
-                    executed: true,
-                    revertData: revertData
-                });
-            }
-            
-            // Check if this is accept_quest and needs parameter normalization
-            if (toolName === 'accept_quest' && result === 'executed') {
-                // Normalize ALL parameters in the visible text to teach the LLM proper format
-                const normalizedParams = [...params];
-                
-                // Normalize quest name (param 1)
-                if (normalizedParams[1]) {
-                    normalizedParams[1] = String(normalizedParams[1]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+            },
+
+            rewind_steps: function(params) {
+                const [steps] = params;
+
+                if (steps === undefined) return 'malformed';
+
+                const numSteps = parseInt(steps);
+                if (isNaN(numSteps) || numSteps <= 0) {
+                    if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Invalid steps: ${steps}`);
+                    return 'malformed';
                 }
-                
-                // Normalize quest giver (param 2)
-                if (normalizedParams[2]) {
-                    normalizedParams[2] = String(normalizedParams[2]).toLowerCase().replace(/\s+/g, '_').replace(/[^a-z0-9_]/g, '');
+
+                const data = RewindSystem.getStorage();
+                const targetPos = Math.max(0, data.position - numSteps);
+
+                if (RewindSystem.rewind(targetPos)) {
+                    return 'executed';
+                } else {
+                    return 'malformed';
                 }
-                
-                // Normalize quest type (param 3)
-                if (normalizedParams[3]) {
-                    let questType = String(normalizedParams[3]).toLowerCase();
-                    // Remove _quest suffix if present
-                    if (questType.endsWith('_quest')) {
-                        questType = questType.substring(0, questType.length - 6);
-                    }
-                    normalizedParams[3] = questType;
-                }
-                
-                // Build the normalized tool string
-                const normalizedTool = `${toolName}(${normalizedParams.join(', ')})`;
-                
-                if (normalizedTool !== fullMatch) {
-                    toolsToModify.push({
-                        match: fullMatch,
-                        replacement: normalizedTool,
-                        index: matchIndex,
-                        length: fullMatch.length
-                    });
-                    if (debug) console.log(`${MODULE_NAME}: Normalizing: ${fullMatch} -> ${normalizedTool}`);
-                }
-            }
-            
-            // Only remove if malformed or unknown tool
-            if (result === 'malformed' || result === 'unknown') {
-                toolsToRemove.push({
-                    match: fullMatch,
-                    index: matchIndex,
-                    length: fullMatch.length,
-                    reason: result
-                });
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Marking for removal (${result}): ${fullMatch}`);
-                }
-            }
-        }
-        
-        // Apply modifications and removals from end to beginning
-        const allChanges = [...toolsToModify, ...toolsToRemove].sort((a, b) => b.index - a.index);
-        
-        for (const change of allChanges) {
-            const before = modifiedText.substring(0, change.index);
-            const after = modifiedText.substring(change.index + change.length);
-            
-            if (change.replacement) {
-                // Modification (normalize parameters)
-                modifiedText = before + change.replacement + after;
-            } else {
-                // Removal (malformed/unknown)
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Removed ${change.reason} tool: ${change.match}`);
-                }
-                let cleanedBefore = before;
-                let cleanedAfter = after;
-                
-                // Handle spacing issues
-                if (before.endsWith(' ') && after.startsWith(' ')) {
-                    cleanedAfter = after.substring(1);
-                } else if (before.endsWith(' ') && after.startsWith('.')) {
-                    cleanedBefore = before.trimEnd();
-                }
-                
-                modifiedText = cleanedBefore + cleanedAfter;
-            }
-        }
-        
-        // Final cleanup: fix any double spaces or weird punctuation spacing
-        modifiedText = modifiedText
-            .replace(/  +/g, ' ')           // Multiple spaces to single space
-            .replace(/ \./g, '.')            // Space before period
-            .replace(/ ,/g, ',')             // Space before comma
-            .replace(/ !/g, '!')             // Space before exclamation
-            .replace(/ \?/g, '?')            // Space before question mark
-            .replace(/\( /g, '(')            // Space after opening paren
-            .replace(/ \)/g, ')')            // Space before closing paren
-            .replace(/\n\n\n+/g, '\n\n');   // Multiple newlines to double newline
-        
-        // Return both the modified text and executed tools
-        // We'll record them in the main output hook
-        return { modifiedText, executedTools };
-    }
-    
-    // Capture revert data for specific tools
-    function captureRevertData(toolName, params, characters) {
-        if (!characters) characters = loadAll('Character');
-        const revertData = {};
-        
-        switch(toolName) {
-            case 'update_location':
-                const char = characters[String(params[0]).toLowerCase()];
-                if (char && char.info) {
-                    revertData.oldLocation = char.info.location;
-                }
-                break;
-                
-            case 'add_item':
-                // Store current quantity so we can revert to it
-                const addChar = characters[String(params[0]).toLowerCase()];
-                if (addChar && addChar.inventory) {
-                    const itemName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                    const currentItem = addChar.inventory[itemName];
-                    revertData.oldQuantity = currentItem ? currentItem.quantity : 0;
-                }
-                break;
-                
-            case 'remove_item':
-                // Store current quantity so we can restore it
-                const removeChar = characters[String(params[0]).toLowerCase()];
-                if (removeChar && removeChar.inventory) {
-                    const itemName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                    const currentItem = removeChar.inventory[itemName];
-                    revertData.oldQuantity = currentItem ? currentItem.quantity : 0;
-                }
-                break;
-                
-            case 'transfer_item':
-                // Store current quantities for both characters
-                const fromChar = characters[String(params[0]).toLowerCase()];
-                const toChar = characters[String(params[1]).toLowerCase()];
-                const transferItem = String(params[2]).toLowerCase().replace(/\s+/g, '_');
-                
-                if (fromChar && fromChar.inventory) {
-                    const fromItem = fromChar.inventory[transferItem];
-                    revertData.fromOldQuantity = fromItem ? fromItem.quantity : 0;
-                }
-                if (toChar && toChar.inventory) {
-                    const toItem = toChar.inventory[transferItem];
-                    revertData.toOldQuantity = toItem ? toItem.quantity : 0;
-                }
-                break;
-                
-            case 'deal_damage':
-                const target = characters[String(params[1]).toLowerCase()];
-                if (target && target.stats && target.stats.hp) {
-                    revertData.oldHp = target.stats.hp.current;
-                }
-                break;
-                
-            case 'update_relationship':
-                const char1 = characters[String(params[0]).toLowerCase()];
-                if (char1 && char1.relationships) {
-                    const char2Name = String(params[1]).toLowerCase();
-                    revertData.oldValue = char1.relationships[char2Name] || 0;
-                }
-                break;
-                
-            case 'add_levelxp':
-                const xpChar = characters[String(params[0]).toLowerCase()];
-                if (xpChar && xpChar.stats && xpChar.stats.level) {
-                    revertData.oldLevel = xpChar.stats.level.value;
-                    revertData.oldXp = xpChar.stats.level.xp ? xpChar.stats.level.xp.current : 0;
-                }
-                break;
-                
-            case 'add_skillxp':
-                const skillChar = characters[String(params[0]).toLowerCase()];
-                const skillName = String(params[1]).toLowerCase().replace(/\s+/g, '_');
-                if (skillChar && skillChar.skills && skillChar.skills[skillName]) {
-                    const skill = skillChar.skills[skillName];
-                    revertData.oldLevel = skill.level || 1;
-                    revertData.oldXp = skill.xp ? skill.xp.current : 0;
-                }
-                break;
-                
-            default:
-                // Check if this is an update_[stat] tool
-                if (toolName.startsWith('update_')) {
-                    const statName = toolName.substring(7); // Remove 'update_'
-                    const statChar = characters[String(params[0]).toLowerCase()];
-                    if (statChar && statChar.attributes && statChar.attributes[statName]) {
-                        // Store old attribute value
-                        revertData.oldValue = statChar.attributes[statName].value;
-                        revertData.statName = statName;
-                    }
-                }
-                break;
-        }
-        
-        return revertData;
-    }
-    
-    function processToolCall(toolName, params, characters) {
-        // Normalize tool name to lowercase for lookup
-        const normalizedToolName = toolName.toLowerCase();
-        
-        // Characters are already in entityCache, set by processTools
-        
-        // Check if it's a known tool
-        if (toolProcessors[normalizedToolName]) {
-            try {
-                // Execute the tool (it will use the cached characters)
-                const result = toolProcessors[normalizedToolName](...params);
-                return result;
-            } catch (e) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Error in ${normalizedToolName}: ${e.message}`);
-                }
-                logError(e, `Tool execution: ${normalizedToolName}(${params.join(', ')})`);
-                return 'malformed';
-            }
-        }
-        
-        // Check for dynamic core stat tools (update_hp, update_mp, etc)
-        if (normalizedToolName.startsWith('update_')) {
-            // Just try to process it as a core stat tool
-            // The function will handle validation
-            if (processCoreStatTool(normalizedToolName, params)) {
+            },
+
+            get_rewind_position: function(params) {
+                const data = RewindSystem.getStorage();
+                console.log(`${MODULE_NAME}: Current rewind position: ${data.position}/${data.entries.length - 1}`);
                 return 'executed';
             }
+        };
+
+        // Register all tools
+        Object.entries(tools).forEach(([name, fn]) => {
+            ModuleAPI.registerTool(name, fn);
+        });
+
+        // Export RewindSystem for use by other modules
+        ModuleAPI.RewindSystem = RewindSystem;
+        ModuleAPI.registerAPI('RewindSystem', RewindSystem);
+
+        // The main output hook will handle recording actions with executed tools
+        // Position tracking happens in context hook via handleContext, not in input
+
+    }
+    //#endregion RewindModule
+
+    // ======== END OF MODULES ========
+
+    //#endregion SECTION 5
+
+    // ========================================
+    // SECTION 6: TOOL PROCESSING
+    // ========================================
+    //#region SECTION 6
+
+    function processTool(toolName, params, source = 'unknown') {
+        // Normalize tool name (snake_case)
+        const normalizedName = toolName.toLowerCase().replace(/\s+/g, '_');
+
+        // Check registered tools first
+        const tool = tools[normalizedName] || runtimeTools[normalizedName];
+        if (!tool) {
+            // Check dynamic/generated tools
+            if (normalizedName.startsWith('get_')) {
+                // Dynamic getter tool for debugging
+                const path = normalizedName.substring(4).replace(/_/g, '.');
+                const value = get(path);
+                if (value !== undefined) {
+                    debugLog('tool', `Dynamic getter ${normalizedName}: ${JSON.stringify(value)}`);
+                    return 'executed';
+                }
+            }
+
+            // Track unknown tools from AI output
+            if (source === 'output' && ModuleAPI.trackUnknownTool) {
+                ModuleAPI.trackUnknownTool(normalizedName);
+            }
+
+            return 'unknown';
         }
-        
-        // Check runtime tools
-        if (runtimeTools[normalizedToolName]) {
+
+        try {
+            // Track entity references in tool calls (first param is typically entity name)
+            if (params && params.length > 0 && typeof params[0] === 'string') {
+                const entityName = params[0];
+                const normalized = normalizeEntityId(entityName);
+
+                // Check if entity exists, if not track it
+                if (!dataCache[normalized] && !loadEntityFromCache(normalized)) {
+                    if (ModuleAPI.trackUnknownEntity) {
+                        ModuleAPI.trackUnknownEntity(entityName, normalizedName, history.length);
+                    }
+                }
+            }
+
+            // Call tool with params array
+            const result = tool(params);
+
+            return result;
+        } catch (e) {
+            debugLogStore.errors.push({
+                error: e.message,
+                context: `processTool:${normalizedName}`,
+                params: params
+            });
+            if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Error in tool ${normalizedName}: ${e.message}`);
+            return 'malformed';
+        }
+    }
+
+    function parseToolCall(text) {
+        // Use the already-defined TOOL_PATTERN from top of file
+        const tools = [];
+        const matches = [...text.matchAll(TOOL_PATTERN)];
+        for (const match of matches) {
+            const toolName = match[1];
+            const paramString = match[2] || '';
+
+            // Parse parameters - split by comma and trim
+            const params = paramString
+                .split(',')
+                .map(p => p.trim())
+                .filter(p => p.length > 0);
+
+            tools.push({ name: toolName, params, match: match[0] });
+        }
+
+        return tools;
+    }
+
+    //#endregion SECTION 6
+
+    // ========================================
+    // SECTION 7: COMMAND PROCESSING
+    // ========================================
+    //#region SECTION 7
+
+    // Built-in command handlers
+    const builtInCommands = {
+        // Debug commands
+        debug: function(args) {
+            return getDebugLog();
+        },
+
+        debug_log: function(args) {
+            return getDebugLog();
+        },
+
+        entities: function(args) {
+            const entities = [];
+            for (const [key, value] of Object.entries(dataCache)) {
+                if (value && value.id && !key.startsWith('schema.') && !key.startsWith('Library.')) {
+                    entities.push(`${value.id} (${value.GameplayTags?.join(', ') || 'no tags'})`);
+                }
+            }
+            return `Loaded entities (${entities.length}):\n${entities.join('\n')}`;
+        },
+
+        // Generation Wizard commands
+        gw_npc: function(args) {
+            // Join args to get the full name if multiple words
+            const fullName = args.length > 0 ? args.join(' ') : undefined;
+            // Use the registered tool
+            const result = processTool('gw_npc', fullName ? [fullName] : []);
+            if (result === 'executed') {
+                const name = fullName || `NPC_${Date.now()}`;
+                return `Queued NPC generation for: ${name}`;
+            }
+            return 'Failed to queue NPC generation';
+        },
+
+        gw_location: function(args) {
+            // Join args to get the full name if multiple words
+            const fullName = args.length > 0 ? args.join(' ') : undefined;
+            // Use the registered tool
+            const result = processTool('gw_location', fullName ? [fullName] : []);
+            if (result === 'executed') {
+                const name = fullName || `Location_${Date.now()}`;
+                return `Queued location generation for: ${name}`;
+            }
+            return 'Failed to queue location generation';
+        },
+
+        gw_quest: function(args) {
+            // Join args to get the full name if multiple words
+            const fullName = args.length > 0 ? args.join(' ') : undefined;
+            // Use the registered tool
+            const result = processTool('gw_quest', fullName ? [fullName] : []);
+            if (result === 'executed') {
+                const name = fullName || `Quest_${Date.now()}`;
+                return `Queued quest generation for: ${name}`;
+            }
+            return 'Failed to queue quest generation';
+        },
+
+        gw_item: function(args) {
+            // Note: No built-in Item blueprint, would need to be added
+            const name = args.join(' ') || `Item_${Date.now()}`;
+            return 'Item generation not yet implemented';
+        },
+
+        gw_abort: function(args) {
+            // Find all queued entities and abort them
+            let aborted = 0;
+            for (const [key, entity] of Object.entries(dataCache)) {
+                if (entity && entity.generationwizard &&
+                    (entity.generationwizard.state === 'queued' || entity.generationwizard.state === 'collecting')) {
+                    entity.generationwizard.state = 'aborted';
+                    ModuleAPI.save(entity.id, entity);
+                    aborted++;
+                }
+            }
+            return `Aborted ${aborted} generation(s)`;
+        },
+
+        gw_status: function(args) {
+            const status = {
+                queued: [],
+                collecting: [],
+                complete: []
+            };
+
+            for (const [key, entity] of Object.entries(dataCache)) {
+                if (entity && entity.generationwizard) {
+                    const state = entity.generationwizard.state;
+                    if (status[state]) {
+                        status[state].push(entity.id);
+                    }
+                }
+            }
+
+            return `Generation Status:\n` +
+                   `Queued: ${status.queued.join(', ') || 'none'}\n` +
+                   `Collecting: ${status.collecting.join(', ') || 'none'}\n` +
+                   `Complete: ${status.complete.join(', ') || 'none'}`;
+        },
+
+
+    };
+
+    function processCommand(command, args = []) {
+        // Check built-in commands first
+        if (builtInCommands[command]) {
             try {
-                const result = runtimeTools[normalizedToolName](...params);
-                return result;
+                const result = builtInCommands[command](args);
+                return { handled: true, output: result };
             } catch (e) {
-                if (debug) {
-                    console.log(`${MODULE_NAME}: Error in runtime tool ${normalizedToolName}: ${e.message}`);
-                }
-                return 'malformed';
+                debugLogStore.errors.push({ error: e.message, context: `command:${command}` });
+                return { handled: true, output: `Error executing /${command}: ${e.message}` };
             }
         }
-        
-        // Unknown tool
-        if (debug) console.log(`${MODULE_NAME}: Unknown tool: ${toolName}`);
-        return 'unknown';
+
+        // Check runtime-loaded commands
+        if (inputCommands[command]) {
+            try {
+                const result = inputCommands[command](args);
+                return { handled: true, output: result };
+            } catch (e) {
+                debugLogStore.errors.push({ error: e.message, context: `runtime command:${command}` });
+                return { handled: true, output: `Error executing /${command}: ${e.message}` };
+            }
+        }
+
+        // Command not found
+        return { handled: false, output: '' };
     }
-    
-    function processCoreStatTool(toolName, params) {
-        const characterName = String(params[0]).toLowerCase();
-        
-        // Check for update_max_[stat] pattern
-        if (toolName.startsWith('update_max_')) {
-            const statName = toolName.substring(11).toLowerCase();
-            
-            // Load the character
-            const character = load('Character', characterName);
-            if (!character) {
-                if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-                return false;
-            }
-            
-            const newMax = parseInt(params[1]);
-            if (isNaN(newMax)) {
-                if (debug) console.log(`${MODULE_NAME}: Invalid max value: ${params[1]}`);
-                return false;
-            }
-            
-            // Update max value using component paths only
-            if (!character.stats || !character.stats[statName] || typeof character.stats[statName] !== 'object') {
-                if (debug) console.log(`${MODULE_NAME}: Stat ${statName} not found in character.stats component`);
-                return false;
-            }
-            
-            character.stats[statName].max = newMax;
-            if (character.stats[statName].current > newMax) {
-                character.stats[statName].current = newMax;
-            }
-            
-            save('Character', character);
-            if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s max ${statName} to ${newMax}`);
-            return true;
-        }
-        
-        // Check for update_[stat] pattern (current value)
-        const statName = toolName.substring(7).toLowerCase();
-        
-        // Load the character
-        const character = load('Character', characterName);
-        if (!character) {
-            if (debug) console.log(`${MODULE_NAME}: Character ${characterName} not found`);
-            return false;
-        }
-        
-        const current = parseInt(params[1]);
-        if (isNaN(current)) {
-            if (debug) console.log(`${MODULE_NAME}: Invalid value for ${statName}: ${params[1]}`);
-            return false;
-        }
-        
-        // Update current value using component paths
-        // First check stats component
-        if (character.stats && character.stats[statName]) {
-            if (typeof character.stats[statName] === 'object') {
-                character.stats[statName].current = current;
+
+    //#endregion SECTION 7
+
+    // ========================================
+    // SECTION 8: HOOK PROCESSING
+    // ========================================
+    //#region SECTION 8
+
+    function processInputHook(text) {
+        let modifiedText = text;
+
+        // Apply input modifier
+        if (inputModifier) {
+            try {
+                modifiedText = inputModifier(modifiedText);
+            } catch (e) {
+                debugLog('input', `Input modifier error: ${e.message}`);
             }
         }
-        // Fallback to legacy paths
-        else if (character[statName] && typeof character[statName] === 'object') {
-            character[statName].current = current;
+
+        // Parse and execute commands using the defined COMMAND_PATTERN
+        const commandMatches = [...modifiedText.matchAll(COMMAND_PATTERN)];
+        for (const match of commandMatches) {
+            const commandName = match[1].toLowerCase();
+            const args = match[2] ? match[2].trim().split(/\s+/) : [];
+
+            const result = processCommand(commandName, args);
+            if (result.handled) {
+                debugLog('input', `Command /${commandName} executed`);
+
+                // Some commands replace the entire input
+                if (result.output && (commandName === 'debug' || commandName === 'debug_log' ||
+                                      commandName === 'entities' || commandName === 'tracker')) {
+                    modifiedText = result.output;
+                    return modifiedText;
+                }
+
+                // Generation Wizard commands should be consumed (removed from input)
+                if (commandName.startsWith('gw_')) {
+                    modifiedText = modifiedText.replace(match[0], '').trim();
+                    if (result.output) {
+                        debugLog('command', result.output);
+                    }
+                    // Return empty if only command was present
+                    return modifiedText || ZERO_WIDTH_CHAR;
+                }
+
+                // Other commands just log their output
+                if (result.output) {
+                    debugLog('command', result.output);
+                }
+            }
         }
-        // Try coreStats for very old format
-        else if (character.coreStats && character.coreStats[statName]) {
-            character.coreStats[statName].current = current;
+
+        // Parse and handle getter syntax for debugging: get[entity.path]
+        const getterMatches = [...modifiedText.matchAll(GETTER_PATTERN)];
+        for (const match of getterMatches) {
+            const path = match[1];
+            const value = get(path);
+            debugLog('input', `get[${path}] = ${JSON.stringify(value)}`);
         }
-        else {
-            if (debug) console.log(`${MODULE_NAME}: Stat ${statName} not found on character`);
-            return false;
+
+        // Run module input hooks
+        for (const handler of hooks.input) {
+            try {
+                const result = handler(modifiedText);
+                if (result) modifiedText = result;
+            } catch (e) {
+                debugLog('input', `Module hook error: ${e.message}`);
+            }
         }
-        
-        save('Character', character);
-        if (debug) console.log(`${MODULE_NAME}: Set ${character.name}'s current ${statName} to ${current}`);
-        return true;
+
+        // Calculate hash for rewind system
+        if (ModuleAPI.RewindSystem && ModuleAPI.RewindSystem.quickHash) {
+            currentHash = ModuleAPI.RewindSystem.quickHash(modifiedText);
+        }
+
+        return modifiedText;
     }
-    
-    // ==========================
-    // Debug Helper Functions (only work when debug = true)
-    // ==========================
-    
-    // Handle debug commands directly
-    function handleDebugCommand(commandName, args) {
-        const debugCommands = [
-            // GenerationWizard tests
-            'gw_activate', 'gw_npc', 'gw_quest', 'gw_location',
-            // Status and listing commands
-            'entity_status', 'char_list', 'schema_all',
-            // System tests
-            'runtime_test', 'test_footer', 'test_info', 'test_template', 'test_inventory', 'test_all',
-            // Maintenance
-            'cleanup', 'fix_format',
-            // Debug utilities
-            'debug_log', 'debug_help'
-        ];
-        
-        // Check if it's a debug command
-        if (debugCommands.includes(commandName)) {
-            if (commandName === 'debug_help') {
-                return `\n<<<[DEBUG COMMANDS]\n${debugCommands.filter(c => c !== 'debug_help').map(c => `/${c}`).join('\n')}>>>\n`;
+
+    function processContextHook(text) {
+        let modifiedText = text;
+
+        // Remove content between HIDE_BEGINNING and HIDE_ENDING markers (including the markers)
+        // temporary fix for state.message handling
+        const hidePattern = /HIDE_BEGINNING[\s\S]*?HIDE_ENDING/g;
+        const hideMatches = modifiedText.match(hidePattern);
+        if (hideMatches && hideMatches.length > 0) {
+            modifiedText = modifiedText.replace(hidePattern, '');
+            debugLog('context', `Removed ${hideMatches.length} hidden content block(s)`);
+        }
+
+        // Check for edits/rewinds in history (MUST happen first after hidden content removal)
+        if (ModuleAPI.RewindSystem && ModuleAPI.RewindSystem.handleContext) {
+            try {
+                ModuleAPI.RewindSystem.handleContext();
+            } catch (e) {
+                debugLog('context', `RewindSystem error: ${e.message}`);
             }
-            
-            if (commandName === 'debug_log') {
-                const result = outputDebugLog();
-                return `\n<<<${result}>>>\n`;
-            }
-            
-            // GenerationWizard tests
-            if (commandName === 'gw_activate') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard('activate', null);
-                return "\n<<<GenerationWizard activated for next turn>>>\n";
-            }
-            
-            if (commandName === 'gw_npc') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                const result = GenerationWizard.startGeneration('NPC', {name: 'Debug_Test_NPC'});
-                const progressCard = Utilities.storyCard.get('[ENTITY_GEN] In Progress');
-                const isActive = GenerationWizard.isActive();
-                console.log(`[DEBUG] Started NPC generation for Debug_Test_NPC\nResult: ${result}\nActive: ${isActive}\nProgress card exists: ${progressCard ? 'yes' : 'no'}`);
-                return "\n<<<Started NPC generation for Debug_Test_NPC>>>\n";
-            }
-            
-            if (commandName === 'gw_quest') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Quest', {
-                    NAME: 'Debug_Test_Quest',
-                    QUEST_GIVER: 'Debug_NPC',
-                    QUEST_TYPE: 'side',
-                    STAGE_COUNT: 3
-                });
-                return "\n<<<Started Quest generation for Debug_Test_Quest>>>\n";
-            }
-            
-            if (commandName === 'gw_location') {
-                if (typeof GenerationWizard === 'undefined') return "<<<GenerationWizard not available>>>";
-                GenerationWizard.startGeneration('Location', null, {NAME: 'Debug_Test_Location'});
-                return "\n<<<Started Location generation for Debug_Test_Location>>>\n";
-            }
-            
-            // Status and listing commands
-            if (commandName === 'entity_status') {
-                const config = Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker');
-                const queueCard = Utilities.storyCard.get('[SANE_CONFIG] Entity Queue');
-                
-                let status = `Entity Tracker Status:\n`;
-                if (config) {
-                    const parsed = parseConfigEntry(config.entry || '');
-                    status += `- Threshold: ${parsed.threshold || 3}\n`;
-                    status += `- Auto Generate: ${parsed.auto_generate || 'true'}\n`;
-                    status += `- Blacklist: ${parsed.blacklist || 'none'}\n`;
+        }
+
+        // Replace ((trigger_name)) placeholders with displaynames
+        const triggerPattern = /\(\(([^)]+)\)\)/g;
+        let triggerReplacements = 0;
+
+        modifiedText = modifiedText.replace(triggerPattern, (match, triggerName) => {
+            // Check all loaded entities for matching trigger_name
+            for (const [key, entity] of Object.entries(dataCache)) {
+                if (entity?.info?.trigger_name === triggerName && entity?.info?.displayname) {
+                    triggerReplacements++;
+                    return entity.info.displayname;
                 }
-                
-                if (queueCard && queueCard.entry) {
-                    const lines = queueCard.entry.split('\n').filter(l => l.trim());
-                    status += `- Queue has ${lines.length} entities\n`;
-                }
-                
-                return status;
             }
-            
-            if (commandName === 'char_list') {
-                const chars = loadAll('Character');
-                const names = Object.keys(chars);
-                return `Characters (${names.length}): ${names.join(', ')}`;
-            }
-            
-            if (commandName === 'schema_all') {
-                const entities = [
-                    '[SANE_ENTITY] Character',
-                    '[SANE_ENTITY] Location', 
-                    '[SANE_ENTITY] Item',
-                    '[SANE_ENTITY] Faction',
-                    '[SANE_ENTITY] Global'
-                ];
-                
-                let result = "=== All Entity Types ===\n";
-                for (const title of entities) {
-                    const card = Utilities.storyCard.get(title);
-                    if (card) {
-                        result += `\n${title}:\n${(card.description || '').substring(0, 200)}...\n`;
+
+            // Also check entity cards that might not be in cache
+            const entityCards = Utilities.storyCard.find(c => c.title?.startsWith('[SANE:E]'), true) || [];
+            for (const card of entityCards) {
+                if (card.description) {
+                    const entityId = card.title.replace('[SANE:E] ', '');
+                    const entity = ModuleAPI.get(entityId);
+                    if (entity?.info?.trigger_name === triggerName && entity?.info?.displayname) {
+                        triggerReplacements++;
+                        return entity.info.displayname;
                     }
                 }
-                return result;
             }
-            
-            // System tests
-            if (commandName === 'runtime_test') {
-                // Test runtime variables
-                const testVar = 'debug_test_var';
-                set(`Global.${testVar}`, 'test_value_' + Date.now());
-                const value = get(`Global.${testVar}`);
-                return `Set Global.${testVar} = ${value}`;
-            }
-            
-            // Maintenance
-            if (commandName === 'cleanup') {
-                const testNames = ['Debug_Test_NPC', 'Debug_Test_Monster', 'Debug_Test_Boss', 
-                                 'Debug_Test_Item', 'Debug_Test_Location', 'Debug_Test_Quest',
-                                 'DebugFooterTest', 'QuickTest', 'TemplateTest'];
-                let removed = 0;
-                
-                for (const name of testNames) {
-                    // Try both CHARACTER and PLAYER prefixes
-                    const titles = [`[CHARACTER] ${name}`, `[PLAYER] ${name}`];
-                    for (const title of titles) {
-                        if (Utilities.storyCard.get(title)) {
-                            Utilities.storyCard.remove(title);
-                            removed++;
-                        }
-                    }
+
+            // If no replacement found, leave the placeholder as-is
+            return match;
+        });
+
+        if (triggerReplacements > 0 && debug) {
+            console.log(`SANE: Replaced ${triggerReplacements} trigger name placeholders`);
+        }
+
+        // Run pre-context hooks for greedy modules (e.g., GenerationWizard)
+        for (const handler of hooks.preContext) {
+            try {
+                const result = handler(modifiedText);
+                if (result && result.consumed) {
+                    return result.text || modifiedText;
                 }
-                
-                return `Cleanup complete. Removed ${removed} debug cards.`;
-            }
-            
-            
-            if (commandName === 'test_datastorage') {
-                let result = '=== Testing Data Storage System ===\n\n';
-                
-                // Create test character with various info fields
-                const testChar = {
-                    name: 'DataTest',
-                    info: {
-                        isPlayer: false,
-                        gender: 'Male',
-                        race: 'Human',
-                        class: 'Warrior',
-                        location: 'Test_Zone',
-                        // Test arbitrary info fields
-                        favorite_color: 'blue',
-                        secret_fear: 'spiders',
-                        battle_cry: 'For glory!',
-                        hometown: 'Village_of_Testing'
-                    },
-                    stats: {
-                        level: {
-                            value: 5,
-                            xp: { current: 2500, max: 3000 }
-                        },
-                        hp: { current: 85, max: 100 }
-                    },
-                    inventory: {
-                        iron_sword: 1,
-                        health_potion: 3
-                    }
-                };
-                
-                // Save the character
-                save('Character', testChar);
-                result += '1. Character saved with arbitrary info fields\n';
-                
-                // Check the card's DESCRIPTION field
-                const card = Utilities.storyCard.get('[CHARACTER] DataTest');
-                if (card && card.description) {
-                    result += '\n2. DESCRIPTION field contains:\n';
-                    if (card.description.includes('<== REAL DATA ==>')) {
-                        result += '   ✓ Data markers found\n';
-                        if (card.description.includes('favorite_color: blue')) {
-                            result += '   ✓ Arbitrary info field saved\n';
-                        }
-                        if (card.description.includes('secret_fear: spiders')) {
-                            result += '   ✓ Another arbitrary field saved\n';
-                        }
-                    } else {
-                        result += '   ✗ No data markers - using old format\n';
-                    }
+                if (result && result.text) {
+                    modifiedText = result.text;
                 }
-                
-                // Load the character back
-                const loaded = load('Character', 'DataTest');
-                result += '\n3. Loading character back:\n';
-                result += `   Level: ${get('Character.DataTest.stats.level')}\n`;
-                result += `   Location: ${get('Character.DataTest.info.location')}\n`;
-                result += `   Favorite Color: ${get('Character.DataTest.info.favorite_color') || 'undefined'}\n`;
-                result += `   Secret Fear: ${get('Character.DataTest.info.secret_fear') || 'undefined'}\n`;
-                result += `   Battle Cry: ${get('Character.DataTest.info.battle_cry') || 'undefined'}\n`;
-                
-                // Test setting a new arbitrary field
-                set('Character.DataTest.info.lucky_number', 7);
-                result += '\n4. Added new info field via set()\n';
-                result += `   Lucky Number: ${get('Character.DataTest.info.lucky_number')}\n`;
-                
-                // Clean up
-                Utilities.storyCard.remove('[CHARACTER] DataTest');
-                result += '\n5. Test complete - card cleaned up\n';
-                
-                return result;
+            } catch (e) {
+                debugLog('context', `Pre-context hook error: ${e.message}`);
             }
-            
-            
+        }
+
+        // Apply context modifier
+        if (contextModifier) {
+            try {
+                modifiedText = contextModifier(modifiedText);
+            } catch (e) {
+                debugLog('context', `Context modifier error: ${e.message}`);
+            }
+        }
+
+        // Run module context hooks (display building happens here)
+        for (const handler of hooks.context) {
+            try {
+                const result = handler(modifiedText);
+                if (result) modifiedText = result;
+            } catch (e) {
+                debugLog('context', `Module hook error: ${e.message}`);
+            }
+        }
+
+        // Resolve all get() calls in the context text
+        modifiedText = modifiedText.replace(/get\(([^)]+)\)/g, (match, path) => {
+            try {
+                const value = ModuleAPI.get(path.trim());
+                return value !== null && value !== undefined ? String(value) : match;
+            } catch (e) {
+                debugLog('context', `Failed to resolve get(${path}): ${e.message}`);
+                return match;  // Keep original if resolution fails
+            }
+        });
+
+        return modifiedText;
+    }
+
+    function processOutputHook(text) {
+        let modifiedText = text;
+        const executedTools = [];
+
+        // Parse and execute tools from AI output
+        const toolCalls = parseToolCall(modifiedText);
+        for (const toolCall of toolCalls) {
+            // Capture revert data BEFORE executing the tool (if RewindSystem is available)
+            let revertData = {};
+            if (ModuleAPI.RewindSystem && ModuleAPI.RewindSystem.captureRevertData) {
+                revertData = ModuleAPI.RewindSystem.captureRevertData(toolCall.name, toolCall.params);
+            }
+
+            const result = processTool(toolCall.name, toolCall.params, 'output');
+            if (result === 'executed') {
+                debugLog('output', `Tool ${toolCall.name} executed successfully`);
+                // Store in format expected by RewindSystem: [name, params, revertData]
+                executedTools.push([
+                    toolCall.name,
+                    toolCall.params,
+                    revertData
+                ]);
+            } else if (result === 'unknown') {
+                debugLog('output', `Unknown tool ${toolCall.name} tracked`);
+            }
+        }
+
+        // Apply output modifier
+        if (outputModifier) {
+            try {
+                modifiedText = outputModifier(modifiedText);
+            } catch (e) {
+                debugLog('output', `Output modifier error: ${e.message}`);
+            }
+        }
+
+        // Run module output hooks
+        for (const handler of hooks.output) {
+            try {
+                const result = handler(modifiedText);
+                if (result && result.active) {
+                    modifiedText = result.text;
+                }
+            } catch (e) {
+                debugLog('output', `Module hook error: ${e.message}`);
+            }
+        }
+
+        // Calculate hash for RewindSystem
+        if (ModuleAPI.RewindSystem && ModuleAPI.RewindSystem.quickHash) {
+            currentHash = ModuleAPI.RewindSystem.quickHash(modifiedText);
+        }
+
+        // Record action for RewindSystem with executed tools
+        if (ModuleAPI.RewindSystem && ModuleAPI.RewindSystem.recordAction && executedTools.length > 0) {
+            try {
+                ModuleAPI.RewindSystem.recordAction(text, executedTools, currentHash);
+            } catch (e) {
+                debugLog('output', `RewindSystem record error: ${e.message}`);
+            }
+        }
+
+        return modifiedText;
+    }
+
+    //#endregion SECTION 8
+
+    // ========================================
+    // SECTION 9: BLUEPRINT SYSTEM
+    // ========================================
+    //#region SECTION 9
+
+    function instantiateBlueprint(blueprintName, overrides = {}) {
+        // Load blueprint from [SANE:BP] card
+        const blueprintCard = Utilities.storyCard.get(`[SANE:BP] ${blueprintName}`);
+        if (!blueprintCard || !blueprintCard.description) {
+            debugLog('blueprint', `Blueprint '${blueprintName}' not found`);
             return null;
         }
-        
-        return null;
-    }
-    
-    
-    // ==========================
-    // Hook Processing
-    // ==========================
 
-    // Auto-initialize runtime cards on first run
-    
-    // Auto-initialize entity tracker cards
-    if (!Utilities.storyCard.get('[SANE_CONFIG] Entity Tracker')) {
-        createEntityTrackerCards();
-    }
+        let blueprint;
+        try {
+            blueprint = JSON.parse(blueprintCard.description);
+        } catch (e) {
+            debugLogStore.errors.push({ error: e.message, context: `loadBlueprint:${blueprintName}` });
+            return null;
+        }
 
-    // Test dynamic resolution functionality
-    
-    // Initialize SANE schemas if they don't exist
-    function createSANESchemas() {
-        // Create new SANE_ENTITY cards
-        if (!Utilities.storyCard.get('[SANE_ENTITY] Character')) {
-            Utilities.storyCard.add({
-                title: '[SANE_ENTITY] Character',
-                description: JSON.stringify({
-                    components: ['info', 'stats', 'attributes', 'skills', 'inventory', 'relationships'],
-                    prefixes: ['CHARACTER', 'PLAYER'],
-                    dataOnly: false
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_ENTITY] Character');
-        }
-    }
-    
-    // Initialize component definitions using new SANE_COMP cards
-    function createComponentSchemas() {
-        // Info component
-        if (!Utilities.storyCard.get('[SANE_COMP] info')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] info',
-                description: JSON.stringify({
-                    fields: {
-                        gender: "string",
-                        race: "string", 
-                        class: "string",
-                        location: "reference:Location",
-                        faction: "reference:Faction",
-                        appearance: "string",
-                        personality: "string",
-                        background: "string"
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] info');
-        }
-        
-        // Stats component with progression formulas
-        if (!Utilities.storyCard.get('[SANE_COMP] stats')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] stats',
-                description: JSON.stringify({
-                    defaults: {
-                        level: {
-                            value: 1,
-                            xp: { current: 0, max: 500 }
-                        },
-                        hp: { current: 100, max: 100 }
-                    },
-                    level_progression: {
-                        xp_formula: "level * (level - 1) * 500",
-                        xp_overrides: {
-                            "1": 500,
-                            "2": 1000
-                        }
-                    },
-                    hp_progression: {
-                        base: 100,
-                        per_level: 20
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] stats with progression formulas');
-        }
-        
-        // Attributes component with master attributes
-        if (!Utilities.storyCard.get('[SANE_COMP] attributes')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] attributes',
-                description: JSON.stringify({
-                    defaults: {
-                        "VITALITY": { "value": 10 },
-                        "STRENGTH": { "value": 10 },
-                        "DEXTERITY": { "value": 10 },
-                        "AGILITY": { "value": 10 }
-                    },
-                    registry: {
-                        "VITALITY": {
-                            "description": "Determines max HP and resistance to status effects",
-                            "abbreviation": "VIT"
-                        },
-                        "STRENGTH": {
-                            "description": "Physical power for melee damage and carry capacity",
-                            "abbreviation": "STR"
-                        },
-                        "DEXTERITY": {
-                            "description": "Precision and accuracy for critical hits",
-                            "abbreviation": "DEX"
-                        },
-                        "AGILITY": {
-                            "description": "Speed and evasion capabilities",
-                            "abbreviation": "AGI"
-                        }
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] attributes with master attributes');
-        }
-        
-        // Skills component with comprehensive registry and formulas
-        if (!Utilities.storyCard.get('[SANE_COMP] skills')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] skills',
-                description: JSON.stringify({
-                    defaults: {},  // Skills are dynamic, added as needed
-                    categories: {
-                        "default": { "xp_formula": "level * 100", "description": "Standard progression" },
-                        "combat": { "xp_formula": "level * 80", "description": "Fighting and weapon skills" },
-                        "crafting": { "xp_formula": "level * 150", "description": "Creating items and equipment" },
-                        "social": { "xp_formula": "level * 120", "description": "Interpersonal abilities" },
-                        "gathering": { "xp_formula": "level * 130", "description": "Resource collection" },
-                        "support": { "xp_formula": "level * 90", "description": "Combat support abilities" }
-                    },
-                    registry: {
-                        // Combat skills
-                        "one_handed_sword": { "category": "combat" },
-                        "two_handed_sword": { "category": "combat" },
-                        "rapier": { "category": "combat" },
-                        "one_handed_curved_sword": { "category": "combat" },
-                        "dagger": { "category": "combat" },
-                        "blade_throwing": { "xp_formula": "level * 110" },
-                        "spear": { "category": "combat" },
-                        "mace": { "category": "combat" },
-                        "katana": { "xp_formula": "level * 200" },
-                        "martial_arts": { "category": "combat" },
-                        "scimitar": { "xp_formula": "level * 150" },
-                        
-                        // Combat Support
-                        "parrying": { "category": "support" },
-                        "battle_healing": { "category": "support" },
-                        "searching": { "category": "support" },
-                        "tracking": { "xp_formula": "level * 120" },
-                        "hiding": { "category": "support" },
-                        "night_vision": { "category": "support" },
-                        "extended_weight_limit": { "category": "support" },
-                        "straining": { "category": "support" },
-                        
-                        // Crafting
-                        "blacksmithing": { "category": "crafting" },
-                        "tailoring": { "category": "crafting" },
-                        "cooking": { "category": "crafting" },
-                        "alchemy": { "category": "crafting" },
-                        "woodcrafting": { "category": "crafting" },
-                        
-                        // Gathering
-                        "fishing": { "xp_formula": "level * 200" },
-                        "herbalism": { "category": "gathering" },
-                        "mining": { "category": "gathering" },
-                        
-                        // Social
-                        "trading": { "category": "social" },
-                        "negotiation": { "category": "social" },
-                        "persuasion": { "category": "social" },
-                        "intimidation": { "category": "social" },
-                        "bartering": { "category": "social" },
-                        "leadership": { "xp_formula": "level * 140" },
-                        "performing": { "category": "social" }
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] skills with full registry');
-        }
-        
-        // Inventory component with quantity tracking
-        if (!Utilities.storyCard.get('[SANE_COMP] inventory')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] inventory',
-                description: JSON.stringify({
-                    defaults: {},  // Items added dynamically
-                    structure: {
-                        // Each item stored as: "item_name": { "quantity": number }
-                        example: {
-                            "health_potion": { "quantity": 5 },
-                            "iron_sword": { "quantity": 1 },
-                            "bread": { "quantity": 10 }
-                        }
-                    },
-                    // Note: Item registry could be added here for validation
-                    // registry: { "health_potion": { "max_stack": 99, "type": "consumable" } }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] inventory with quantity tracking');
-        }
-        
-        // Relationships component with detailed thresholds
-        if (!Utilities.storyCard.get('[SANE_COMP] relationships')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] relationships',
-                description: JSON.stringify({
-                    defaults: {},  // Relationships are dynamic
-                    thresholds: [
-                        { min: -9999, max: -2000, flavor: "{from}'s hatred for {to} consumes their every thought" },
-                        { min: -1999, max: -1000, flavor: "{from} would sacrifice everything to see {to} destroyed" },
-                        { min: -999, max: -500, flavor: "{from} actively wishes harm upon {to}" },
-                        { min: -499, max: -200, flavor: "{from} feels genuine hostility toward {to}" },
-                        { min: -199, max: -100, flavor: "{from} strongly dislikes {to}" },
-                        { min: -99, max: -50, flavor: "{from} finds {to} irritating and unpleasant" },
-                        { min: -49, max: -25, flavor: "{from} feels mild annoyance toward {to}" },
-                        { min: -24, max: 24, flavor: "{from} feels neutral about {to}" },
-                        { min: 25, max: 49, flavor: "{from} has slightly positive feelings toward {to}" },
-                        { min: 50, max: 99, flavor: "{from} enjoys {to}'s company" },
-                        { min: 100, max: 199, flavor: "{from} considers {to} a friend" },
-                        { min: 200, max: 499, flavor: "{from} cares deeply about {to}'s wellbeing" },
-                        { min: 500, max: 999, flavor: "{from} has strong affection and loyalty toward {to}" },
-                        { min: 1000, max: 1999, flavor: "{from} loves {to} deeply" },
-                        { min: 2000, max: 9999, flavor: "{from} would do absolutely anything for {to}" }
-                    ]
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] relationships with detailed thresholds');
-        }
-        
-        // Pathways component (for locations)
-        if (!Utilities.storyCard.get('[SANE_COMP] pathways')) {
-            Utilities.storyCard.add({
-                title: '[SANE_COMP] pathways',
-                description: JSON.stringify({
-                    fields: {
-                        north: "reference:Location",
-                        south: "reference:Location",
-                        east: "reference:Location",
-                        west: "reference:Location",
-                        up: "reference:Location",
-                        down: "reference:Location",
-                        inside: "reference:Location",
-                        outside: "reference:Location"
-                    }
-                }, null, 2),
-                type: 'schema'
-            });
-            if (debug) console.log(MODULE_NAME + ': Created [SANE_COMP] pathways');
-        }
-    }
-    
-    // Auto-initialize SANE schemas on first run
-    createSANESchemas();
-    createComponentSchemas();
-    
+        // Deep merge blueprint with overrides
+        let entity = deepMerge(blueprint, overrides);
 
-    // Public API
-    
-    // Universal Data System - NEW PRIMARY API
-    GameState.load = load;
-    GameState.save = save;
-    GameState.loadAll = loadAll;
-    GameState.get = get;
-    GameState.set = set;
-    GameState.resolve = resolve;  // Dynamic path resolution
-    GameState.create = create;  // Unified entity creator
+        // Generate unique ID if not provided
+        entity.id = entity.id || overrides.id || `${blueprintName.toLowerCase()}_${Date.now()}`;
 
-    GameState.processTools = processTools;
-    GameState.processGetters = processGetters;
-    GameState.getGlobalValue = getGlobalValue;
-    GameState.setGlobalValue = setGlobalValue;
-    
-    // Character API - redirects to universal functions
-    GameState.loadCharacter = (name) => load('Character', name);
-    GameState.saveCharacter = (character) => save('Character', character);
-    GameState.createCharacter = createCharacter;  // Legacy, redirects to create()
-    
-    // Location API - redirects to universal functions  
-    GameState.loadLocation = (name) => load('Location', name);
-    GameState.saveLocation = (location) => save('Location', location);
-    
-    GameState.getPlayerName = function() {
-        // Find the first [PLAYER] card
-        const playerCard = Utilities.storyCard.find(card => {
-            return card.title && card.title.startsWith('[PLAYER]');
-        }, false); // false = return first match only
-        
-        if (playerCard) {
-            // Extract name from title: [PLAYER] Name
-            const match = playerCard.title.match(/\[PLAYER\]\s+(.+)/);
-            if (match) {
-                return match[1].trim();
+        // Initialize components from schemas
+        entity = initializeEntityComponents(entity);
+
+        // Special handling for Character blueprint - add random starting skills
+        if (blueprintName === 'Character' && entity.skills !== undefined && schemas.skills) {
+            // Get available skills from the skills schema registry
+            const skillsSchema = schemas.skills;
+            const availableSkills = skillsSchema.registry || [];
+
+            if (availableSkills.length > 0) {
+                // Randomly select 2 starting skills
+                const numStartingSkills = Math.min(2, availableSkills.length);
+                const selectedIndices = new Set();
+
+                while (selectedIndices.size < numStartingSkills) {
+                    selectedIndices.add(Math.floor(Math.random() * availableSkills.length));
+                }
+
+                // Add selected skills to entity with default structure
+                for (const index of selectedIndices) {
+                    const skillName = availableSkills[index];
+                    // Create default skill structure
+                    entity.skills[skillName] = {
+                        level: 1,
+                        xp: { current: 0, max: 100 }
+                    };
+                }
+
+                if (debug) console.log(`[SANE blueprint]: Added ${selectedIndices.size} random skills to ${entity.id}`);
             }
         }
-        
-        if (debug) console.log(`${MODULE_NAME}: No [PLAYER] card found`);
-        return null;
-    };
-    
-    // Entity tracking API
-    GameState.completeEntityGeneration = completeEntityGeneration;
-    GameState.completeLocationGeneration = completeLocationGeneration;
-    GameState.loadEntityTrackerConfig = loadEntityTrackerConfig;
-    
-    // Tool processing API (for testing)
-    GameState.processToolCall = processToolCall;
-    
-    // Rewind System API
-    GameState.RewindSystem = RewindSystem;
-    
-    // Field accessor methods
-    GameState.getCharacterField = getCharacterField;
-    GameState.setCharacterField = setCharacterField;
-    GameState.getField = function(characterName, fieldPath) {
-        const character = GameState.loadCharacter(characterName);
-        if (!character) return null;
-        return getCharacterField(character, fieldPath);
-    };
-    GameState.setField = function(characterName, fieldPath, value) {
-        const character = GameState.loadCharacter(characterName);
-        if (!character) return false;
-        
-        setCharacterField(character, fieldPath, value);
-        return save('Character', character);
-    };
-    GameState.modifyField = function(characterName, fieldPath, delta) {
-        const current = GameState.getField(characterName, fieldPath);
-        if (current === null || typeof current !== 'number') return false;
-        
-        return GameState.setField(characterName, fieldPath, current + delta);
-    };
-    
-    // Testing functions
-    GameState.testComponentTools = function() {
-        console.log(`${MODULE_NAME}: Testing component-aware tools...`);
-        
-        // Create test character with components
-        const testChar = createCharacter({
-            name: 'ToolTestHero',
-            isPlayer: false
-        });
-        
-        if (!testChar) {
-            console.log('ERROR: Failed to create test character');
-            return false;
+
+        // Save entity
+        save(entity.id, entity);
+
+        // If entity has generationwizard component with state 'queued',
+        // GenerationWizard will pick it up on next context hook
+        if (entity.generationwizard?.state === 'queued') {
+            debugLog('blueprint', `Entity ${entity.id} queued for generation`);
         }
-        
-        console.log('1. Testing HP modification (stats.hp)...');
-        // Test damage tool
-        const damageResult = toolProcessors.deal_damage('unknown', 'ToolTestHero', 20);
-        console.log(`  - deal_damage result: ${damageResult}`);
-        console.log(`  - HP after damage: ${get('Character.ToolTestHero.stats.hp.current')}/${get('Character.ToolTestHero.stats.hp.max')}`);
-        
-        console.log('2. Testing XP addition (stats.level.xp)...');
-        const xpResult = toolProcessors.add_levelxp('ToolTestHero', 250);
-        console.log(`  - add_levelxp result: ${xpResult}`);
-        console.log(`  - XP after: ${get('Character.ToolTestHero.stats.level.xp.current')}/${get('Character.ToolTestHero.stats.level.xp.max')}`);
-        
-        console.log('3. Testing inventory (component)...');
-        const addItemResult = toolProcessors.add_item('ToolTestHero', 'test_sword', 1);
-        console.log(`  - add_item result: ${addItemResult}`);
-        const inventory = get('Character.ToolTestHero.inventory');
-        console.log(`  - Inventory: ${JSON.stringify(inventory)}`);
-        
-        console.log('4. Testing location update (info.location)...');
-        const locResult = toolProcessors.update_location('ToolTestHero', 'Test_Dungeon');
-        console.log(`  - update_location result: ${locResult}`);
-        console.log(`  - Location: ${get('Character.ToolTestHero.info.location')}`);
-        
-        console.log('5. Testing attribute update...');
-        const attrResult = toolProcessors.update_attribute('ToolTestHero', 'strength', 15);
-        console.log(`  - update_attribute result: ${attrResult}`);
-        const attributes = get('Character.ToolTestHero.attributes');
-        console.log(`  - Attributes: ${JSON.stringify(attributes)}`);
-        
-        console.log(`${MODULE_NAME}: Component tools test complete!`);
-        return true;
+
+        return entity.id;
+    }
+
+    function deepMerge(target, source) {
+        // Deep merge utility for combining objects
+        if (!source) return target;
+        if (!target) return source;
+
+        const result = { ...target };
+
+        for (const key in source) {
+            if (source[key] && typeof source[key] === 'object' && !Array.isArray(source[key])) {
+                result[key] = deepMerge(target[key], source[key]);
+            } else {
+                result[key] = source[key];
+            }
+        }
+
+        return result;
+    }
+
+    //#endregion SECTION 9
+
+    // ========================================
+    // API EXPOSURE
+    // ========================================
+    //#region API EXPOSURE
+
+    // API object for compatibility
+    const SANEApi = {
+        // Core data functions
+        get,
+        set,
+        resolve,
+        save,
+        create,
+
+        // Entity management
+        loadEntityFromCache,
+        generateEntityKeys,
+        saveEntityWithOverflow,
+        saveToDataCard,
+
+        // Component system
+        initializeEntityComponents,
+        loadSchemaIntoCache,
+
+        // GameplayTag system
+        hasGameplayTag,
+        hasTagExact,
+        hasAnyTag,
+        hasAllTags,
+        addGameplayTag,
+
+        // Query system
+        queryTags,
+        loadAllEntities,
+
+        // Blueprint system
+        instantiateBlueprint,
+        deepMerge,
+
+        // Rewind system (from RewindModule)
+        RewindSystem: ModuleAPI.RewindSystem,
+
+        // Entity tracker (removed - now handled by EntityTrackerModule)
+
+        // Registries (direct access)
+        schemas,
+        tools,
+        hooks,
+
+        // Tool processing
+        processTool,
+        parseToolCall,
+
+        // Utility references
+        Utilities: Utilities,
+        Calendar: Calendar,
+
+        // State
+        debug,
+        dataCache,
+        entityAliasMap,
+
+        // Helper functions
+        normalizeEntityId,
+
+        // Library
+        Library
     };
-    GameState.testComponentSystem = function() {
-        console.log(`${MODULE_NAME}: Starting component system test...`);
-        
-        // 1. Create a new character with components
-        console.log('1. Creating character with components...');
-        const testChar = createCharacter({
-            name: 'TestHero',
-            isPlayer: false
-        });
-        
-        if (!testChar) {
-            console.log('ERROR: Failed to create character');
-            return false;
-        }
-        
-        // 2. Verify components were initialized
-        console.log('2. Verifying components...');
-        if (!testChar.stats || !testChar.info) {
-            console.log('ERROR: Required components missing');
-            return false;
-        }
-        
-        console.log(`  - stats.level: ${testChar.stats.level}`);
-        console.log(`  - stats.hp: ${JSON.stringify(testChar.stats.hp)}`);
-        console.log(`  - info.location: ${testChar.info.location}`);
-        
-        // 3. Modify using component paths
-        console.log('3. Modifying via component paths...');
-        set('Character.TestHero.stats.level', 5);
-        set('Character.TestHero.info.location', 'Test_Town');
-        set('Character.TestHero.stats.hp.current', 150);
-        
-        // 4. Load and verify changes
-        console.log('4. Loading and verifying changes...');
-        const loaded = load('Character', 'TestHero');
-        
-        if (!loaded) {
-            console.log('ERROR: Failed to load character');
-            return false;
-        }
-        
-        console.log(`  - Loaded level: ${get('Character.TestHero.stats.level')}`);
-        console.log(`  - Loaded location: ${get('Character.TestHero.info.location')}`);
-        console.log(`  - Loaded HP: ${get('Character.TestHero.stats.hp.current')}`);
-        
-        // 5. Component check (validation removed)
-        console.log('5. Component check...');
-        console.log('  - Has stats: ' + !!loaded.stats);
-        console.log('  - Has info: ' + !!loaded.info);
-        console.log('  - Has inventory: ' + !!loaded.inventory);
-        console.log('  - Has skills: ' + !!loaded.skills);
-        
-        // Migration test removed - no longer needed
-        
-        console.log(`${MODULE_NAME}: Component system test complete!`);
-        return true;
-    };
-    
-    // Test dynamic resolution with components
-    GameState.testDynamicResolution = function() {
-        console.log(`${MODULE_NAME}: Testing dynamic resolution with components...`);
-        
-        // 1. Test basic component path access
-        console.log('1. Testing basic component paths:');
-        const hero = load('Character', 'TestHero');
-        if (hero) {
-            console.log(`  - Direct: hero.stats.level = ${hero.stats?.level}`);
-            console.log(`  - get('Character.TestHero.stats.level') = ${get('Character.TestHero.stats.level')}`);
-            console.log(`  - get('Character.TestHero.stats.hp.current') = ${get('Character.TestHero.stats.hp.current')}`);
-            console.log(`  - get('Character.TestHero.info.location') = ${get('Character.TestHero.info.location')}`);
-        }
-        
-        // 2. Test dynamic resolution
-        console.log('2. Testing dynamic resolution:');
-        set('Global.currentPlayer', 'TestHero');
-        console.log(`  - Set Global.currentPlayer = 'TestHero'`);
-        console.log(`  - get('Character.$(Global.currentPlayer).stats.level') = ${get('Character.$(Global.currentPlayer).stats.level')}`);
-        console.log(`  - get('Character.$(Global.currentPlayer).stats.hp.current') = ${get('Character.$(Global.currentPlayer).stats.hp.current')}`);
-        
-        // 3. Test nested dynamic resolution
-        console.log('3. Testing nested dynamic resolution:');
-        const playerLocation = get('Character.$(Global.currentPlayer).info.location');
-        console.log(`  - Player location: ${playerLocation}`);
-        
-        // Create a test location if needed
-        const testLoc = {
-            name: 'Test_Town',
-            type: 'town',
-            description: 'A test location'
-        };
-        save('Location', testLoc);
-        
-        console.log(`  - get('Location.$(Character.$(Global.currentPlayer).info.location).type') = ${get('Location.$(Character.$(Global.currentPlayer).info.location).type')}`);
-        
-        // 4. Test setting component values via paths
-        console.log('4. Testing set() with component paths:');
-        set('Character.TestHero.stats.level', 10);
-        set('Character.TestHero.stats.hp.current', 200);
-        set('Character.TestHero.info.location', 'New_Location');
-        
-        console.log(`  - After set, level = ${get('Character.TestHero.stats.level')}`);
-        console.log(`  - After set, HP = ${get('Character.TestHero.stats.hp.current')}`);
-        console.log(`  - After set, location = ${get('Character.TestHero.info.location')}`);
-        
-        console.log(`${MODULE_NAME}: Dynamic resolution test complete!`);
-        return true;
-    };
-    
-    // Test runtime variable functions
-    GameState.testRuntimeVariables = function() {
-        console.log(`${MODULE_NAME}: Testing runtime variable functions with components...`);
-        
-        // Create test character if needed
-        const testChar = createCharacter({
-            name: 'RuntimeTestHero',
-            isPlayer: false
-        });
-        
-        if (testChar) {
-            // Set some component values
-            set('Character.RuntimeTestHero.stats.level', 7);
-            set('Character.RuntimeTestHero.stats.hp.current', 140);
-            set('Character.RuntimeTestHero.stats.hp.max', 200);
-            set('Character.RuntimeTestHero.info.location', 'Test_Village');
-            set('Character.RuntimeTestHero.attributes.strength', 18);
-            set('Character.RuntimeTestHero.skills.swordsmanship', { level: 5, xp: { current: 250, max: 400 } });
-        }
-        
-        console.log('1. Testing function-style getters:');
-        console.log(`  - getCharacterHP('RuntimeTestHero') = ${getCharacterHP('RuntimeTestHero')}`);
-        console.log(`  - getCharacterLevel('RuntimeTestHero') = ${getCharacterLevel('RuntimeTestHero')}`);
-        console.log(`  - getCharacterLocation('RuntimeTestHero') = ${getCharacterLocation('RuntimeTestHero')}`);
-        console.log(`  - getCharacterAttribute('RuntimeTestHero', 'strength') = ${getCharacterAttribute('RuntimeTestHero', 'strength')}`);
-        console.log(`  - getCharacterSkill('RuntimeTestHero', 'swordsmanship') = ${getCharacterSkill('RuntimeTestHero', 'swordsmanship')}`);
-        
-        console.log('2. Testing processGetters with both styles:');
-        const testText = '\n' +
-            'Current Status:\n' +
-            '- HP: get_hp(RuntimeTestHero)\n' +
-            '- Level: get_level(RuntimeTestHero)\n' +
-            '- Location: get_location(RuntimeTestHero)\n' +
-            '- Using new syntax: get[Character.RuntimeTestHero.stats.hp.current]\n' +
-            '- Mixed: HP is get_hp(RuntimeTestHero) and level is get[Character.RuntimeTestHero.stats.level]\n' +
-            '        ';
-        
-        const processed = processGetters(testText);
-        console.log('Processed text:', processed);
-        
-        console.log('3. Testing with dynamic resolution:');
-        set('Global.testHero', 'RuntimeTestHero');
-        const dynamicText = '\n' +
-            'Hero: get[Global.testHero]\n' +
-            'Hero HP: get[Character.$(Global.testHero).stats.hp.current]/get[Character.$(Global.testHero).stats.hp.max]\n' +
-            'Hero Location: get[Character.$(Global.testHero).info.location]\n' +
-            '        ';
-        
-        const dynamicProcessed = processGetters(dynamicText);
-        console.log('Dynamic processed:', dynamicProcessed);
-        
-        console.log(`${MODULE_NAME}: Runtime variables test complete!`);
-        return true;
-    };
-    
-    // test of universal get/set system
-    GameState.testUniversalSystem = function() {
-        console.log(`${MODULE_NAME}: Testing universal get/set system comprehensively...`);
-        
-        // 1. Test basic get/set
-        console.log('1. Testing basic get/set:');
-        set('Global.testValue', 42);
-        console.log(`  - set('Global.testValue', 42) -> get = ${get('Global.testValue')}`);
-        
-        // 2. Test nested object creation
-        console.log('2. Testing nested object creation:');
-        set('Global.nested.deep.value', 'deep value');
-        console.log(`  - set('Global.nested.deep.value', 'deep value') -> get = ${get('Global.nested.deep.value')}`);
-        
-        // 3. Test entity loading and modification
-        console.log('3. Testing entity operations:');
-        const testChar = createCharacter({ name: 'UniversalTestHero' });
-        if (testChar) {
-            set('Character.UniversalTestHero.stats.level', 99);
-            set('Character.UniversalTestHero.stats.hp.current', 9999);
-            set('Character.UniversalTestHero.info.location', 'Test_Zone');
-            console.log(`  - Level: ${get('Character.UniversalTestHero.stats.level')}`);
-            console.log(`  - HP: ${get('Character.UniversalTestHero.stats.hp.current')}`);
-            console.log(`  - Location: ${get('Character.UniversalTestHero.info.location')}`);
-        }
-        
-        // 4. Test dynamic resolution
-        console.log('4. Testing dynamic resolution:');
-        set('Global.targetChar', 'UniversalTestHero');
-        set('Global.targetField', 'stats.level');
-        console.log(`  - Single $(): ${get('Character.$(Global.targetChar).stats.level')}`);
-        console.log(`  - Nested $(): ${get('Character.$(Global.targetChar).$(Global.targetField)')}`);
-        
-        // 5. Test error cases
-        console.log('5. Testing error handling:');
-        console.log(`  - Invalid path 'NoType': ${get('NoType')}`);
-        console.log(`  - Missing entity: ${get('Character.DoesNotExist.level')}`);
-        console.log(`  - Missing field: ${get('Character.UniversalTestHero.nonexistent.field')}`);
-        
-        // 6. Test array notation
-        console.log('6. Testing array notation:');
-        set('Global.testArray[0]', 'first');
-        set('Global.testArray[1]', 'second');
-        set('Global.nested.array[0].name', 'item1');
-        console.log(`  - Array[0]: ${get('Global.testArray[0]')}`);
-        console.log(`  - Array[1]: ${get('Global.testArray[1]')}`);
-        console.log(`  - Nested array: ${get('Global.nested.array[0].name')}`);
-        
-        // 7. Test cache behavior
-        console.log('7. Testing cache:');
-        const before = get('Character.UniversalTestHero.stats.level');
-        set('Character.UniversalTestHero.stats.level', 100);
-        const after = get('Character.UniversalTestHero.stats.level');
-        console.log(`  - Before: ${before}, After: ${after}, Cache updated: ${after === '100'}`);
-        
-        // 8. Test component paths with missing components
-        console.log('8. Testing missing component paths:');
-        const noComponents = { name: 'FlatHero', level: 5, hp: 100 };
-        save('Character', noComponents);
-        console.log(`  - Flat hero level: ${get('Character.FlatHero.level')}`);
-        console.log(`  - Flat hero stats.level (missing): ${get('Character.FlatHero.stats.level')}`);
-        
-        // 9. Test Global special handling
-        console.log('9. Testing Global special handling:');
-        set('Global.complex', { a: 1, b: { c: 2 } });
-        console.log(`  - Complex global: ${JSON.stringify(get('Global.complex'))}`);
-        set('Global.complex.b.c', 3);
-        console.log(`  - After nested set: ${get('Global.complex.b.c')}`);
-        
-        // 10. Test resolution edge cases
-        console.log('10. Testing resolution edge cases:');
-        set('Global.circular', 'Global.circular');
-        console.log(`  - Circular reference: ${get('$(Global.circular)')}`);
-        set('Global.undefined', undefined);
-        console.log(`  - Undefined value: ${get('Global.undefined')}`);
-        set('Global.null', null);
-        console.log(`  - Null value: ${get('Global.null')}`);
-        
-        console.log(`${MODULE_NAME}: Universal system test complete!`);
-        return true;
-    };
-    
-    // Master test 
-    GameState.runAllTests = function() {
-        console.log('\n' + '='.repeat(60));
-        console.log('SANE COMPREHENSIVE TEST SUITE');
-        console.log('='.repeat(60) + '\n');
-        
-        const tests = [
-            { name: 'Component System', fn: GameState.testComponentSystem },
-            { name: 'Component Tools', fn: GameState.testComponentTools },
-            { name: 'Dynamic Resolution', fn: GameState.testDynamicResolution },
-            { name: 'Runtime Variables', fn: GameState.testRuntimeVariables },
-            { name: 'Universal System', fn: GameState.testUniversalSystem },
-            { name: 'Tool Processing', fn: testToolProcessing },
-            { name: 'Entity Validation', fn: testEntityValidation },
-            { name: 'Template Processing', fn: testTemplateProcessing }
-        ];
-        
-        let passed = 0;
-        let failed = 0;
-        
-        for (const test of tests) {
-            console.log(`\n${'*'.repeat(40)}`);
-            console.log(`Running: ${test.name}`);
-            console.log('*'.repeat(40));
-            
+
+    // Make API available globally for compatibility
+    if (typeof global !== 'undefined') {
+        global.GameState = SANEApi;
+        global.SANE = SANEApi;
+    }
+    if (typeof window !== 'undefined') {
+        window.GameState = SANEApi;
+        window.SANE = SANEApi;
+    }
+    // Only set on 'this' if it exists
+    if (typeof this !== 'undefined') {
+        this.GameState = SANEApi;
+        this.SANE = SANEApi;
+    }
+
+    //#endregion API EXPOSURE
+
+    // ========================================
+    // RUNTIME CONFIGURATION LOADING
+    // ========================================
+    //#region RUNTIME CONFIG
+
+    function loadRuntimeConfigurations() {
+        // Load runtime tools from [SANE_RUNTIME] TOOLS
+        const toolsCard = Utilities?.storyCard?.get('[SANE_RUNTIME] TOOLS');
+        if (toolsCard) {
             try {
-                const result = test.fn();
-                if (result) {
-                    console.log(`✓ ${test.name} PASSED`);
-                    passed++;
-                } else {
-                    console.log(`✗ ${test.name} FAILED`);
-                    failed++;
+                const toolsCode = (toolsCard.description || toolsCard.entry || toolsCard.value || '').trim();
+                if (!toolsCode) return;
+
+                // Create context for runtime tools
+                const toolContext = {
+                    GameState: SANEApi,
+                    SANE: SANEApi,
+                    ModuleAPI: ModuleAPI,
+                    Utilities: Utilities,
+                    Calendar: Calendar,
+                    state: state,
+                    history: history,
+                    console: console,
+                    get: get,
+                    set: set,
+                    save: save
+                };
+
+                // Use same approach as GameState.js - wrap in object literal and eval
+                try {
+                    const wrappedCode = `({${toolsCode}})`;
+                    const toolDefinitions = eval(wrappedCode);
+
+                    // Register each tool
+                    for (const [name, func] of Object.entries(toolDefinitions)) {
+                        if (typeof func === 'function') {
+                            runtimeTools[name] = (function(toolName, toolFunc) {
+                                return function(params) {
+                                    try {
+                                        const result = toolFunc.apply(toolContext, [params]);
+                                        debugLog('runtime', `Tool ${toolName} returned: ${result}`);
+                                        return result;
+                                    } catch(e) {
+                                        debugLog('runtime', `Error in tool ${toolName}: ${e.toString()}`);
+                                        return 'malformed';
+                                    }
+                                };
+                            })(name, func);
+                        }
+                    }
+
+                    debugLog('runtime', `Loaded ${Object.keys(runtimeTools).length} runtime tools`);
+                } catch(evalError) {
+                    debugLog('runtime', `Failed to eval runtime tools: ${evalError}`);
                 }
             } catch (e) {
-                console.log(`✗ ${test.name} ERRORED: ${e.message}`);
-                console.log(e.stack);
-                failed++;
+                debugLog('runtime', `Error loading runtime tools: ${e.message}`);
             }
         }
-        
-        console.log('\n' + '='.repeat(60));
-        console.log(`TEST RESULTS: ${passed} passed, ${failed} failed`);
-        console.log('='.repeat(60));
-        
-        return failed === 0;
-    };
-    
-    // Test tool processing
-    function testToolProcessing() {
-        console.log(`${MODULE_NAME}: Testing tool processing...`);
-        
-        // Create test character
-        const testChar = createCharacter({ 
-            name: 'ToolTestChar',
-            isPlayer: false
-        });
-        
-        if (testChar) {
-            // Initialize with component values
-            set('Character.ToolTestChar.stats.level', 1);
-            set('Character.ToolTestChar.stats.hp.current', 100);
-            set('Character.ToolTestChar.stats.hp.max', 100);
-            set('Character.ToolTestChar.inventory.sword', { quantity: 1 });
-        }
-        
-        // 1. Test damage tool
-        console.log('1. Testing deal_damage:');
-        const damageResult = processTool('deal_damage', ['Monster', 'ToolTestChar', '30']);
-        console.log(`  - Result: ${damageResult}`);
-        const afterDamage = get('Character.ToolTestChar.stats.hp.current');
-        console.log(`  - HP after damage: ${afterDamage}`);
-        
-        // 2. Test healing
-        console.log('2. Testing heal:');
-        const healResult = processTool('heal', ['ToolTestChar', '20']);
-        console.log(`  - Result: ${healResult}`);
-        const afterHeal = get('Character.ToolTestChar.stats.hp.current');
-        console.log(`  - HP after heal: ${afterHeal}`);
-        
-        // 3. Test item management
-        console.log('3. Testing add_item:');
-        const addResult = processTool('add_item', ['ToolTestChar', 'potion', '5']);
-        console.log(`  - Result: ${addResult}`);
-        const potions = get('Character.ToolTestChar.inventory.potion');
-        console.log(`  - Potions: ${potions?.quantity || potions}`);
-        
-        // 4. Test XP addition
-        console.log('4. Testing add_levelxp:');
-        set('Character.ToolTestChar.stats.level.xp', { current: 0, max: 500 });
-        const xpResult = processTool('add_levelxp', ['ToolTestChar', '250']);
-        console.log(`  - Result: ${xpResult}`);
-        const xp = get('Character.ToolTestChar.stats.level.xp.current');
-        console.log(`  - XP: ${xp}`);
-        
-        console.log(`${MODULE_NAME}: Tool processing test complete!`);
-        return true;
-    }
-    
-    // Test entity validation
-    function testEntityValidation() {
-        console.log(`${MODULE_NAME}: Testing entity validation...`);
-        
-        // 1. Test valid entity
-        console.log('1. Testing valid entity:');
-        const validEntity = {
-            name: 'ValidHero',
-            stats: { 
-                level: {
-                    value: 5,
-                    xp: { current: 2000, max: 2500 }
-                },
-                hp: { current: 100, max: 100 } 
-            },
-            info: { location: 'Town' }
-        };
-        const validResult = validateEntityComponents('Character', validEntity);
-        console.log(`  - Valid: ${validResult.valid}`);
-        console.log(`  - Errors: ${validResult.errors?.length || 0}`);
-        
-        // 2. Test missing required component
-        console.log('2. Testing missing required component:');
-        const missingEntity = {
-            name: 'IncompleteHero',
-            stats: { 
-                level: {
-                    value: 1,
-                    xp: { current: 0, max: 500 }
-                }
-            }
-            // Missing info component
-        };
-        const missingResult = validateEntityComponents('Character', missingEntity);
-        console.log(`  - Valid: ${missingResult.valid}`);
-        console.log(`  - Errors: ${missingResult.errors?.join(', ')}`);
-        
-        // 3. Test component initialization
-        console.log('3. Testing component initialization:');
-        const newEntity = initializeEntityComponents('Character', { name: 'NewHero' });
-        console.log(`  - Has stats: ${!!newEntity.stats}`);
-        console.log(`  - Has info: ${!!newEntity.info}`);
-        console.log(`  - Stats.level.value: ${newEntity.stats?.level?.value}`);
-        console.log(`  - Info.location: ${newEntity.info?.location}`);
-        
-        console.log(`${MODULE_NAME}: Entity validation test complete!`);
-        return true;
-    }
-    
-    // Test template processing
-    function testTemplateProcessing() {
-        console.log(`${MODULE_NAME}: Testing template processing...`);
-        
-        // Create test data
-        const testData = {
-            name: 'Template Hero',
-            stats: {
-                level: {
-                    value: 10,
-                    xp: { current: 4500, max: 5000 }
-                },
-                hp: { current: 150, max: 200 }
-            },
-            skills: {
-                sword: { level: 5, unlocked: true },
-                magic: { level: 3, unlocked: true },
-                stealth: { level: 1, unlocked: false }
-            },
-            isPlayer: false
-        };
-        
-        // 1. Test simple replacements
-        console.log('1. Testing simple replacements:');
-        let template = 'Name: {name}, Level: {stats.level}';
-        let result = processTemplateLine(template, testData);
-        console.log(`  - Result: ${result}`);
-        
-        // 2. Test conditionals
-        console.log('2. Testing conditionals:');
-        template = '{info.isPlayer?Player Character:NPC Character}';
-        result = processTemplateLine(template, testData);
-        console.log(`  - Result: ${result}`);
-        
-        // 3. Test loops
-        console.log('3. Testing loops:');
-        template = 'Skills: {skills.*:{*.unlocked?{*} (Level {*.level})}}';
-        result = processTemplateLine(template, testData);
-        console.log(`  - Result: ${result}`);
-        
-        // 4. Test entity references
-        console.log('4. Testing entity references:');
-        // Save test character for reference
-        save('Character', testData);
-        set('Global.currentHero', 'Template Hero');
-        
-        template = 'Hero Level: {Character.Template Hero.stats.level}';
-        result = processTemplateLine(template, {});
-        console.log(`  - Direct reference: ${result}`);
-        
-        template = 'Current Hero Level: {Character.{Global.currentHero}.stats.level}';
-        result = processTemplateLine(template, { Global: { currentHero: 'Template Hero' } });
-        console.log(`  - Dynamic reference: ${result}`);
-        
-        console.log(`${MODULE_NAME}: Template processing test complete!`);
-        return true;
-    }
-    
-    // Test schema registry
-    GameState.testSchemaRegistry = function() {
-        console.log(`${MODULE_NAME}: Testing schema registry...`);
-        
-        // Initialize if needed
-        if (!schemaRegistry) schemaRegistry = initializeSchemaRegistry();
-        
-        console.log('1. Registered entity types:');
-        for (const [type, schema] of Object.entries(schemaRegistry)) {
-            if (!type.startsWith('_')) {
-                console.log(`  - ${type}: ${schema.prefixes?.join(', ')}`);
-            }
-        }
-        
-        console.log('2. Component schemas:');
-        const components = schemaRegistry._components || {};
-        for (const [name, schema] of Object.entries(components)) {
-            console.log(`  - ${name}: ${schema.component_of}`);
-        }
-        
-        console.log('3. Schema aliases:');
-        const aliases = schemaAliasMap || {};
-        console.log(`  - Total aliases: ${Object.keys(aliases).length}`);
-        
-        console.log(`${MODULE_NAME}: Schema registry test complete!`);
-        return true;
-    };
-    
 
-    switch(hook) {
-        case 'input':
-            // Initialize debug logging for this turn
-            if (debug) initDebugLogging();
-            
-            
-            // Store original input for logging
-            const originalInput = text;
-            
-            // Load input systems
-            loadInputCommands();
-            loadInputModifier();
-            
-            // Apply INPUT_MODIFIER first
-            if (inputModifier) {
+        // Load input commands from [SANE_RUNTIME] INPUT_COMMANDS
+        const commandsCard = Utilities?.storyCard?.get('[SANE_RUNTIME] INPUT_COMMANDS');
+        if (commandsCard) {
+            try {
+                const commandsCode = (commandsCard.description || commandsCard.entry || commandsCard.value || '').trim();
+                if (!commandsCode) return;
+
+                // Same pattern as tools - wrap in object literal
                 try {
-                    text = inputModifier(text);
-                    if (debug) console.log(`${MODULE_NAME}: Applied input modifier`);
-                } catch(e) {
-                    if (debug) console.log(`${MODULE_NAME}: Input modifier error: ${e}`);
-                }
-            }
-            
-            // Check for INPUT_COMMANDS in the text
-            // Pattern: /commandname or /commandname args
-            const commandPattern = /\/([a-z_]+)(?:\s+([^\n/]*))?/gi;
-            let commandResults = [];
-            let match;
-            
-            while ((match = commandPattern.exec(text)) !== null) {
-                const commandName = match[1].toLowerCase();
-                const argsString = match[2] || '';
-                const args = argsString.trim().split(/\s+/).filter(arg => arg);
-                
-                if (debug) console.log(`${MODULE_NAME}: Found command: /${commandName} with args: [${args.join(', ')}]`);
-                
-                // Check debug commands first (only when debug mode is on)
-                if (debug) {
-                    const debugResult = handleDebugCommand(commandName, args);
-                    if (debugResult) {
-                        console.log(`${MODULE_NAME}: Debug command handled: ${commandName}`);
-                        console.log(`${MODULE_NAME}: Debug command result: ${debugResult}`);
-                        commandResults.push(debugResult);
-                        continue;
-                    }
-                }
-                
-                // Check custom commands
-                if (inputCommands[commandName]) {
-                    const result = inputCommands[commandName](args);
-                    if (result !== null && result !== undefined) {
-                        if (debug) console.log(`${MODULE_NAME}: Command /${commandName} returned: ${result}`);
-                        commandResults.push(result);
-                        continue;
-                    }
-                }
-                
-                // Check built-in commands
-                const processed = processPlayerCommand(`/${commandName} ${args.join(' ')}`);
-                if (processed.handled) {
-                    commandResults.push(processed.output);
-                }
-            }
-            
-            // If any commands were processed, return their combined results
-            if (commandResults.length > 0) {
-                logTime();
-                const result = commandResults.join('\n');
-                // Calculate hash of the result
-                currentHash = RewindSystem.quickHash(result);
-                logTime();
-                return result;
-            }
-            
-            // If GenerationWizard is active, delegate to it
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
-                const result = GenerationWizard.process('input', text);
-                const finalResult = result.active ? '\n' : text;
-                
-                // Log the input turn
-                logDebugTurn('input', originalInput, finalResult, {
-                    commandsProcessed: commandResults.length > 0
-                });
-                
-                // Calculate hash of the final result
-                currentHash = RewindSystem.quickHash(finalResult);
-                logTime();
-                return finalResult;  // Block input if wizard is active
-            }
-            
-            // Log the input turn
-            logDebugTurn('input', originalInput, text, {
-                commandsProcessed: commandResults.length > 0
-            });
-            
-            // Calculate hash of the modified input text (what will be stored in history)
-            currentHash = RewindSystem.quickHash(text);
-            
-            logTime();
-            return text;
-            
-        case 'context':
-            // Initialize debug logging for this turn
-            if (debug) initDebugLogging();
-            
-            // Store original context for logging
-            const originalContext = text;
-            
-            // Store context length for debug output
-            if (!state.lastContextLength) {
-                state.lastContextLength = 0;
-            }
-            state.lastContextLength = text ? text.length : 0;
-            
-            // Cache cards are no longer needed with the universal data system
-            // All data is loaded on-demand through load()/loadAll() functions
-            
-            // Check for edits in history (RewindSystem)
-            RewindSystem.handleContext();
-            
-            // Load context modifier
-            loadContextModifier();
-            
-            // Remove any hidden message markers from previous turns (including surrounding newlines)
-            let modifiedText = text.replace(/\n*<<<[^>]*>>>\n*/g, '');
-            
-            // Move current scene card if it exists (before getters)
-            modifiedText = moveCurrentSceneCard(modifiedText);
-            
-            // Process all getters in the entire context (if getters exist)
-            let gettersReplaced = {};
-            // Check both universal object getters and function getters
-            const hasUniversalGetters = UNIVERSAL_GETTER_PATTERN.test(modifiedText);
-            const hasFunctionGetters = FUNCTION_GETTER_PATTERN.test(modifiedText);
-            
-            if (hasUniversalGetters || hasFunctionGetters) {
-                // Track which getters are being replaced (count only, not every instance)
-                const universalMatches = hasUniversalGetters ? modifiedText.match(UNIVERSAL_GETTER_PATTERN) : [];
-                const functionMatches = hasFunctionGetters ? modifiedText.match(FUNCTION_GETTER_PATTERN) : [];
-                const getterMatches = [...(universalMatches || []), ...(functionMatches || [])];
-                
-                if (getterMatches.length > 0) {
-                    // Check if any getters need character data
-                    let needsCharacters = false;
-                    getterMatches.forEach(match => {
-                        // Check universal getter format
-                        if (match.startsWith('get[')) {
-                            const path = match.match(/get\[([^\]]+)\]/)?.[1];
-                            if (path && path.toLowerCase().includes('character')) {
-                                needsCharacters = true;
-                            }
-                        }
-                        // Check function getter format
-                        const innerMatch = match.match(/get_([a-z]+)/i);
-                        if (innerMatch) {
-                            const getterName = innerMatch[1];
-                            gettersReplaced[getterName] = (gettersReplaced[getterName] || 0) + 1;
-                            
-                            // These getters need character data
-                            if (['location', 'hp', 'level', 'xp', 'name', 'attribute', 'skill', 'inventory', 'stat'].includes(getterName)) {
-                                needsCharacters = true;
-                            }
-                        }
-                    });
-                    
-                    // Pre-load characters if needed
-                    if (needsCharacters) {
-                        const allChars = loadAll('Character');
-                        for (const [name, char] of Object.entries(allChars || {})) {
-                            entityCache[`Character.${name}`] = char;
+                    const wrappedCode = `({${commandsCode}})`;
+                    const commandDefinitions = eval(wrappedCode);
+
+                    // Register each command
+                    for (const [name, func] of Object.entries(commandDefinitions)) {
+                        if (typeof func === 'function') {
+                            inputCommands[name] = func;
                         }
                     }
+
+                    debugLog('runtime', `Loaded ${Object.keys(inputCommands).length} input commands`);
+                } catch(evalError) {
+                    debugLog('runtime', `Failed to eval input commands: ${evalError}`);
                 }
-                modifiedText = processGetters(modifiedText);
+            } catch (e) {
+                debugLog('runtime', `Error loading input commands: ${e.message}`);
             }
-            
-            // Build trigger name to username mapping and replace in tool usages
-            const triggerNameMap = {};
-            const allCharacters = loadAll('Character');
-            
-            // Get current action count for cleanup check
-            const currentTurn = info?.actionCount || 0;
-            
-            // Build the mapping from character data (info.trigger_name)
-            for (const [charName, character] of Object.entries(allCharacters || {})) {
-                if (character.info?.trigger_name) {
-                    const triggerName = character.info.trigger_name;
-                    const username = character.name.toLowerCase();
-                    
-                    // Get generation turn if available
-                    const generatedTurn = character.info.generation_turn || 0;
-                    
-                    // Check if trigger name should be cleaned up (10+ turns old and not in context)
-                    if (generatedTurn > 0 && currentTurn - generatedTurn >= 10) {
-                        // Check if trigger name still exists in the context
-                        const triggerPattern = new RegExp(`\\b${triggerName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i');
-                        if (!triggerPattern.test(modifiedText)) {
-                            // Remove trigger name from character info
-                            delete character.info.trigger_name;
-                            delete character.info.generation_turn;
-                            
-                            // When saving, the keys will be regenerated without the trigger_name
-                            // since it's no longer in character.info.trigger_name
-                            save('Character', character);
-                            
-                            // Also need to update the card's keys directly since save() might not regenerate them
-                            const cardTitle = `[CHARACTER] ${character.name}`;
-                            const card = Utilities.storyCard.get(cardTitle);
-                            if (card) {
-                                // Regenerate keys without trigger name
-                                const newKeys = ` ${character.name.toLowerCase()},(${character.name.toLowerCase()}`;
-                                Utilities.storyCard.update(cardTitle, { keys: newKeys });
-                            }
-                            
-                            if (debug) {
-                                console.log(`${MODULE_NAME}: Cleaned up trigger name "${triggerName}" for ${username} (${currentTurn - generatedTurn} turns old)`);
-                            }
-                            continue; // Skip adding to map since we cleaned it up
-                        }
-                    }
-                    
-                    // Add to mapping if trigger name differs from character name
-                    if (triggerName.toLowerCase() !== username) {
-                        triggerNameMap[triggerName] = username;
-                    }
-                }
-            }
-            
-            // Single pass replacement of all trigger names in tool usages
-            if (Object.keys(triggerNameMap).length > 0) {
-                // Build regex pattern for all trigger names
-                const triggerNames = Object.keys(triggerNameMap).map(name => 
-                    name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
-                ).join('|');
-                
-                const toolPattern = new RegExp(
-                    `(\\w+\\()(\\s*)(${triggerNames})(\\s*)(,|\\))`,
-                    'gi'
-                );
-                
-                modifiedText = modifiedText.replace(toolPattern, (match, func, space1, triggerName, space2, delimiter) => {
-                    const username = triggerNameMap[triggerName] || triggerName;
-                    if (debug && username !== triggerName) {
-                        console.log(`${MODULE_NAME}: Replaced trigger name "${triggerName}" with "${username}" in tool usage`);
-                    }
-                    return `${func}${space1}${username}${space2}${delimiter}`;
-                });
-            }
-            
-            // Check if GenerationWizard needs to append prompts
-            if (typeof GenerationWizard !== 'undefined') {
-                const isActive = GenerationWizard.isActive();
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard active check: ${isActive}`);
-                
-                if (isActive) {
-                    const result = GenerationWizard.process('context', modifiedText);
-                    if (debug) console.log(`${MODULE_NAME}: GenerationWizard.process result: active=${result.active}, text length before=${modifiedText.length}, after=${result.text ? result.text.length : 'null'}`);
-                    if (result.active) {
-                        modifiedText = result.text;  // Use wizard's modified context (with prompts appended)
-                    }
-                }
-            } else {
-                if (debug) console.log(`${MODULE_NAME}: GenerationWizard not available`);
-            }
-            
-            // Apply CONTEXT_MODIFIER if available
-            if (contextModifier) {
-                try {
-                    // Create context for the modifier
-                    const context = {
-                        getGlobalValue: getGlobalValue,
-                        setGlobalValue: setGlobalValue,
-                        loadCharacter: function(name) {
-                            const chars = loadAll('Character');
-                            return chars[name.toLowerCase()];
-                        },
-                        Utilities: Utilities,
-                        Calendar: typeof Calendar !== 'undefined' ? Calendar : null
+        }
+
+        // Load modifiers - these expect to return a function
+        const inputModCard = Utilities?.storyCard?.get('[SANE_RUNTIME] INPUT_MODIFIER');
+        if (inputModCard) {
+            try {
+                const fullCode = (inputModCard.entry || '') + '\n' + (inputModCard.description || '');
+
+                // Skip if only comments
+                const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+                if (!codeWithoutComments) {
+                    debugLog('runtime', 'Input modifier is empty, using pass-through');
+                    inputModifier = (text) => text;
+                } else {
+                    // Create function from code with access to SANE context
+                    const codeWithReturn = fullCode.includes('return ') ? fullCode : fullCode + '\nreturn text;';
+                    const funcCode = `(function(text) {
+                        const SANE = this.SANE || {};
+                        const GameState = this.GameState || this.SANE || {};
+                        const ModuleAPI = this.ModuleAPI || {};
+                        const Utilities = this.Utilities;
+                        const Calendar = this.Calendar;
+                        const get = this.get;
+                        const set = this.set;
+                        const state = this.state;
+                        const history = this.history;
+                        ${codeWithReturn}
+                    })`;
+                    const baseFunc = eval(funcCode);
+                    // Wrap it to provide context (SANEApi will be defined later)
+                    inputModifier = (text) => {
+                        // Get SANEApi at runtime (it's defined after this loads)
+                        const api = typeof SANEApi !== 'undefined' ? SANEApi : {get, set, save};
+                        return baseFunc.call({
+                            SANE: api,
+                            GameState: api,
+                            ModuleAPI: ModuleAPI,
+                            Utilities: Utilities,
+                            Calendar: Calendar,
+                            get: get,
+                            set: set,
+                            save: save,
+                            state: state,
+                            history: history
+                        }, text);
                     };
-                    
-                    // Apply modifier with context
-                    // If it's already a function, just call it with context
-                    if (typeof contextModifier === 'function') {
-                        modifiedText = contextModifier.call(context, modifiedText);
-                    }
-                    
-                    if (debug) console.log(`${MODULE_NAME}: Applied context modifier`);
-                } catch(e) {
-                    if (debug) console.log(`${MODULE_NAME}: Context modifier error: ${e}`);
+                    debugLog('runtime', 'Loaded input modifier');
                 }
+            } catch (e) {
+                debugLog('runtime', `Error loading input modifier: ${e.message}`);
+                inputModifier = null;
             }
-            
-            // Log the context turn
-            logDebugTurn('context', originalContext, modifiedText, {
-                // Don't include actual context text to save state space
-                triggerNamesReplaced: Object.keys(triggerNameMap).length,
-                gettersReplaced: gettersReplaced
-            });
-            
-            logTime();
-            return modifiedText;  // Return the fully modified text
-            
-        case 'output':
-            // Initialize debug logging for this turn
-            if (debug) initDebugLogging();
-            
-            // Store original output for logging
-            const originalOutput = text;
-            
-            
-            // Load output modifier
-            loadOutputModifier();
-            
-            // Check if GenerationWizard is processing
-            if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
-                const result = GenerationWizard.process('output', text);
-                if (result.active) {
-                    // Log early return
-                    logDebugTurn('output', null, null, {
-                        generationWizardActive: true
-                    });
-                    return result.text;  // Return wizard's output (hidden message)
-                }
-            }
+        }
 
-            // Process tools in LLM's output
-            if (text) {
-                // Check if there are any tool patterns first
-                const hasToolPatterns = TOOL_PATTERN.test(text);
-                TOOL_PATTERN.lastIndex = 0; // Reset regex state
-                
-                if (hasToolPatterns) {
-                    loadRuntimeTools();
-                }
-                
-                const result = processTools(text);
-                let modifiedText = result.modifiedText;
-                const executedTools = result.executedTools || [];
-                
-                // Calculate hash AFTER tool removal so it matches what gets stored
-                currentHash = RewindSystem.quickHash(modifiedText);
-                
-                // Position should be current history.length
-                const futurePosition = history ? Math.min(history.length, RewindSystem.MAX_HISTORY - 1) : 0;
-                RewindSystem.recordAction(text, executedTools, futurePosition);
-                
-                // Check if any entities need generation
-                const entityQueued = queuePendingEntities();
-                
-                // Check if GenerationWizard was triggered by any tool or entity generation
-                if (typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()) {
-                    // Add warning that GM will take control next turn
-                    modifiedText += '\n\n<<<The GM will use the next turn to think. Use `/GW abort` if undesired.>>>';
-                    if (debug) console.log(`${MODULE_NAME}: GenerationWizard activated, adding warning to output`);
-                } else if (entityQueued) {
-                    // Entity generation was triggered
-                    modifiedText += '\n\n<<<The GM will generate a new entity next turn. Use `/GW abort` if undesired.>>>';
-                    if (debug) console.log(`${MODULE_NAME}: Entity generation triggered, adding warning to output`);
-                }
-                
-                // Apply OUTPUT_MODIFIER if available
-                if (outputModifier) {
-                    try {
-                        modifiedText = outputModifier(modifiedText);
-                        if (debug) console.log(`${MODULE_NAME}: Applied output modifier`);
-                    } catch(e) {
-                        if (debug) console.log(`${MODULE_NAME}: Output modifier error: ${e}`);
-                    }
-                }
-                
-                // Log the output turn with tools executed
-                logDebugTurn('output', null, null, {
-                    toolsExecuted: executedTools,
-                    entityQueued: entityQueued,
-                    generationWizardActive: typeof GenerationWizard !== 'undefined' && GenerationWizard.isActive()
-                });
-                
-                // Clear entity cache after processing
-                entityCache = {};
-                
-                // Pin important cards to top for fast access
-                // [PLAYER] cards go at the very top
-                if (typeof storyCards !== 'undefined' && storyCards.length > 0) {
-                    const playerCards = [];
-                    
-                    // Extract all special cards in one pass (backwards to avoid index issues)
-                    for (let i = storyCards.length - 1; i >= 0; i--) {
-                        const card = storyCards[i];
-                        if (!card || !card.title) continue;
-                        
-                        if (card.title.startsWith('[PLAYER]')) {
-                            playerCards.unshift(storyCards.splice(i, 1)[0]);
-                        }
-                        // Cache cards are obsolete - no longer pinned
-                    }
-                    
-                    // Re-insert in optimal order at the top
-                    let insertPos = 0;
-                    
-                    // Insert player cards at the very top
-                    if (playerCards.length > 0) {
-                        storyCards.splice(insertPos, 0, ...playerCards);
-                        if (debug) console.log(`${MODULE_NAME}: Pinned ${playerCards.length} player card(s) to top`);
-                    }
+        const contextModCard = Utilities?.storyCard?.get('[SANE_RUNTIME] CONTEXT_MODIFIER');
+        if (contextModCard) {
+            try {
+                const fullCode = (contextModCard.entry || '') + '\n' + (contextModCard.description || '');
 
+                // Skip if only comments
+                const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+                if (!codeWithoutComments) {
+                    debugLog('runtime', 'Context modifier is empty, using pass-through');
+                    contextModifier = (text) => text;
+                } else {
+                    // Create function from code with access to SANE context
+                    const codeWithReturn = fullCode.includes('return ') ? fullCode : fullCode + '\nreturn text;';
+                    const funcCode = `(function(text) {
+                        const SANE = this.SANE || {};
+                        const GameState = this.GameState || this.SANE || {};
+                        const ModuleAPI = this.ModuleAPI || {};
+                        const Utilities = this.Utilities;
+                        const Calendar = this.Calendar;
+                        const get = this.get;
+                        const set = this.set;
+                        const state = this.state;
+                        const history = this.history;
+                        ${codeWithReturn}
+                    })`;
+                    const baseFunc = eval(funcCode);
+                    // Wrap it to provide context (SANEApi will be defined later)
+                    contextModifier = (text) => {
+                        // Get SANEApi at runtime (it's defined after this loads)
+                        const api = typeof SANEApi !== 'undefined' ? SANEApi : {get, set, save};
+                        return baseFunc.call({
+                            SANE: api,
+                            GameState: api,
+                            ModuleAPI: ModuleAPI,
+                            Utilities: Utilities,
+                            Calendar: Calendar,
+                            get: get,
+                            set: set,
+                            save: save,
+                            state: state,
+                            history: history
+                        }, text);
+                    };
+                    debugLog('runtime', 'Loaded context modifier');
                 }
-                
-                logTime();
-                return modifiedText;
+            } catch (e) {
+                debugLog('runtime', `Error loading context modifier: ${e.message}`);
+                contextModifier = null;
             }
-            break;
+        }
+
+        const outputModCard = Utilities?.storyCard?.get('[SANE_RUNTIME] OUTPUT_MODIFIER');
+        if (outputModCard) {
+            try {
+                const fullCode = (outputModCard.entry || '') + '\n' + (outputModCard.description || '');
+
+                // Skip if only comments
+                const codeWithoutComments = fullCode.replace(/\/\/.*$/gm, '').replace(/\/\*[\s\S]*?\*\//g, '').trim();
+                if (!codeWithoutComments) {
+                    debugLog('runtime', 'Output modifier is empty, using pass-through');
+                    outputModifier = (text) => text;
+                } else {
+                    // Create function from code with access to SANE context
+                    const codeWithReturn = fullCode.includes('return ') ? fullCode : fullCode + '\nreturn text;';
+                    const funcCode = `(function(text) {
+                        const SANE = this.SANE || {};
+                        const GameState = this.GameState || this.SANE || {};
+                        const ModuleAPI = this.ModuleAPI || {};
+                        const Utilities = this.Utilities;
+                        const Calendar = this.Calendar;
+                        const get = this.get;
+                        const set = this.set;
+                        const state = this.state;
+                        const history = this.history;
+                        ${codeWithReturn}
+                    })`;
+                    const baseFunc = eval(funcCode);
+                    // Wrap it to provide context (SANEApi will be defined later)
+                    outputModifier = (text) => {
+                        // Get SANEApi at runtime (it's defined after this loads)
+                        const api = typeof SANEApi !== 'undefined' ? SANEApi : {get, set, save};
+                        return baseFunc.call({
+                            SANE: api,
+                            GameState: api,
+                            ModuleAPI: ModuleAPI,
+                            Utilities: Utilities,
+                            Calendar: Calendar,
+                            get: get,
+                            set: set,
+                            save: save,
+                            state: state,
+                            history: history
+                        }, text);
+                    };
+                    debugLog('runtime', 'Loaded output modifier');
+                }
+            } catch (e) {
+                debugLog('runtime', `Error loading output modifier: ${e.message}`);
+                outputModifier = null;
+            }
+        }
+
+        // Entity tracker configuration is now handled by EntityTrackerModule
     }
-    
-    // Log execution time before returning
+
+    //#endregion RUNTIME CONFIG
+
+    // ========================================
+    // MAIN EXECUTION
+    // ========================================
+    //#region MAIN EXECUTION
+
+    // Load runtime configurations (function is defined above)
+    loadRuntimeConfigurations();
+
+    // Process the hook based on type
+    let result = text;
+    try {
+        switch (hook) {
+            case 'input':
+                result = processInputHook(text);
+                break;
+            case 'context':
+                result = processContextHook(text);
+                break;
+            case 'output':
+                result = processOutputHook(text);
+                break;
+            default:
+                debugLog('error', `Unknown hook type: ${hook}`);
+        }
+    } catch (e) {
+        console.log(`${MODULE_NAME}: Fatal error in hook processing: ${e.message}`);
+        debugLogStore.errors.push({
+            error: e.message,
+            stack: e.stack,
+            context: `main hook processing: ${hook}`
+        });
+        if (MODULE_CONFIG.debug) console.log(e.stack);
+    }
+
+    // Flush all modified entities to Story Cards before finishing
+    flushModifiedEntities();
+
+    // Log execution time
     logTime();
-    return GameState;
+
+    return result;
+
+    //#endregion MAIN EXECUTION
 }

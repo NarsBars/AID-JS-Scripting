@@ -80,6 +80,9 @@ function SANE(hook, text) {
     // Zero-width character to prevent empty output errors
     const ZERO_WIDTH_CHAR = '\u200B';
 
+    const HIDE_BEGINNING = '<<<'
+    const HIDE_ENDING = '>>>'
+
     // Scene management
     let currentScene = null;
     let currentHash = null;
@@ -302,9 +305,9 @@ function SANE(hook, text) {
 
         // Normalize ID
         const normalizedId = normalizeEntityId(entityId);
-        const resolvedId = entityAliasMap[normalizedId] || entityId;
+        const resolvedId = entityAliasMap[normalizedId] || normalizedId;  // Use normalized ID, not original
 
-        // Get or create entity
+        // Get or create entity (use normalized key for lookup)
         let entity = dataCache[resolvedId];
         if (!entity) {
             // Create new entity
@@ -397,6 +400,36 @@ function SANE(hook, text) {
                             }
                         } catch (e) {
                             // Continue searching
+                        }
+                    }
+                }
+
+                // CLEANUP: Remove entity from [SANE:D] data cards if transitioning from DATA to DISPLAY
+                // This happens when display.active gets set to true after generation completes
+                const dataCards = Utilities.storyCard.find(card => card.title && card.title.startsWith('[SANE:D]'), true) || [];
+                for (const dataCard of dataCards) {
+                    if (dataCard.description) {
+                        try {
+                            const entities = JSON.parse(dataCard.description);
+                            // Check if this entity exists in this data card
+                            if (entities[entityId] || entities[normalizedId]) {
+                                // Remove the entity from the data card
+                                delete entities[entityId];
+                                delete entities[normalizedId];
+
+                                // Update the data card without this entity
+                                const updatedJson = JSON.stringify(entities);
+                                Utilities.storyCard.upsert({
+                                    title: dataCard.title,
+                                    value: dataCard.value || '# Data Storage',
+                                    description: updatedJson,
+                                    type: 'data'
+                                });
+
+                                if (debug) console.log(`[SANE save]: Removed ${entityId} from ${dataCard.title} during transition to display card`);
+                            }
+                        } catch (e) {
+                            // Continue checking other data cards
                         }
                     }
                 }
@@ -2036,6 +2069,15 @@ function SANE(hook, text) {
         const valueParsers = {
             // Parse "Item x5" format for inventory
             inventory: function(value) {
+                // Check for empty/null values first
+                const trimmedValue = value ? value.trim().toLowerCase() : '';
+                const emptyValues = ['none', 'n/a', 'na', 'null', ''];
+
+                if (emptyValues.includes(trimmedValue)) {
+                    // Return special marker for empty inventory
+                    return { _empty: true };
+                }
+
                 const match = value.match(/^(.+?)\s*x\s*(\d+)$/);
                 if (match) {
                     return {
@@ -2170,6 +2212,13 @@ function SANE(hook, text) {
         function applyMapsTo(entityId, mapsTo, parsedValue) {
             if (!mapsTo || parsedValue === undefined || parsedValue === null) return false;
 
+            // Special handling for empty inventory marker
+            if (parsedValue && parsedValue._empty === true) {
+                // This is a valid "no items" response - return true to indicate success
+                // but don't actually set anything
+                return true;
+            }
+
             // Replace * with entityId directly
             let path = mapsTo.replace('*', entityId);
 
@@ -2206,10 +2255,37 @@ function SANE(hook, text) {
                 // Replace {item} with parsed item value
                 if (parsedValue.item) {
                     path = path.replace('{item}', parsedValue.item);
+                    // For item paths, store only quantity (not the full {item, quantity} object)
+                    parsedValue = { quantity: parsedValue.quantity || 1 };
                 }
                 // Replace {character} with parsed character value
                 if (parsedValue.character) {
                     path = path.replace('{character}', parsedValue.character);
+                }
+            }
+
+            // Special handling for objectives - ensure complete structure
+            if (path.includes('.objectives.objective_') && path.endsWith('.description')) {
+                // Extract the objective parent path
+                const objPath = path.substring(0, path.lastIndexOf('.description'));
+
+                // Get or create the objective object
+                let objective = ModuleAPI.get(objPath);
+                if (!objective || typeof objective !== 'object') {
+                    objective = {
+                        description: parsedValue,
+                        completed: false,
+                        progress: 0,
+                        target: 1
+                    };
+                    ModuleAPI.set(objPath, objective);
+                    if (debug) console.log(`${MODULE_NAME}: Created complete objective at ${objPath}`);
+                    return true;
+                } else {
+                    // Just update the description
+                    objective.description = parsedValue;
+                    ModuleAPI.set(objPath, objective);
+                    return true;
                 }
             }
 
@@ -2221,6 +2297,118 @@ function SANE(hook, text) {
                 console.log(`${MODULE_NAME}: Failed to apply maps_to: ${e.message}`);
                 return false;
             }
+        }
+
+        // Helper: Evaluate computed fields
+        function evaluateComputedField(formula, collectedFields) {
+            if (!formula || typeof formula !== 'string') return null;
+
+            // Replace $(fieldName) with collected values
+            let expression = formula;
+            const fieldPattern = /\$\(([^)]+)\)/g;
+            expression = expression.replace(fieldPattern, (match, fieldName) => {
+                const value = collectedFields[fieldName];
+                if (value === undefined || value === null) {
+                    return 'null';
+                }
+                // Quote strings
+                if (typeof value === 'string') {
+                    return `"${value.replace(/"/g, '\\"')}"`;
+                }
+                return String(value);
+            });
+
+            // Evaluate the expression using eval (AI Dungeon sandbox doesn't support Function constructor)
+            try {
+                if (debug) console.log(`${MODULE_NAME}: Evaluating expression: ${expression}`);
+                const result = eval(expression);
+                if (debug) console.log(`${MODULE_NAME}: Expression result: ${result}`);
+                return result;
+            } catch (e) {
+                if (debug) console.log(`${MODULE_NAME}: Failed to evaluate computed field: ${e.message}`);
+                return null;
+            }
+        }
+
+        // Helper: Expand template fields into concrete fields
+        function expandFieldTemplates(generation, collectedFields) {
+            if (!generation.fields) return false;
+
+            let anyExpanded = false;
+
+            // Look for fields with type: "expansion"
+            for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                if (fieldDef.type !== 'expansion') continue;
+                if (fieldDef._expanded) continue;  // Already expanded
+
+                // Evaluate the count (can be a number or a formula)
+                let count = fieldDef.count;
+                if (typeof count === 'string' && count.includes('$(')) {
+                    count = evaluateComputedField(count, collectedFields);
+                }
+
+                if (typeof count !== 'number' || count < 1) {
+                    if (debug) console.log(`${MODULE_NAME}: Invalid count for expansion field ${fieldName}: ${count}`);
+                    continue;
+                }
+
+                // Expand the template
+                const template = fieldDef.template;
+                if (!template) {
+                    if (debug) console.log(`${MODULE_NAME}: No template for expansion field ${fieldName}`);
+                    continue;
+                }
+
+                // Create {count} number of fields based on template
+                for (let i = 1; i <= count; i++) {
+                    const expandedFieldName = template.fieldName ? template.fieldName.replace('{i}', i) : `${fieldName}_${i}`;
+
+                    // Don't overwrite existing fields
+                    if (generation.fields[expandedFieldName]) continue;
+
+                    // Create the expanded field
+                    generation.fields[expandedFieldName] = {
+                        maps_to: template.maps_to ? template.maps_to.replace('{i}', i) : null,
+                        key: template.key ? template.key.replace('{i}', i) : expandedFieldName.toUpperCase(),
+                        parser: template.parser || 'text',
+                        prompt: template.prompt ? {
+                            uncollected: template.prompt.uncollected ? template.prompt.uncollected.replace(/{i}/g, i) : null,
+                            known: template.prompt.known ? template.prompt.known.replace(/{i}/g, i) : null,
+                            priority: template.prompt.priority ? template.prompt.priority + i : 50 + i
+                        } : null
+                    };
+
+                    if (debug) console.log(`${MODULE_NAME}: Expanded ${fieldName} to ${expandedFieldName}`);
+                    anyExpanded = true;
+                }
+
+                // Mark as expanded
+                fieldDef._expanded = true;
+            }
+
+            return anyExpanded;
+        }
+
+        // Helper: Process computed fields
+        function processComputedFields(generation, collectedFields) {
+            if (!generation.fields) return false;
+
+            let anyComputed = false;
+
+            for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                if (fieldDef.source !== 'computed') continue;
+                if (collectedFields[fieldName] !== undefined) continue;  // Already computed
+
+                // Evaluate the formula
+                const result = evaluateComputedField(fieldDef.formula, collectedFields);
+                if (result !== null && result !== undefined) {
+                    collectedFields[fieldName] = result;
+                    anyComputed = true;
+                    if (debug) console.log(`${MODULE_NAME}: Computed ${fieldName} = ${result}`);
+                }
+            }
+
+            return anyComputed;
         }
 
         // Helper: Find entities with active generation
@@ -2330,18 +2518,22 @@ function SANE(hook, text) {
 
             // Process the response
             const result = processResponse(text, activeGen);
-
+            let hiddentext = ' ';
             // Set appropriate message based on result
             if (state && typeof state === 'object') {
                 if (result === 'completed') {
                     state.message = COMPLETION_MESSAGE;
+                    // temp state.message fix
+                    hiddentext = HIDE_BEGINNING + COMPLETION_MESSAGE + HIDE_ENDING;
                 } else if (result) {
                     state.message = PROCESSING_MESSAGE;
+                    // temp state.message fix
+                    hiddentext = HIDE_BEGINNING + PROCESSING_MESSAGE + HIDE_ENDING;
                 }
             }
 
             // Hide the output during generation
-            return { active: true, text: ZERO_WIDTH_CHAR };
+            return { active: true, text: hiddentext /*ZERO_WIDTH_CHAR*/ };
         });
 
         // Helper: Process AI response
@@ -2364,6 +2556,9 @@ function SANE(hook, text) {
 
                 if (generation.fields) {
                     for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                        // Skip computed and expansion fields - they're not collected from AI
+                        if (fieldDef.source === 'computed' || fieldDef.type === 'expansion') continue;
+
                         if (!collectedFields[fieldName]) {
                             const key = fieldDef.key || fieldName.toUpperCase();
                             expectedKeys.push(key);
@@ -2467,7 +2662,12 @@ function SANE(hook, text) {
                         if (!genComponent.fields_collected) {
                             genComponent.fields_collected = {};
                         }
-                        genComponent.fields_collected[fieldName] = parsedValue;
+                        // Store the original value for empty inventory items, not the marker
+                        if (parsedValue && parsedValue._empty === true) {
+                            genComponent.fields_collected[fieldName] = 'None';
+                        } else {
+                            genComponent.fields_collected[fieldName] = parsedValue;
+                        }
                         anyCollected = true;
                     }
                 }
@@ -2476,10 +2676,13 @@ function SANE(hook, text) {
                 if (anyCollected) {
                     ModuleAPI.save(activeGen.entityId, entity);
 
-                    // Check if all fields are now collected
+                    // Check if all fields are now collected (expansion already happened in prompt builder)
                     const stillNeeded = [];
                     if (generation.fields) {
                         for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                            // Skip expansion templates and computed fields - they don't need to be collected
+                            if (fieldDef.type === 'expansion' || fieldDef.source === 'computed') continue;
+
                             if (!genComponent.fields_collected[fieldName]) {
                                 stillNeeded.push(fieldName);
                             }
@@ -2654,6 +2857,18 @@ function SANE(hook, text) {
             const generation = genComponent.generations?.[activeGenName];
             if (!generation) return null;
 
+            // IMPORTANT: Process computed fields and expand templates BEFORE building prompt
+            const collectedFields = genComponent.fields_collected || {};
+
+            // Process computed fields first
+            processComputedFields(generation, collectedFields);
+
+            // Expand template fields based on computed values
+            const expanded = expandFieldTemplates(generation, collectedFields);
+            if (expanded && debug) {
+                console.log(`${MODULE_NAME}: Expanded template fields in prompt builder`);
+            }
+
             // Build context for variable substitution
             const context = {
                 trigger_name: genComponent.trigger || entity.info?.trigger_name || entity.info?.displayname || entity.id,
@@ -2701,6 +2916,9 @@ function SANE(hook, text) {
                 const collectedFields = genComponent.fields_collected || {};
                 if (generation.fields) {
                     for (const [fieldName, fieldDef] of Object.entries(generation.fields)) {
+                        // Skip computed and expansion fields - they're not collected from AI
+                        if (fieldDef.source === 'computed' || fieldDef.type === 'expansion') continue;
+
                         if (!collectedFields[fieldName]) {
                             const key = fieldDef.key || fieldName.toUpperCase();
                             if (fieldDef.prompt && fieldDef.prompt.uncollected) {
@@ -2786,8 +3004,8 @@ function SANE(hook, text) {
                 console.log(`${MODULE_NAME}: Checking rename - displayname: "${entity.info?.displayname}", aliases[0]: "${entity.aliases?.[0]}", finalName: "${finalName}"`);
             }
             if (finalName && finalName !== entityId) {
-                // Create renamed entity - use the USERNAME as-is for the ID (just replace spaces)
-                const renamedId = finalName.replace(/\s+/g, '_');
+                // Create renamed entity - use the displayname as-is, no transformation
+                const renamedId = finalName;  // No transformation - use displayname directly
                 if (renamedId !== entityId && !ModuleAPI.get(renamedId)) {
                     // Copy to new ID
                     entity.id = renamedId;
@@ -2843,7 +3061,7 @@ function SANE(hook, text) {
 
             // Generate unique ID - use provided name or create timestamp-based one
             const displayName = name || `NPC_${Date.now()}`;
-            const characterId = displayName.toLowerCase().replace(/\s+/g, '_');
+            const characterId = displayName;  // Use displayName as-is, no transformation
 
             // Check if character already exists
             if (ModuleAPI.get(characterId)) {
@@ -2889,7 +3107,7 @@ function SANE(hook, text) {
 
             // Generate unique ID - use provided name or create timestamp-based one
             const displayName = name || `Location_${Date.now()}`;
-            const locationId = displayName.toLowerCase().replace(/\s+/g, '_');
+            const locationId = displayName;  // Use displayName as-is, no transformation
 
             // Check if location already exists
             if (ModuleAPI.get(locationId)) {
@@ -2924,11 +3142,11 @@ function SANE(hook, text) {
         });
 
         ModuleAPI.registerTool('gw_quest', function(params) {
-            const [name, type] = params;
+            const [name, typeParam] = params;
 
             // Generate unique ID - use provided name or create timestamp-based one
             const displayName = name || `Quest_${Date.now()}`;
-            const questId = displayName.toLowerCase().replace(/\s+/g, '_');
+            const questId = displayName;  // Use displayName as-is, no transformation
 
             // Check if quest already exists
             if (ModuleAPI.get(questId)) {
@@ -2936,18 +3154,36 @@ function SANE(hook, text) {
                 return 'malformed';
             }
 
+            // Determine quest type - code decides, not user
+            let questType = typeParam;
+            if (!questType) {
+                // Randomize quest type with weighted distribution
+                const rand = Math.random();
+                if (rand < 0.05) {
+                    questType = "Story";        // 5% chance - Main story quests
+                } else if (rand < 0.75) {
+                    questType = "Side";         // 70% chance - Side quests
+                } else if (rand < 0.90) {
+                    questType = "Hidden";       // 15% chance - Hidden quests
+                } else {
+                    questType = "Raid";         // 10% chance - Raid quests
+                }
+                if (debug) console.log(`${MODULE_NAME}: Randomized quest type: ${questType}`);
+            }
+
             // Structure data for blueprint
             const entityData = {
                 id: questId,
+                quest: {
+                    type: questType
+                },
                 generationwizard: {
-                    trigger: displayName
+                    trigger: displayName,
+                    fields_collected: {
+                        type: questType  // Mark type as already collected
+                    }
                 }
             };
-
-            // Add type if provided
-            if (type) {
-                entityData.quest = { type: type };
-            }
 
             // Instantiate from Quest blueprint
             const entity = ModuleAPI.instantiateBlueprint('Quest', entityData);
@@ -3318,7 +3554,6 @@ function SANE(hook, text) {
                     info: {
                         displayname: null,
                         description: null,
-                        atmosphere: null,
                         type: null,
                         danger_level: null
                     },
@@ -3333,22 +3568,16 @@ function SANE(hook, text) {
                                 template: "### **{info.displayname}**",
                                 condition: "info.displayname"
                             },
-                            atmosphere: {
-                                line: "infoline",
-                                priority: 10,
-                                template: "{info.atmosphere}",
-                                condition: "info.atmosphere"
-                            },
                             type: {
                                 line: "infoline",
                                 priority: 20,
-                                template: " | Type: {info.type}",
+                                template: "Type: {info.type}",
                                 condition: "info.type"
                             },
                             danger: {
                                 line: "infoline",
                                 priority: 30,
-                                template: " | Danger: {info.danger_level}",
+                                template: "Danger: {info.danger_level}",
                                 condition: "info.danger_level"
                             },
                             description: {
@@ -3383,15 +3612,6 @@ function SANE(hook, text) {
                                             uncollected: "DESCRIPTION: [Detailed description of the location - what it looks like, sounds, smells, notable features. 2-3 sentences]",
                                             known: "Description: $(value)",
                                             priority: 20
-                                        }
-                                    },
-                                    atmosphere: {
-                                        maps_to: "*.info.atmosphere",
-                                        key: "ATMOSPHERE",
-                                        prompt: {
-                                            uncollected: "ATMOSPHERE: [The mood and feeling of this place in 3-5 words]",
-                                            known: "Atmosphere: $(value)",
-                                            priority: 30
                                         }
                                     },
                                     type: {
@@ -3460,18 +3680,19 @@ function SANE(hook, text) {
                         displayname: null,
                         description: null,
                         difficulty: null,
-                        type: null
                     },
                     quest: {
                         status: 'available',
                         giver: null,
                         location: null,
-                        prerequisites: []
+                        prerequisites: [],
+                        type: null
                     },
                     objectives: {},  // Objectives added dynamically
                     rewards: {},     // Rewards added dynamically
                     display: {
                         active: false,  // Will be set to true when generation completes
+                        prefix: "<$# Quests>",
                         sections: {
                             header: {
                                 line: "nameline",
@@ -3482,19 +3703,31 @@ function SANE(hook, text) {
                             status: {
                                 line: "infoline",
                                 priority: 10,
-                                template: "Status: {quest.status} | Difficulty: {info.difficulty}",
+                                template: "Status: {quest.status}",
                                 condition: "quest.status"
+                            },
+                            type: {
+                                line: "infoline",
+                                priority: 11,
+                                template: "Type: {quest.type}",
+                                condition: "quest.type"
+                            },
+                            difficulty: {
+                                line: "infoline",
+                                priority: 15,
+                                template: "Difficulty: {info.difficulty}",
+                                condition: "info.difficulty"
                             },
                             giver: {
                                 line: "infoline",
                                 priority: 20,
-                                template: " | Giver: {quest.giver}",
+                                template: "Giver: {quest.giver}",
                                 condition: "quest.giver"
                             },
                             location: {
                                 line: "infoline",
                                 priority: 30,
-                                template: " | Location: {quest.location}",
+                                template: "Location: {quest.location}",
                                 condition: "quest.location"
                             },
                             description: {
@@ -3506,14 +3739,26 @@ function SANE(hook, text) {
                             objectives: {
                                 line: "section",
                                 priority: 20,
-                                template: "**Objectives:**\n{objectives.*→ • [{*.completed ? 'X' : ' '}] {*.description} {*.progress ? '(' + *.progress + '/' + *.target + ')' : ''}}",
-                                condition: "$hasContent(objectives)"
+                                template: "**Objectives:**\n{objectives.*→ • {*.description}}",
+                                condition: "objectives.*"
                             },
-                            rewards: {
+                            rewards_xp: {
                                 line: "section",
                                 priority: 30,
-                                template: "**Rewards:**\n{rewards.xp ? '• Experience: ' + rewards.xp + ' XP\n' : ''}{rewards.gold ? '• Gold: ' + rewards.gold + '\n' : ''}{rewards.*→$isItem(*) ? '• ' + *.displayname + ' x' + *.quantity + '\n' : ''}",
-                                condition: "$hasContent(rewards)"
+                                template: "**Rewards:**\n• Experience: {rewards.xp} XP",
+                                condition: "rewards.xp"
+                            },
+                            rewards_gold: {
+                                line: "section",
+                                priority: 31,
+                                template: "• Gold: {rewards.gold}",
+                                condition: "rewards.gold"
+                            },
+                            rewards_items: {
+                                line: "section",
+                                priority: 32,
+                                template: "{rewards.items.*→ • {*} x{*.quantity}}",
+                                condition: "rewards.items.*"
                             }
                         }
                     },
@@ -3556,15 +3801,6 @@ function SANE(hook, text) {
                                             priority: 25
                                         }
                                     },
-                                    type: {
-                                        maps_to: "*.info.type",
-                                        key: "TYPE",
-                                        prompt: {
-                                            uncollected: "TYPE: [Main Quest/Side Quest/Daily Quest/Event Quest]",
-                                            known: "Type: $(value)",
-                                            priority: 30
-                                        }
-                                    },
                                     giver: {
                                         maps_to: "*.quest.giver",
                                         key: "GIVER",
@@ -3583,14 +3819,23 @@ function SANE(hook, text) {
                                             priority: 50
                                         }
                                     },
+                                    objective_count: {
+                                        source: "computed",
+                                        formula: '$(type) === "Story" ? Math.floor(Math.random() * 4) + 4 : $(type) === "Side" ? Math.floor(Math.random() * 3) + 2 : $(type) === "Hidden" ? Math.floor(Math.random() * 3) + 3 : $(type) === "Raid" ? Math.floor(Math.random() * 4) + 5 : Math.floor(Math.random() * 3) + 2'
+                                    },
                                     objectives: {
-                                        maps_to: "*.objectives",
-                                        parser: "objectives",
-                                        key: "OBJECTIVES",
-                                        prompt: {
-                                            uncollected: "OBJECTIVES: [List 1-3 specific quest objectives, one per line]\n- [First objective]\n- [Second objective]",
-                                            known: "Objectives: $(value)",
-                                            priority: 60
+                                        type: "expansion",
+                                        count: "$(objective_count)",
+                                        template: {
+                                            fieldName: "objective_{i}",
+                                            maps_to: "*.objectives.objective_{i}.description",
+                                            key: "OBJECTIVE_{i}",
+                                            parser: "text",
+                                            prompt: {
+                                                uncollected: "OBJECTIVE_{i}: [Specific objective #{i} for this quest]",
+                                                known: "Objective {i}: $(value)",
+                                                priority: 60
+                                            }
                                         }
                                     },
                                     xp_reward: {
@@ -3614,11 +3859,11 @@ function SANE(hook, text) {
                                         }
                                     },
                                     item_rewards: {
-                                        maps_to: "*.rewards",
+                                        maps_to: "*.rewards.items.{item}",
                                         parser: "inventory",
                                         key: "ITEM_REWARDS",
                                         prompt: {
-                                            uncollected: "ITEM_REWARDS: [List items as 'item_name x quantity', one per line, or 'None']",
+                                            uncollected: "ITEM_REWARDS: [Single item reward as 'item_name x quantity', or 'None']",
                                             known: "Item Rewards: $(value)",
                                             priority: 90
                                         }
@@ -5816,9 +6061,6 @@ function SANE(hook, text) {
             debugLog('input', `get[${path}] = ${JSON.stringify(value)}`);
         }
 
-        // Do NOT process tools during input - tools are only processed in output
-        // Player input should only handle commands, not tool execution
-
         // Run module input hooks
         for (const handler of hooks.input) {
             try {
@@ -5840,7 +6082,16 @@ function SANE(hook, text) {
     function processContextHook(text) {
         let modifiedText = text;
 
-        // Check for edits/rewinds in history (MUST happen first)
+        // Remove content between HIDE_BEGINNING and HIDE_ENDING markers (including the markers)
+        // temporary fix for state.message handling
+        const hidePattern = /HIDE_BEGINNING[\s\S]*?HIDE_ENDING/g;
+        const hideMatches = modifiedText.match(hidePattern);
+        if (hideMatches && hideMatches.length > 0) {
+            modifiedText = modifiedText.replace(hidePattern, '');
+            debugLog('context', `Removed ${hideMatches.length} hidden content block(s)`);
+        }
+
+        // Check for edits/rewinds in history (MUST happen first after hidden content removal)
         if (ModuleAPI.RewindSystem && ModuleAPI.RewindSystem.handleContext) {
             try {
                 ModuleAPI.RewindSystem.handleContext();
@@ -5850,7 +6101,6 @@ function SANE(hook, text) {
         }
 
         // Replace ((trigger_name)) placeholders with displaynames
-        // This is a core system that runs every turn, independent of any module
         const triggerPattern = /\(\(([^)]+)\)\)/g;
         let triggerReplacements = 0;
 

@@ -1657,7 +1657,11 @@ function GenerationWizardModule() {
 
                     // Special handling for itemList type - parse "item_name x qty" format
                     if (fieldDef.specialType === 'itemList') {
-                        if (collectedValue && collectedValue.toLowerCase() !== 'null' && collectedValue.trim() !== '') {
+                        // Check if value should be treated as empty (null, None, N/A, etc.)
+                        const lowerValue = collectedValue ? collectedValue.toLowerCase().trim() : '';
+                        const emptyValues = ['null', 'none', 'n/a', 'na', ''];
+
+                        if (collectedValue && !emptyValues.includes(lowerValue)) {
                             const itemsObject = {};
                             const itemPairs = collectedValue.split(',');
                             for (const pair of itemPairs) {
@@ -1668,6 +1672,14 @@ function GenerationWizardModule() {
                                     const quantity = parseInt(match[2], 10);
                                     if (itemName && !isNaN(quantity)) {
                                         itemsObject[itemName] = { quantity };
+                                    }
+                                } else if (pair.trim()) {
+                                    // If no "x quantity" format, check if it's a valid item name
+                                    const itemName = pair.trim();
+                                    // Skip common empty values even if they appear without "x quantity"
+                                    if (!emptyValues.includes(itemName.toLowerCase())) {
+                                        // Default to quantity 1 for valid items without quantity
+                                        itemsObject[itemName] = { quantity: 1 };
                                     }
                                 }
                             }
