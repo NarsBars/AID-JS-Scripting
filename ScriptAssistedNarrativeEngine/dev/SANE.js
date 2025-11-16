@@ -84,17 +84,7 @@ function SANE(hook, text) {
     const HIDE_ENDING = '>>>'
 
     // Scene management
-    let currentScene = null;
     let currentHash = null;
-
-    // Entity tracker (must be defined early for tool processing)
-    const entityTracker = {
-        unknown: {},       // Track entities referenced but not found
-        unknownTools: {},  // Track unknown tools from AI
-        queue: [],         // Queue for entities pending generation
-        threshold: 3,      // Default threshold for auto-generation
-        autoGenerate: true // Whether to auto-generate entities
-    };
 
     // Initialize Library with external dependencies
     Library.Utilities = Utilities;
@@ -991,7 +981,6 @@ function SANE(hook, text) {
 
         // Entity tracker (will be provided by EntityTrackerModule)
         trackUnknownEntity: null,  // Will be set by EntityTrackerModule
-        entityTracker,
 
         // Registration functions
         registerSchema, registerTool, registerRewindable, registerHook, registerAPI,
@@ -1890,9 +1879,34 @@ function SANE(hook, text) {
 
                         // Replace {*} with key
                         itemText = itemText.replace(/\{\*\}/g, key);
-                        // Replace {*.field} with value fields
+
+                        // Handle array values specially for pathways
+                        if (Array.isArray(value)) {
+                            // For arrays of strings, just join them
+                            const destinations = value.map(item => {
+                                if (typeof item === 'string') {
+                                    return item;
+                                } else if (typeof item === 'object' && item.destination) {
+                                    // Handle old format for backward compatibility
+                                    return item.destination;
+                                }
+                                return 'Unknown';
+                            });
+                            itemText = itemText.replace(/\{\*\.\*\|[^}]+\}/g, destinations.join(', '));
+                        }
+
+                        // Handle nested iteration: {*.*| pattern} for non-arrays
+                        itemText = itemText.replace(/\{\*\.\*\|([^}]+)\}/g, (m, subPattern) => {
+                            // This is for backward compatibility with non-array nested patterns
+                            if (!Array.isArray(value)) {
+                                return value || 'None';
+                            }
+                            return ''; // Already handled above
+                        });
+
+                        // Replace {*.field} with value fields (for non-array access)
                         itemText = itemText.replace(/\{\*\.([^}]+)\}/g, (m, field) => {
-                            if (typeof value === 'object' && value !== null) {
+                            if (typeof value === 'object' && value !== null && !Array.isArray(value)) {
                                 const fieldValue = getFieldValue(value, field);
                                 // Handle special values
                                 if (fieldValue === null || fieldValue === undefined) return 'None';
@@ -2154,10 +2168,21 @@ function SANE(hook, text) {
 
                 return objectives;
             },
-            // Parse pathways/exits
+            // Parse pathways/exits (supports multiple destinations per direction)
             pathways: function(value) {
                 // Parse list of pathways/exits
                 const pathways = {};
+
+                // Valid direction keywords
+                const validDirections = [
+                    'north', 'south', 'east', 'west',
+                    'northeast', 'northwest', 'southeast', 'southwest',
+                    'up', 'down', 'in', 'out',
+                    'forward', 'back', 'backward',
+                    'left', 'right',
+                    'inside', 'outside',
+                    'enter', 'exit', 'entrance'
+                ];
 
                 // Split by newlines and filter out empty lines
                 const lines = value.split('\n').filter(line => line.trim());
@@ -2173,19 +2198,22 @@ function SANE(hook, text) {
                             const direction = colonMatch[1].trim().toLowerCase();
                             const destination = colonMatch[2].trim();
 
-                            // Store pathway keyed by direction
-                            pathways[direction] = {
-                                destination: destination,
-                                description: null
-                            };
-                        } else {
-                            // Just a direction name - use as key with Unknown destination
-                            const direction = cleanLine.toLowerCase();
-                            pathways[direction] = {
-                                destination: 'Unknown',
-                                description: null
-                            };
+                            // Validate direction is reasonable
+                            const isValidDirection = validDirections.some(valid =>
+                                direction.includes(valid) || valid.includes(direction)
+                            ) || direction.length <= 20; // Allow short custom directions
+
+                            if (isValidDirection && destination && destination !== 'Unknown') {
+                                // Initialize array if direction doesn't exist
+                                if (!pathways[direction]) {
+                                    pathways[direction] = [];
+                                }
+                                // Add destination as simple string to array
+                                pathways[direction].push(destination);
+                            }
+                            // Skip invalid or incomplete entries
                         }
+                        // If no colon, skip the line entirely (don't create invalid entries)
                     }
                 });
 
@@ -3595,7 +3623,7 @@ function SANE(hook, text) {
                             pathways: {
                                 line: "section",
                                 priority: 20,
-                                template: "**Paths:**\n{pathways.*→ • {*}: {*.destination}}",
+                                template: "**Paths:**\n{pathways.*→ • {*}: {*.*| {*.destination}}",
                                 condition: "pathways.*"
                             }
                         }
@@ -3636,16 +3664,6 @@ function SANE(hook, text) {
                                             uncollected: "DANGER_LEVEL: [Safe/Low/Medium/High/Extreme]",
                                             known: "Danger Level: $(value)",
                                             priority: 50
-                                        }
-                                    },
-                                    pathways: {
-                                        maps_to: "*.pathways",
-                                        parser: "pathways",
-                                        key: "EXITS",
-                                        prompt: {
-                                            uncollected: "EXITS: [List available exits, one per line]\n- [Direction]: [Destination]",
-                                            known: "Exits: $(value)",
-                                            priority: 60
                                         }
                                     }
                                 },
@@ -4165,8 +4183,25 @@ function SANE(hook, text) {
                 return 'malformed';
             }
 
-            // Update source's relationship to target
+            // Get entities and track if not found
             const sourceEntity = ModuleAPI.get(source);
+            const targetEntity = ModuleAPI.get(target);
+
+            // Track unknown entities
+            if (!sourceEntity) {
+                if (ModuleAPI.trackUnknownEntity) {
+                    ModuleAPI.trackUnknownEntity(source, 'update_relationship');
+                }
+                if (MODULE_CONFIG.debug) console.log(`[update_relationship]: Source entity ${source} not found`);
+            }
+            if (!targetEntity) {
+                if (ModuleAPI.trackUnknownEntity) {
+                    ModuleAPI.trackUnknownEntity(target, 'update_relationship');
+                }
+                if (MODULE_CONFIG.debug) console.log(`[update_relationship]: Target entity ${target} not found`);
+            }
+
+            // Update source's relationship to target
             if (sourceEntity) {
                 if (!sourceEntity.relationships) sourceEntity.relationships = {};
                 if (!sourceEntity.relationships[target]) {
@@ -4177,7 +4212,6 @@ function SANE(hook, text) {
             }
 
             // Bidirectional update
-            const targetEntity = ModuleAPI.get(target);
             if (targetEntity) {
                 if (!targetEntity.relationships) targetEntity.relationships = {};
                 if (!targetEntity.relationships[source]) {
@@ -4258,6 +4292,10 @@ function SANE(hook, text) {
             const character = ModuleAPI.get(charName);
             if (!character) {
                 if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Character ${charName} not found`);
+                // Track unknown character
+                if (ModuleAPI.trackUnknownEntity) {
+                    ModuleAPI.trackUnknownEntity(characterName, 'discover_location');
+                }
                 return 'executed';
             }
 
@@ -4267,6 +4305,9 @@ function SANE(hook, text) {
                 if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Location ${locName} already exists - cannot discover existing location`);
                 return 'malformed';
             }
+
+            // Get character's current location
+            const currentLocation = character.info?.currentLocation || null;
 
             // Create new location using blueprint
             if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Creating new location ${locName} using blueprint`);
@@ -4282,24 +4323,42 @@ function SANE(hook, text) {
                 pathways: {}
             };
 
-            // If direction specified, set up pathways before creation
-            if (dir && character.info?.currentLocation) {
+            // If direction specified and we know current location, set up pathways before creation
+            if (dir && currentLocation) {
                 const opposites = {
                     'north': 'south',
                     'south': 'north',
                     'east': 'west',
                     'west': 'east',
+                    'northeast': 'southwest',
+                    'northwest': 'southeast',
+                    'southeast': 'northwest',
+                    'southwest': 'northeast',
                     'up': 'down',
                     'down': 'up',
+                    'in': 'out',
+                    'out': 'in',
                     'inside': 'outside',
                     'outside': 'inside',
                     'enter': 'exit',
-                    'exit': 'enter'
+                    'exit': 'enter',
+                    'forward': 'back',
+                    'back': 'forward',
+                    'backward': 'forward',
+                    'left': 'right',
+                    'right': 'left'
                 };
 
-                // Add reverse pathway in the new location
+                // Add reverse pathway in the new location (as array of strings)
                 if (opposites[dir]) {
-                    locationData.pathways[opposites[dir]] = { destination: character.info.currentLocation };
+                    locationData.pathways[opposites[dir]] = [currentLocation];
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`${MODULE_NAME}: Setting up reverse pathway in ${locName}: ${opposites[dir]} -> ${currentLocation}`);
+                    }
+                }
+            } else if (dir && !currentLocation) {
+                if (MODULE_CONFIG.debug) {
+                    console.log(`${MODULE_NAME}: Direction ${dir} specified but character ${charName} has no current location`);
                 }
             }
 
@@ -4325,16 +4384,36 @@ function SANE(hook, text) {
                 ModuleAPI.save(locName, location);
             }
 
-            // If direction specified and character has current location, create connection
-            if (dir && character.info?.currentLocation) {
-                const currentLoc = ModuleAPI.get(character.info.currentLocation);
+            // If direction specified and we know current location, create connection
+            if (dir && currentLocation) {
+                const currentLoc = ModuleAPI.get(currentLocation);
                 if (currentLoc) {
                     // Add pathway from current location to new location
                     if (!currentLoc.pathways) currentLoc.pathways = {};
-                    currentLoc.pathways[dir] = { destination: locName };
+
+                    // Initialize as array if not exists, or convert old format
+                    if (!currentLoc.pathways[dir]) {
+                        currentLoc.pathways[dir] = [];
+                    } else if (!Array.isArray(currentLoc.pathways[dir])) {
+                        // Convert old format to array
+                        if (typeof currentLoc.pathways[dir] === 'string') {
+                            currentLoc.pathways[dir] = [currentLoc.pathways[dir]];
+                        } else if (currentLoc.pathways[dir].destination) {
+                            // Old object format with destination field
+                            currentLoc.pathways[dir] = [currentLoc.pathways[dir].destination];
+                        }
+                    }
+
+                    // Check if destination already exists in this direction
+                    if (!currentLoc.pathways[dir].includes(locName)) {
+                        currentLoc.pathways[dir].push(locName);
+                    }
 
                     // Save current location with new pathway
-                    ModuleAPI.save(character.info.currentLocation, currentLoc);
+                    ModuleAPI.save(currentLocation, currentLoc);
+                    if (MODULE_CONFIG.debug) {
+                        console.log(`${MODULE_NAME}: Added pathway from ${currentLocation} ${dir} to ${locName}`);
+                    }
                 }
             }
 
@@ -4407,8 +4486,29 @@ function SANE(hook, text) {
             if (!loc1.pathways) loc1.pathways = {};
             if (!loc2.pathways) loc2.pathways = {};
 
+            // Helper function to add pathway (handles array format)
+            function addPathway(location, direction, destination) {
+                // Initialize as array if not exists, or convert old format
+                if (!location.pathways[direction]) {
+                    location.pathways[direction] = [];
+                } else if (!Array.isArray(location.pathways[direction])) {
+                    // Convert old format to array
+                    if (typeof location.pathways[direction] === 'string') {
+                        location.pathways[direction] = [location.pathways[direction]];
+                    } else if (location.pathways[direction].destination) {
+                        // Old object format with destination field
+                        location.pathways[direction] = [location.pathways[direction].destination];
+                    }
+                }
+
+                // Check if destination already exists in this direction
+                if (!location.pathways[direction].includes(destination)) {
+                    location.pathways[direction].push(destination);
+                }
+            }
+
             // Create directional connection
-            loc1.pathways[dir] = { destination: loc2Name };
+            addPathway(loc1, dir, loc2Name);
 
             // Add reverse pathway if opposites are defined
             const opposites = {
@@ -4416,16 +4516,27 @@ function SANE(hook, text) {
                 'south': 'north',
                 'east': 'west',
                 'west': 'east',
+                'northeast': 'southwest',
+                'northwest': 'southeast',
+                'southeast': 'northwest',
+                'southwest': 'northeast',
                 'up': 'down',
                 'down': 'up',
+                'in': 'out',
+                'out': 'in',
                 'inside': 'outside',
                 'outside': 'inside',
                 'enter': 'exit',
-                'exit': 'enter'
+                'exit': 'enter',
+                'forward': 'back',
+                'back': 'forward',
+                'backward': 'forward',
+                'left': 'right',
+                'right': 'left'
             };
 
             if (opposites[dir]) {
-                loc2.pathways[opposites[dir]] = { destination: loc1Name };
+                addPathway(loc2, opposites[dir], loc1Name);
             }
 
             // Save both locations
@@ -4979,10 +5090,11 @@ function SANE(hook, text) {
             if (tracker.count >= config.threshold && !trackerData.queue.includes(normalizedName)) {
                 trackerData.queue.push(normalizedName);
                 debugLog('tracker', `Entity '${entityName}' queued for generation (count: ${tracker.count})`);
-
-                // Save queue to Story Card
-                saveEntityQueue();
             }
+
+            // Always save tracking data to ensure persistence
+            saveEntityQueue();
+            debugLog('tracker', `Entity '${entityName}' tracked (count: ${tracker.count})`);
         }
 
         // Track unknown tool
@@ -5036,29 +5148,6 @@ function SANE(hook, text) {
                 trackerData.initialized = true;
             }
             return text;
-        });
-
-        // Expose legacy entityTracker object for compatibility
-        // This maintains backward compatibility with existing code
-        Object.defineProperty(entityTracker, 'unknown', {
-            get: () => trackerData.unknown,
-            set: (val) => { trackerData.unknown = val; }
-        });
-        Object.defineProperty(entityTracker, 'unknownTools', {
-            get: () => trackerData.unknownTools,
-            set: (val) => { trackerData.unknownTools = val; }
-        });
-        Object.defineProperty(entityTracker, 'queue', {
-            get: () => trackerData.queue,
-            set: (val) => { trackerData.queue = val; }
-        });
-        Object.defineProperty(entityTracker, 'threshold', {
-            get: () => config.threshold,
-            set: (val) => { config.threshold = val; }
-        });
-        Object.defineProperty(entityTracker, 'autoGenerate', {
-            get: () => config.autoGenerate,
-            set: (val) => { config.autoGenerate = val; }
         });
 
     }
