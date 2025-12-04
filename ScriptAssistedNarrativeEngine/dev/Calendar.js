@@ -1,17 +1,24 @@
 function Calendar(hook, text) {
+    // time system bc idek what day it is every day i wake up
     'use strict';
-    
-    const debug = false;
+    const debug = true;
     const MODULE_NAME = 'Calendar';
     
     // =====================================
-    // CALENDAR MODULE v2.0
+    // CALENDAR MODULE
     // =====================================
-    // A complete time and event system for AI Dungeon
     //
     // USAGE:
-    //   Context Modifier: Calendar("context");
+    //   Context Modifier: text = Calendar("context", text);
+    //   Input Modifier: text = Calendar("input", text);
     //   API Only: Calendar();
+    //
+    // INPUT COMMANDS:
+    //   /advancetime("3h")         - Advance time by 3 hours
+    //   /advancetime("2d, 3h")     - Advance time by 2 days and 3 hours
+    //   /settime(14, 30)           - Set time to 2:30 PM
+    //   /settime(9)                - Set time to 9:00 AM
+    //   /setday(100)               - Jump to day 100
     //
     // CONFIGURATION CARDS:
     //   [CALENDAR] Time Configuration
@@ -148,6 +155,7 @@ function Calendar(hook, text) {
     const STATE_CARD = '[CALENDAR] Time State';
     const EVENT_CARD_PREFIX = '[CALENDAR] Event Days';
     const MODIFIED_CARDS_STATE = '[CALENDAR] Modified Cards State';
+    const DEFAULT_INJECTION_CARD = '[CALENDAR] Default Injection';
 
     // Module-level cache (valid for this turn only)
     let eventCache = null;
@@ -201,9 +209,12 @@ function Calendar(hook, text) {
                 }
             } else if (line.includes('Hours Per Day:')) {
                 config.hoursPerDay = parseInt(line.split(':')[1].trim());
+            } else if (line.includes('Enable Default Injection:')) {
+                const value = line.split(':')[1].trim().toLowerCase();
+                config.enableDefaultInjection = (value === 'true' || value === 'yes' || value === '1');
             }
         }
-        
+
         // Validate required fields
         if (!config.actionsPerDay || !config.startDate || !config.hoursPerDay) {
             return null;
@@ -1857,6 +1868,7 @@ function Calendar(hook, text) {
             `\nStart Date: 11/06/2022` +
             `\nStarting Time: 09:00` +
             `\nHours Per Day: 24` +
+            `\nEnable Default Injection: true` +
             `\n` +
             `\n## Time Periods` +
             `\n- Late Night: 0.92-0.21` +
@@ -1869,7 +1881,6 @@ function Calendar(hook, text) {
             `\n` +
             `\n## Seasons` +
             `\n// Based on year progress (0.0 = Jan 1, 1.0 = Dec 31)` +
-            `\n// Supports wraparound (e.g., Winter: 0.92-0.25 for Dec-Mar)` +
             `\n// Northern Hemisphere example:` +
             `\n- Winter: 0.92-0.25` +
             `\n- Spring: 0.25-0.5` +
@@ -2017,7 +2028,198 @@ function Calendar(hook, text) {
             if (debug) console.log(`${MODULE_NAME}: Failed to create event days card`);
         }
     }
-    
+
+    // Keys that trigger card injection (all letters + common punctuation)
+    const INJECTION_KEYS_ENABLED = '.,a,b,c,d,e,f,g,h,i,j,k,l,m,n,o,p,q,r,s,t,u,v,w,x,y,z,"';
+    const INJECTION_KEYS_DISABLED = '';
+
+    function createDefaultInjectionCard(enabled = true) {
+        const injectionText = `[**Current Time** get(Calendar.getFormattedTime) (get(Calendar.getTimeOfDay)) | get(Calendar.getCurrentDate)]`;
+
+        const description = (
+            `// This card is injected into context when "Enable Default Injection: true" is set in Time Configuration.\n` +
+            `// Available methods:\n` +
+            `//   get(Calendar.getCurrentTime)     - "14:30"\n` +
+            `//   get(Calendar.getFormattedTime)   - "2:30 PM"\n` +
+            `//   get(Calendar.getTimeOfDay)       - "Afternoon"\n` +
+            `//   get(Calendar.getCurrentDate)     - "Tuesday, July 15, 2023"\n` +
+            `//   get(Calendar.getCurrentSeason)   - "Summer"\n` +
+            `//   get(Calendar.getDayOfWeek)       - "Tuesday"\n` +
+            `//   get(Calendar.getMonth)           - "July"\n` +
+            `//   get(Calendar.getYear)            - "2023"\n` +
+            `//   get(Calendar.getDayNumber)       - "42"`
+        );
+
+        const card = Utilities.storyCard.add({
+            title: DEFAULT_INJECTION_CARD,
+            entry: injectionText,
+            description: description,
+            keys: enabled ? INJECTION_KEYS_ENABLED : INJECTION_KEYS_DISABLED
+        });
+
+        if (debug) {
+            if (card) {
+                console.log(`${MODULE_NAME}: Created default injection card (enabled: ${enabled})`);
+            } else {
+                console.log(`${MODULE_NAME}: Failed to create default injection card`);
+            }
+        }
+
+        return card;
+    }
+
+    function updateInjectionCardKeys(enabled) {
+        const card = Utilities.storyCard.get(DEFAULT_INJECTION_CARD);
+        if (!card) return;
+
+        const newKeys = enabled ? INJECTION_KEYS_ENABLED : INJECTION_KEYS_DISABLED;
+
+        // Only update if keys changed
+        if (card.keys !== newKeys) {
+            Utilities.storyCard.upsert({
+                title: DEFAULT_INJECTION_CARD,
+                keys: newKeys
+            });
+            if (debug) console.log(`${MODULE_NAME}: Updated injection card keys (enabled: ${enabled})`);
+        }
+    }
+
+    function resolveCalendarGetters(text) {
+        const pattern = /get\(Calendar\.(\w+)\)/g;
+
+        if (debug) {
+            console.log(`${MODULE_NAME}: resolveCalendarGetters called with: ${text.substring(0, 100)}...`);
+            console.log(`${MODULE_NAME}: Calendar.getFormattedTime exists: ${typeof Calendar.getFormattedTime}`);
+        }
+
+        return text.replace(pattern, (match, methodName) => {
+            if (debug) console.log(`${MODULE_NAME}: Trying to resolve: ${methodName}, type: ${typeof Calendar[methodName]}`);
+            // Check if the method exists on Calendar
+            if (typeof Calendar[methodName] === 'function') {
+                try {
+                    const result = Calendar[methodName]();
+                    // Handle null/undefined gracefully
+                    if (result === null || result === undefined) {
+                        return '';
+                    }
+                    // Handle arrays (like getTodayEvents)
+                    if (Array.isArray(result)) {
+                        if (result.length === 0) return '';
+                        // For events, extract names
+                        if (result[0] && result[0].name) {
+                            return result.map(e => e.name).join(', ');
+                        }
+                        return result.join(', ');
+                    }
+                    return String(result);
+                } catch (e) {
+                    if (debug) console.log(`${MODULE_NAME}: Error calling Calendar.${methodName}: ${e.message}`);
+                    return '';
+                }
+            }
+            // Method doesn't exist, leave unchanged
+            if (debug) console.log(`${MODULE_NAME}: Unknown Calendar method: ${methodName}`);
+            return match;
+        });
+    }
+
+    function processDefaultInjection(contextText) {
+        const config = loadConfiguration();
+        const enabled = config && config.enableDefaultInjection;
+
+        // Get or create the injection card
+        let injectionCard = Utilities.storyCard.get(DEFAULT_INJECTION_CARD);
+        if (!injectionCard) {
+            createDefaultInjectionCard(enabled);
+            injectionCard = Utilities.storyCard.get(DEFAULT_INJECTION_CARD);
+        } else {
+            // Update keys based on current enabled state
+            updateInjectionCardKeys(enabled);
+        }
+
+        // If disabled, just return context as-is (card won't be injected due to empty keys)
+        if (!enabled) {
+            return contextText;
+        }
+
+        if (!injectionCard || !injectionCard.entry) {
+            if (debug) console.log(`${MODULE_NAME}: No injection content available`);
+            return contextText;
+        }
+
+        const cardContent = injectionCard.entry;
+
+        // Find the card content in context (AI Dungeon auto-injects it)
+        let contentIndex = contextText.indexOf(cardContent);
+        let contentToRemove = cardContent;
+
+        if (contentIndex === -1) {
+            // Exact match not found - try to find by first/last line
+            const contentLines = cardContent.split('\n');
+            const firstLine = contentLines[0];
+            const lastLine = contentLines[contentLines.length - 1];
+
+            contentIndex = contextText.indexOf(firstLine);
+
+            if (contentIndex === -1) {
+                if (debug) console.log(`${MODULE_NAME}: Injection card not found in context`);
+                return contextText;
+            }
+
+            // Find where the content ends
+            const endIndex = contextText.indexOf(lastLine, contentIndex);
+            if (endIndex === -1) {
+                if (debug) console.log(`${MODULE_NAME}: Injection card end not found`);
+                return contextText;
+            }
+
+            contentToRemove = contextText.substring(contentIndex, endIndex + lastLine.length);
+        }
+
+        // Remove the card content from its current position
+        let modifiedContext = contextText.substring(0, contentIndex) +
+                             contextText.substring(contentIndex + contentToRemove.length);
+        // Clean up excessive newlines only where content was removed
+        modifiedContext = modifiedContext.replace(/\n{4,}/g, '\n\n\n');
+
+        // Resolve Calendar getters in the template
+        const resolvedContent = resolveCalendarGetters(cardContent);
+
+        if (debug) console.log(`${MODULE_NAME}: Resolved content: ${resolvedContent}`);
+
+        if (!resolvedContent || resolvedContent.trim() === '') {
+            return modifiedContext;
+        }
+
+        // Find insertion point by counting sentences from end (non-destructive)
+        // Match sentence endings and track their positions
+        const sentenceEndPattern = /[.!?]\s+/g;
+        const sentenceEndings = [];
+        let match;
+        while ((match = sentenceEndPattern.exec(modifiedContext)) !== null) {
+            sentenceEndings.push(match.index + match[0].length);
+        }
+
+        const sentencesFromEnd = 6;
+
+        if (sentenceEndings.length <= sentencesFromEnd) {
+            if (debug) console.log(`${MODULE_NAME}: Not enough sentences (${sentenceEndings.length}), putting injection at start`);
+            return resolvedContent + '\n\n' + modifiedContext;
+        }
+
+        // Find the character position to insert at (after the Nth sentence from end)
+        const insertPosition = sentenceEndings[sentenceEndings.length - sentencesFromEnd];
+
+        // Insert resolved content at position, preserving all original whitespace
+        const beforeText = modifiedContext.substring(0, insertPosition);
+        const afterText = modifiedContext.substring(insertPosition);
+
+        const result = beforeText + '\n\n' + resolvedContent + '\n\n' + afterText;
+
+        if (debug) console.log(`${MODULE_NAME}: Positioned injection 6 sentences from end`);
+        return result;
+    }
+
     // ==========================
     // Action Processing
     // ==========================
@@ -2563,11 +2765,90 @@ function Calendar(hook, text) {
             
             // Store events and initialize API
             Calendar.events = eventDispatcher.getEvents();
-            
+
             initializeAPI();
-            
+
+            // Process default injection if enabled
+            if (text && typeof text === 'string') {
+                return processDefaultInjection(text);
+            }
             return;
-            
+
+        case 'input':
+            // Process input commands
+            initializeAPI();
+
+            if (!text || typeof text !== 'string') {
+                return text;
+            }
+
+            let processedText = text;
+
+            // Match /advancetime("spec") or /advancetime(spec) anywhere in text
+            const advanceTimePattern = /\/advancetime\(["']?([^"')]+)["']?\)/gi;
+            let advanceMatch;
+            while ((advanceMatch = advanceTimePattern.exec(text)) !== null) {
+                const timeSpec = advanceMatch[1].trim();
+                const success = Calendar.advanceTime(timeSpec);
+
+                if (debug) {
+                    if (success) {
+                        console.log(`${MODULE_NAME}: Advanced time by "${timeSpec}"`);
+                    } else {
+                        console.log(`${MODULE_NAME}: Failed to advance time by "${timeSpec}"`);
+                    }
+                }
+            }
+            // Remove all advancetime commands from text
+            processedText = processedText.replace(/\/advancetime\(["']?[^"')]+["']?\)/gi, '');
+
+            // Match /settime(hour, minute) or /settime(hour) anywhere in text
+            const setTimePattern = /\/settime\((\d+)(?:\s*,\s*(\d+))?\)/gi;
+            let timeMatch;
+            while ((timeMatch = setTimePattern.exec(text)) !== null) {
+                const hour = parseInt(timeMatch[1]);
+                const minute = timeMatch[2] ? parseInt(timeMatch[2]) : 0;
+                const success = Calendar.setTime(hour, minute);
+
+                if (debug) {
+                    if (success) {
+                        console.log(`${MODULE_NAME}: Set time to ${hour}:${String(minute).padStart(2, '0')}`);
+                    } else {
+                        console.log(`${MODULE_NAME}: Failed to set time to ${hour}:${String(minute).padStart(2, '0')}`);
+                    }
+                }
+            }
+            // Remove all settime commands from text
+            processedText = processedText.replace(/\/settime\(\d+(?:\s*,\s*\d+)?\)/gi, '');
+
+            // Match /setday(dayNumber) anywhere in text
+            const setDayPattern = /\/setday\((-?\d+)\)/gi;
+            let dayMatch;
+            while ((dayMatch = setDayPattern.exec(text)) !== null) {
+                const dayNumber = parseInt(dayMatch[1]);
+                const success = Calendar.setDay(dayNumber);
+
+                if (debug) {
+                    if (success) {
+                        console.log(`${MODULE_NAME}: Set day to ${dayNumber}`);
+                    } else {
+                        console.log(`${MODULE_NAME}: Failed to set day to ${dayNumber}`);
+                    }
+                }
+            }
+            // Remove all setday commands from text
+            processedText = processedText.replace(/\/setday\(-?\d+\)/gi, '');
+
+            // Only return modified text if commands were found, otherwise return original
+            if (processedText !== text) {
+                // Clean up multiple spaces (but preserve newlines)
+                processedText = processedText.replace(/  +/g, ' ').trim();
+                // Return zero-width space if text is empty (AI Dungeon requires non-empty input)
+                return processedText || '\u200B';
+            }
+
+            return text;
+
         default:
             // Default to API-only mode
             initializeAPI();

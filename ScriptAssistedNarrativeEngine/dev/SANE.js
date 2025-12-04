@@ -3329,36 +3329,33 @@ function SANE(hook, text) {
             let modifiedContext = contextText.substring(0, sceneIndex) +
                                  contextText.substring(sceneIndex + sceneToRemove.length);
 
-            // Clean up any resulting multiple newlines
-            modifiedContext = modifiedContext.replace(/\n\n\n+/g, '\n\n');
+            // Clean up excessive newlines only where content was removed
+            modifiedContext = modifiedContext.replace(/\n{4,}/g, '\n\n\n');
 
-            // Split context by sentences to find insertion point
-            const sentences = modifiedContext.split(/(?<=[.!?])\s+/);
+            // Find insertion point by counting sentences from end (non-destructive)
+            // Match sentence endings and track their positions
+            const sentenceEndPattern = /[.!?]\s+/g;
+            const sentenceEndings = [];
+            let match;
+            while ((match = sentenceEndPattern.exec(modifiedContext)) !== null) {
+                sentenceEndings.push(match.index + match[0].length);
+            }
 
-            // Try to place scene 6 sentences from the end - EXACTLY LIKE GAMESTATE.JS
             const sentencesFromEnd = 6;
 
-            if (sentences.length <= sentencesFromEnd) {
-                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Not enough sentences (${sentences.length}), putting scene at start`);
+            if (sentenceEndings.length <= sentencesFromEnd) {
+                if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Not enough sentences (${sentenceEndings.length}), putting scene at start`);
                 return sceneContent + '\n\n' + modifiedContext;
             }
 
-            // Calculate insertion point
-            const insertIndex = sentences.length - sentencesFromEnd;
+            // Find the character position to insert at (after the Nth sentence from end)
+            const insertPosition = sentenceEndings[sentenceEndings.length - sentencesFromEnd];
 
-            // Rebuild context with scene inserted
-            const beforeSentences = sentences.slice(0, insertIndex);
-            const afterSentences = sentences.slice(insertIndex);
+            // Insert scene content at position, preserving all original whitespace
+            const beforeText = modifiedContext.substring(0, insertPosition);
+            const afterText = modifiedContext.substring(insertPosition);
 
-            // Join the parts
-            let result = beforeSentences.join(' ');
-            if (result && !result.endsWith('\n')) {
-                result += '\n\n';
-            }
-            result += sceneContent;
-            if (afterSentences.length > 0) {
-                result += '\n\n' + afterSentences.join(' ');
-            }
+            const result = beforeText + '\n\n' + sceneContent + '\n\n' + afterText;
 
             if (MODULE_CONFIG.debug) console.log(`${MODULE_NAME}: Positioned Current Scene 6 sentences from end`);
             return result;
