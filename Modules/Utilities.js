@@ -1863,7 +1863,7 @@ const Utilities = (function() {
                 
                 const match = trimmed.match(/^([^:]+):\s*(.+)$/);
                 if (match) {
-                    const key = match[1].trim();
+                    const key = match[1].trim().toLowerCase().replace(/[\s-]+/g, '_');
                     let value = match[2].trim();
                     
                     if (parseValues) {
@@ -2370,6 +2370,36 @@ const Utilities = (function() {
         removeAuthorsNotes(context) {
             // Remove all author's notes from text
             return context.replace(/\[Author['']s\s*note:[^\]]*\]/gi, '').trim();
+        },
+
+        replaceRecentStory(context, newStoryText) {
+            const recentStoryPattern = /Recent\s*Story\s*:\s*([\s\S]*?)(%@GEN@%|%@COM@%|\s\[\s*Author's\s*note\s*:|$)/i;
+            const match = context.match(recentStoryPattern);
+            if (!match) return context;
+            return context.replace(recentStoryPattern, `Recent Story:\n${newStoryText}${match[2]}`);
+        },
+
+        insertIntoWorldLore(context, insertText) {
+            if (!insertText || insertText.trim().length === 0) {
+                return context;
+            }
+            const worldLoreMatch = context.match(/World\s*Lore\s*:\s*/i);
+            if (worldLoreMatch) {
+                const index = worldLoreMatch.index + worldLoreMatch[0].length;
+                const beforeInsert = context.slice(0, index);
+                const afterInsert = context.slice(index);
+                const prefix = afterInsert.startsWith('\n') ? "" : "\n";
+                return beforeInsert + prefix + insertText + "\n" + afterInsert;
+            } else {
+                const recentStoryMatch = context.match(/Recent\s*Story\s*:/i);
+                if (recentStoryMatch) {
+                    return context.slice(0, recentStoryMatch.index) +
+                        "World Lore:\n" + insertText + "\n" +
+                        context.slice(recentStoryMatch.index);
+                } else {
+                    return "World Lore:\n" + insertText + "\n" + context;
+                }
+            }
         }
     };
     

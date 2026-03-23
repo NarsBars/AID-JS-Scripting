@@ -73,7 +73,8 @@ function SANE(hook, text) {
     let outputModifier = null;
 
     // Parsing patterns
-    const TOOL_PATTERN = /\b([a-z_]+)\(([^)]*)\)/g;
+    // XML-style tool syntax: <tool_name param="value" param2="value2"/>
+    const TOOL_PATTERN = /<([a-z_]+)((?:\s+[a-z_0-9]+="[^"]*")*)\s*\/>/gi;
     const COMMAND_PATTERN = /\/([a-z_]+)(?:\s+([^\n/]*))?/gi;
     const GETTER_PATTERN = /get\[([^\]]+)\]/gi;
 
@@ -1061,18 +1062,30 @@ function SANE(hook, text) {
             return entity;
         },
 
-        // Standard parameter validation
-        validateParams: (params, count) => {
-            if (!params || params.length < count) return false;
-            return params.slice(0, count).every(p => p !== undefined);
+        // Standard parameter validation for named params object
+        validateParams: (params, requiredKeys) => {
+            if (!params || typeof params !== 'object') return false;
+            // requiredKeys is now an array of required parameter names
+            if (Array.isArray(requiredKeys)) {
+                return requiredKeys.every(key => params[key] !== undefined && params[key] !== '');
+            }
+            // Backward compat: if requiredKeys is a number, check that we have that many non-empty values
+            if (typeof requiredKeys === 'number') {
+                const values = Object.values(params).filter(v => v !== undefined && v !== '');
+                return values.length >= requiredKeys;
+            }
+            return true;
         },
 
         // Create a tool wrapper with common validation
-        createTool: (name, minParams, handler) => {
+        // requiredParams: array of required param names, e.g. ['name', 'item']
+        createTool: (name, requiredParams, handler) => {
             return function(params) {
-                if (!toolHelpers.validateParams(params, minParams)) {
+                if (!toolHelpers.validateParams(params, requiredParams)) {
                     if (MODULE_CONFIG.debug) {
-                        console.log(`[${name}]: Insufficient parameters (need ${minParams}, got ${params ? params.length : 0})`);
+                        const got = params ? Object.keys(params).join(', ') : 'none';
+                        const need = Array.isArray(requiredParams) ? requiredParams.join(', ') : requiredParams;
+                        console.log(`[${name}]: Missing required parameters (need: ${need}, got: ${got})`);
                     }
                     return 'malformed';
                 }
@@ -1246,11 +1259,12 @@ function SANE(hook, text) {
         ModuleAPI.registerAPI('setItemQuantity', setItemQuantity);
 
         // Register add_item tool
-        ModuleAPI.registerTool('add_item', toolHelpers.createTool('add_item', 2, function(params) {
-            const [characterName, itemName, quantity] = params;
+        // XML: <add_item name="Kirito" item="health_potion" quantity="3"/>
+        ModuleAPI.registerTool('add_item', toolHelpers.createTool('add_item', ['name', 'item'], function(params) {
+            const { name, item, quantity = 1 } = params;
 
-            const charName = validators.normalizeString(characterName);
-            const item = validators.normalizeString(itemName);
+            const charName = validators.normalizeString(name);
+            const itemName = validators.normalizeString(item);
 
             const qty = validators.parseNumber(quantity, true);
             if (qty === null || qty === 0) {
@@ -1265,14 +1279,14 @@ function SANE(hook, text) {
             if (!character.inventory) character.inventory = {};
 
             // Update quantity
-            const currentQty = getItemQuantity(character.inventory, item);
+            const currentQty = getItemQuantity(character.inventory, itemName);
             const newQty = Math.max(0, currentQty + qty);
 
-            setItemQuantity(character.inventory, item, newQty);
+            setItemQuantity(character.inventory, itemName, newQty);
 
             if (MODULE_CONFIG.debug) {
                 const action = qty > 0 ? 'Added' : 'Removed';
-                console.log(`[add_item]: ${action} ${Math.abs(qty)} ${item} ${qty > 0 ? 'to' : 'from'} ${charName}'s inventory (now ${newQty})`);
+                console.log(`[add_item]: ${action} ${Math.abs(qty)} ${itemName} ${qty > 0 ? 'to' : 'from'} ${charName}'s inventory (now ${newQty})`);
             }
 
             ModuleAPI.save(charName, character);
@@ -1280,8 +1294,9 @@ function SANE(hook, text) {
         }));
 
         // Register remove_item tool
-        ModuleAPI.registerTool('remove_item', toolHelpers.createTool('remove_item', 3, (params) => {
-            const [characterName, itemName, quantity] = params;
+        // XML: <remove_item name="Kirito" item="health_potion" quantity="1"/>
+        ModuleAPI.registerTool('remove_item', toolHelpers.createTool('remove_item', ['name', 'item', 'quantity'], (params) => {
+            const { name, item, quantity } = params;
 
             const qty = validators.parseNumber(quantity, false);
             if (qty === null || qty === 0) {
@@ -1290,12 +1305,13 @@ function SANE(hook, text) {
             }
 
             // Call add_item with negative quantity
-            return ModuleAPI.tools['add_item']([characterName, itemName, -qty]);
+            return ModuleAPI.tools['add_item']({ name, item, quantity: -qty });
         }));
 
         // Register transfer_item tool
-        ModuleAPI.registerTool('transfer_item', toolHelpers.createTool('transfer_item', 3, (params) => {
-            const [giverName, receiverName, itemName, quantity] = params;
+        // XML: <transfer_item giver="Kirito" receiver="Asuna" item="health_potion" quantity="2"/>
+        ModuleAPI.registerTool('transfer_item', toolHelpers.createTool('transfer_item', ['giver', 'receiver', 'item'], (params) => {
+            const { giver: giverName, receiver: receiverName, item: itemName, quantity = 1 } = params;
 
             const giver = validators.normalizeString(giverName);
             const receiver = validators.normalizeString(receiverName);
@@ -1342,7 +1358,8 @@ function SANE(hook, text) {
         }));
 
         // Register use_consumable tool (alias)
-        ModuleAPI.registerTool('use_consumable', toolHelpers.createTool('use_consumable', 3, (params) => {
+        // XML: <use_consumable name="Kirito" item="health_potion" quantity="1"/>
+        ModuleAPI.registerTool('use_consumable', toolHelpers.createTool('use_consumable', ['name', 'item', 'quantity'], (params) => {
             return ModuleAPI.tools['remove_item'](params);
         }));
 
@@ -1350,33 +1367,33 @@ function SANE(hook, text) {
         ModuleAPI.registerRewindable('add_item', {
             type: 'inverse',
             getInverse: function(params, revertData) {
-                const [character, item, qty] = params;
+                const { name, item, quantity } = params;
                 const normalizedItem = validators.normalizeString(item);
-                const quantity = validators.parseNumber(qty, true);
-                if (quantity === null) return null;
-                // Inverse of add is remove
-                return ['add_item', [character, normalizedItem, -quantity]];
+                const qty = validators.parseNumber(quantity, true);
+                if (qty === null) return null;
+                // Inverse of add is remove (negative quantity)
+                return ['add_item', { name, item: normalizedItem, quantity: -qty }];
             }
         });
 
         ModuleAPI.registerRewindable('remove_item', {
             type: 'inverse',
             getInverse: function(params, revertData) {
-                const [character, item, qty] = params;
+                const { name, item, quantity } = params;
                 const normalizedItem = validators.normalizeString(item);
-                const quantity = validators.parseNumber(qty, false);
-                if (quantity === null) return null;
+                const qty = validators.parseNumber(quantity, false);
+                if (qty === null) return null;
                 // Inverse of remove is add
-                return ['add_item', [character, normalizedItem, quantity]];
+                return ['add_item', { name, item: normalizedItem, quantity: qty }];
             }
         });
 
         ModuleAPI.registerRewindable('transfer_item', {
             type: 'inverse',
             getInverse: function(params, revertData) {
-                const [giver, receiver, item, qty] = params;
+                const { giver, receiver, item, quantity } = params;
                 // Inverse of transfer is transfer in opposite direction
-                return ['transfer_item', [receiver, giver, item, qty]];
+                return ['transfer_item', { giver: receiver, receiver: giver, item, quantity }];
             }
         });
 
@@ -1384,11 +1401,11 @@ function SANE(hook, text) {
             type: 'inverse',
             getInverse: function(params, revertData) {
                 // use_consumable is an alias for remove_item
-                const [character, item, qty] = params;
+                const { name, item, quantity } = params;
                 const normalizedItem = validators.normalizeString(item);
-                const quantity = validators.parseNumber(qty, false);
-                if (quantity === null) return null;
-                return ['add_item', [character, normalizedItem, quantity]];
+                const qty = validators.parseNumber(quantity, false);
+                if (qty === null) return null;
+                return ['add_item', { name, item: normalizedItem, quantity: qty }];
             }
         });
 
@@ -1544,14 +1561,15 @@ function SANE(hook, text) {
         ModuleAPI.registerAPI('processSkillLevelUp', processSkillLevelUp);
 
         // Register tools
-        ModuleAPI.registerTool('add_levelxp', toolHelpers.createTool('add_levelxp', 2, (params) => {
-            const [characterName, xpAmount] = params;
+        // XML: <add_levelxp name="Kirito" amount="500"/>
+        ModuleAPI.registerTool('add_levelxp', toolHelpers.createTool('add_levelxp', ['name', 'amount'], (params) => {
+            const { name, amount } = params;
 
-            const charName = validators.normalizeString(characterName);
-            const xp = validators.parseNumber(xpAmount, true);
+            const charName = validators.normalizeString(name);
+            const xp = validators.parseNumber(amount, true);
 
             if (xp === null || xp === 0) {
-                if (MODULE_CONFIG.debug) console.log(`[add_levelxp]: Invalid XP amount: ${xpAmount}`);
+                if (MODULE_CONFIG.debug) console.log(`[add_levelxp]: Invalid XP amount: ${amount}`);
                 return 'malformed';
             }
 
@@ -1590,15 +1608,16 @@ function SANE(hook, text) {
             return 'executed';
         }));
 
-        ModuleAPI.registerTool('add_skillxp', toolHelpers.createTool('add_skillxp', 3, (params) => {
-            const [characterName, skillName, xpAmount] = params;
+        // XML: <add_skillxp name="Kirito" skill="One_Handed_Sword" amount="50"/>
+        ModuleAPI.registerTool('add_skillxp', toolHelpers.createTool('add_skillxp', ['name', 'skill', 'amount'], (params) => {
+            const { name, skill: skillName, amount } = params;
 
-            const charName = validators.normalizeString(characterName);
+            const charName = validators.normalizeString(name);
             const skill = validators.normalizeString(skillName);
-            const xp = validators.parseNumber(xpAmount, true);
+            const xp = validators.parseNumber(amount, true);
 
             if (xp === null || xp === 0) {
-                if (MODULE_CONFIG.debug) console.log(`[add_skillxp]: Invalid XP amount: ${xpAmount}`);
+                if (MODULE_CONFIG.debug) console.log(`[add_skillxp]: Invalid XP amount: ${amount}`);
                 return 'malformed';
             }
 
@@ -1635,10 +1654,11 @@ function SANE(hook, text) {
             return 'executed';
         }));
 
-        ModuleAPI.registerTool('unlock_newskill', toolHelpers.createTool('unlock_newskill', 2, (params) => {
-            const [characterName, skillName] = params;
+        // XML: <unlock_newskill name="Kirito" skill="Dual_Wield"/>
+        ModuleAPI.registerTool('unlock_newskill', toolHelpers.createTool('unlock_newskill', ['name', 'skill'], (params) => {
+            const { name, skill: skillName } = params;
 
-            const charName = validators.normalizeString(characterName);
+            const charName = validators.normalizeString(name);
             const skill = validators.normalizeString(skillName);
 
             const character = toolHelpers.getEntityOrTrack(charName, 'unlock_newskill');
@@ -1666,10 +1686,11 @@ function SANE(hook, text) {
             return 'executed';
         }));
 
-        ModuleAPI.registerTool('modify_attribute', toolHelpers.createTool('modify_attribute', 3, (params) => {
-            const [characterName, attributeName, amount] = params;
+        // XML: <modify_attribute name="Kirito" attribute="strength" value="5"/>
+        ModuleAPI.registerTool('modify_attribute', toolHelpers.createTool('modify_attribute', ['name', 'attribute', 'value'], (params) => {
+            const { name, attribute: attributeName, value: amount } = params;
 
-            const charName = validators.normalizeString(characterName);
+            const charName = validators.normalizeString(name);
             const attribute = attributeName ? String(attributeName).toUpperCase() : '';
             const value = validators.parseNumber(amount, true);
 
@@ -1705,31 +1726,31 @@ function SANE(hook, text) {
         ModuleAPI.registerRewindable('add_levelxp', {
             type: 'inverse',
             getInverse: function(params, revertData) {
-                const [character, xp] = params;
-                const xpAmount = validators.parseNumber(xp, true);
+                const { name, amount } = params;
+                const xpAmount = validators.parseNumber(amount, true);
                 if (xpAmount === null) return null;
                 // Inverse of adding XP is removing XP
-                return ['add_levelxp', [character, -xpAmount]];
+                return ['add_levelxp', { name, amount: -xpAmount }];
             }
         });
 
         ModuleAPI.registerRewindable('add_skillxp', {
             type: 'inverse',
             getInverse: function(params, revertData) {
-                const [character, skill, xp] = params;
+                const { name, skill, amount } = params;
                 const normalizedSkill = validators.normalizeString(skill);
-                const xpAmount = validators.parseNumber(xp, true);
+                const xpAmount = validators.parseNumber(amount, true);
                 if (xpAmount === null) return null;
                 // Inverse of adding XP is removing XP
-                return ['add_skillxp', [character, normalizedSkill, -xpAmount]];
+                return ['add_skillxp', { name, skill: normalizedSkill, amount: -xpAmount }];
             }
         });
 
         ModuleAPI.registerRewindable('unlock_newskill', {
             type: 'stateful',
             captureState: function(params) {
-                const [characterName, skillName] = params;
-                const charName = validators.normalizeString(characterName);
+                const { name, skill: skillName } = params;
+                const charName = validators.normalizeString(name);
                 const skill = validators.normalizeString(skillName);
                 const character = ModuleAPI.get(charName);
 
@@ -1743,8 +1764,8 @@ function SANE(hook, text) {
                 return { skillExisted: false };
             },
             restoreState: function(params, state) {
-                const [characterName, skillName] = params;
-                const charName = validators.normalizeString(characterName);
+                const { name, skill: skillName } = params;
+                const charName = validators.normalizeString(name);
                 const skill = validators.normalizeString(skillName);
                 const character = ModuleAPI.get(charName);
 
@@ -1764,13 +1785,13 @@ function SANE(hook, text) {
         ModuleAPI.registerRewindable('modify_attribute', {
             type: 'inverse',
             getInverse: function(params, revertData) {
-                const [character, attribute, value] = params;
+                const { name, attribute, value } = params;
                 // Normalize attribute name the same way the tool does
                 const normalizedAttr = validators.normalizeString(attribute).toUpperCase();
                 const amount = validators.parseNumber(value, true);
                 if (amount === null) return null;
                 // Inverse of modifying is modifying by negative amount
-                return ['modify_attribute', [character, normalizedAttr, -amount]];
+                return ['modify_attribute', { name, attribute: normalizedAttr, value: -amount }];
             }
         });
 
@@ -3064,6 +3085,7 @@ function SANE(hook, text) {
 
 
         // Register tools
+        // XML: <gw_abort/>
         ModuleAPI.registerTool('gw_abort', function(params) {
             // Abort any active generation
             const activeGen = findActiveGenerator();
@@ -3075,6 +3097,7 @@ function SANE(hook, text) {
             return 'executed';
         });
 
+        // XML: <gw_status/>
         ModuleAPI.registerTool('gw_status', function(params) {
             const activeGen = findActiveGenerator();
             if (!activeGen) {
@@ -3090,8 +3113,9 @@ function SANE(hook, text) {
             return 'executed';
         });
 
+        // XML: <gw_npc name="Marcus" location="Town_Square"/>
         ModuleAPI.registerTool('gw_npc', function(params) {
-            const [name, location] = params;
+            const { name, location } = params || {};
 
             // Generate unique ID - use provided name or create timestamp-based one
             const displayName = name || `NPC_${Date.now()}`;
@@ -3136,8 +3160,9 @@ function SANE(hook, text) {
             return 'malformed';
         });
 
+        // XML: <gw_location name="Forest_Clearing" direction="north"/>
         ModuleAPI.registerTool('gw_location', function(params) {
-            const [name, direction] = params;
+            const { name, direction } = params || {};
 
             // Generate unique ID - use provided name or create timestamp-based one
             const displayName = name || `Location_${Date.now()}`;
@@ -3175,8 +3200,9 @@ function SANE(hook, text) {
             return 'malformed';
         });
 
+        // XML: <gw_quest name="Missing_Merchant" type="Side"/>
         ModuleAPI.registerTool('gw_quest', function(params) {
-            const [name, typeParam] = params;
+            const { name, type: typeParam } = params || {};
 
             // Generate unique ID - use provided name or create timestamp-based one
             const displayName = name || `Quest_${Date.now()}`;
@@ -3936,8 +3962,9 @@ function SANE(hook, text) {
         }
 
         // Register blueprint tools
+        // XML: <create_blueprint name="Vehicle"/>
         ModuleAPI.registerTool('create_blueprint', function(params) {
-            const [name] = params;
+            const { name } = params || {};
             if (!name) return 'malformed';
 
             // Blueprint creation would be more complex in practice
@@ -3962,6 +3989,7 @@ function SANE(hook, text) {
             return 'executed';
         });
 
+        // XML: <list_blueprints/>
         ModuleAPI.registerTool('list_blueprints', function(params) {
             const blueprints = [];
             // Would need to iterate story cards to find all [SANE:BP] cards
@@ -4045,17 +4073,18 @@ function SANE(hook, text) {
         const MODULE_NAME = 'CombatModule';
 
         // Combat tools
-        ModuleAPI.registerTool('deal_damage', toolHelpers.createTool('deal_damage', 2, (params) => {
-            const [targetName, damage] = params;
+        // XML: <deal_damage source="Kirito" target="Wolf_01" amount="45"/>
+        ModuleAPI.registerTool('deal_damage', toolHelpers.createTool('deal_damage', ['target', 'amount'], (params) => {
+            const { target: targetName, amount } = params;
 
             const target = toolHelpers.getEntityOrTrack(targetName, 'deal_damage');
             if (!target) return 'executed';
 
             if (!target.stats || !target.stats.hp) return 'executed';
 
-            const dmg = validators.requirePositiveNumber(damage);
+            const dmg = validators.requirePositiveNumber(amount);
             if (!dmg) {
-                if (MODULE_CONFIG.debug) console.log(`[deal_damage]: Invalid damage: ${damage}`);
+                if (MODULE_CONFIG.debug) console.log(`[deal_damage]: Invalid damage: ${amount}`);
                 return 'malformed';
             }
 
@@ -4072,7 +4101,7 @@ function SANE(hook, text) {
         ModuleAPI.registerRewindable('deal_damage', {
             type: 'stateful',
             captureState: function(params) {
-                const [targetName] = params;
+                const { target: targetName } = params;
                 const target = ModuleAPI.get(targetName);
 
                 if (target && target.stats && target.stats.hp) {
@@ -4081,7 +4110,7 @@ function SANE(hook, text) {
                 return {};
             },
             restoreState: function(params, state) {
-                const [targetName] = params;
+                const { target: targetName } = params;
                 const target = ModuleAPI.get(targetName);
 
                 if (target && target.stats && target.stats.hp && state.oldHp !== undefined) {
@@ -4171,12 +4200,13 @@ function SANE(hook, text) {
         ModuleAPI.Library.getRelationshipFlavor = getRelationshipFlavor;
 
         // Relationship tools
-        ModuleAPI.registerTool('update_relationship', toolHelpers.createTool('update_relationship', 3, (params) => {
-            const [source, target, change] = params;
+        // XML: <update_relationship name1="Kirito" name2="Asuna" points="10"/>
+        ModuleAPI.registerTool('update_relationship', toolHelpers.createTool('update_relationship', ['name1', 'name2', 'points'], (params) => {
+            const { name1: source, name2: target, points } = params;
 
-            const changeVal = validators.parseNumber(change, true);
+            const changeVal = validators.parseNumber(points, true);
             if (changeVal === null || changeVal === 0) {
-                if (MODULE_CONFIG.debug) console.log(`[update_relationship]: Invalid change value: ${change}`);
+                if (MODULE_CONFIG.debug) console.log(`[update_relationship]: Invalid change value: ${points}`);
                 return 'malformed';
             }
 
@@ -4239,8 +4269,9 @@ function SANE(hook, text) {
         });
 
         // Location management tools
+        // XML: <update_location name="Kirito" location="Town_Square"/>
         ModuleAPI.registerTool('update_location', function(params) {
-            const [characterName, locationName] = params;
+            const { name: characterName, location: locationName } = params || {};
 
             if (!characterName || !locationName) return 'malformed';
 
@@ -4270,14 +4301,15 @@ function SANE(hook, text) {
             ModuleAPI.save(charName, character);
 
             if (MODULE_CONFIG.debug) {
-                console.log(`${MODULE_NAME}: ${character.id || charName} moved from ${oldLocation || 'nowhere'} to ${location.id || locName}`);
+                console.log(`${MODULE_NAME}: ${character.id || charName} moved from ${oldLocation || 'nowhere'} to ${locName}`);
             }
 
             return 'executed';
         });
 
+        // XML: <discover_location name="Kirito" location="Dark_Forest" direction="north"/>
         ModuleAPI.registerTool('discover_location', function(params) {
-            const [characterName, locationName, direction] = params;
+            const { name: characterName, location: locationName, direction } = params || {};
 
             if (!characterName || !locationName) return 'malformed';
 
@@ -4424,13 +4456,14 @@ function SANE(hook, text) {
             return 'executed';
         });
 
+        // XML: <connect_locations location_a="Town_Square" location_b="Temple_District" direction="north"/>
         ModuleAPI.registerTool('connect_locations', function(params) {
-            const [location1Name, location2Name, direction] = params;
+            const { location_a, location_b, direction } = params || {};
 
-            if (!location1Name || !location2Name) return 'malformed';
+            if (!location_a || !location_b) return 'malformed';
 
-            const loc1Name = String(location1Name).toLowerCase();
-            const loc2Name = String(location2Name).toLowerCase();
+            const loc1Name = String(location_a).toLowerCase();
+            const loc2Name = String(location_b).toLowerCase();
             const dir = direction ? String(direction).toLowerCase() : 'both';
 
             // Helper function to create location using blueprint
@@ -5738,12 +5771,24 @@ function SANE(hook, text) {
 
                         // Extract tools without executing them (for tracking purposes)
                         const toolMatches = [];
-                        const TOOL_PATTERN = /([a-z_]+)\s*\(([^)]*)\)/g;
+                        const localToolPattern = /<([a-z_]+)((?:\s+[a-z_]+="[^"]*")*)\s*\/>/gi;
                         let match;
-                        while ((match = TOOL_PATTERN.exec(historyEntry.text)) !== null) {
+                        while ((match = localToolPattern.exec(historyEntry.text)) !== null) {
                             const toolName = match[1];
-                            const paramString = match[2];
-                            const params = paramString ? paramString.split(',').map(p => p.trim()) : [];
+                            const attrString = match[2] || '';
+                            const params = {};
+                            const attrRegex = /([a-z_0-9]+)="([^"]*)"/gi;
+                            let attr;
+                            while ((attr = attrRegex.exec(attrString)) !== null) {
+                                const key = attr[1];
+                                const value = attr[2];
+                                // Auto-convert numeric strings to numbers (but preserve empty strings)
+                                if (value === '' || isNaN(Number(value))) {
+                                    params[key] = value;
+                                } else {
+                                    params[key] = Number(value);
+                                }
+                            }
                             toolMatches.push([toolName, params, {}]);
                         }
 
@@ -5907,20 +5952,26 @@ function SANE(hook, text) {
         }
 
         try {
-            // Track entity references in tool calls (first param is typically entity name)
-            if (params && params.length > 0 && typeof params[0] === 'string') {
-                const entityName = params[0];
-                const normalized = normalizeEntityId(entityName);
+            // Track entity references in tool calls
+            // With named params, look for common entity param names
+            if (params && typeof params === 'object') {
+                const entityParamNames = ['name', 'entity', 'character', 'target', 'source', 'giver', 'receiver', 'name1', 'name2'];
+                for (const paramName of entityParamNames) {
+                    if (params[paramName] && typeof params[paramName] === 'string') {
+                        const entityName = params[paramName];
+                        const normalized = normalizeEntityId(entityName);
 
-                // Check if entity exists, if not track it
-                if (!dataCache[normalized] && !loadEntityFromCache(normalized)) {
-                    if (ModuleAPI.trackUnknownEntity) {
-                        ModuleAPI.trackUnknownEntity(entityName, normalizedName, history.length);
+                        // Check if entity exists, if not track it
+                        if (!dataCache[normalized] && !loadEntityFromCache(normalized)) {
+                            if (ModuleAPI.trackUnknownEntity) {
+                                ModuleAPI.trackUnknownEntity(entityName, normalizedName, history.length);
+                            }
+                        }
                     }
                 }
             }
 
-            // Call tool with params array
+            // Call tool with params object
             const result = tool(params);
 
             return result;
@@ -5936,18 +5987,30 @@ function SANE(hook, text) {
     }
 
     function parseToolCall(text) {
-        // Use the already-defined TOOL_PATTERN from top of file
+        // Parse XML-style tool calls: <tool_name param="value" param2="value2"/>
         const tools = [];
-        const matches = [...text.matchAll(TOOL_PATTERN)];
-        for (const match of matches) {
-            const toolName = match[1];
-            const paramString = match[2] || '';
+        // Reset lastIndex for global regex reuse
+        TOOL_PATTERN.lastIndex = 0;
+        let match;
 
-            // Parse parameters - split by comma and trim
-            const params = paramString
-                .split(',')
-                .map(p => p.trim())
-                .filter(p => p.length > 0);
+        while ((match = TOOL_PATTERN.exec(text)) !== null) {
+            const toolName = match[1];
+            const attrString = match[2] || '';
+            const params = {};
+
+            // Parse attributes: param="value"
+            const attrRegex = /([a-z_0-9]+)="([^"]*)"/gi;
+            let attr;
+            while ((attr = attrRegex.exec(attrString)) !== null) {
+                const key = attr[1];
+                const value = attr[2];
+                // Auto-convert numeric strings to numbers (but preserve empty strings)
+                if (value === '' || isNaN(Number(value))) {
+                    params[key] = value;
+                } else {
+                    params[key] = Number(value);
+                }
+            }
 
             tools.push({ name: toolName, params, match: match[0] });
         }
@@ -5988,7 +6051,7 @@ function SANE(hook, text) {
             // Join args to get the full name if multiple words
             const fullName = args.length > 0 ? args.join(' ') : undefined;
             // Use the registered tool
-            const result = processTool('gw_npc', fullName ? [fullName] : []);
+            const result = processTool('gw_npc', { name: fullName });
             if (result === 'executed') {
                 const name = fullName || `NPC_${Date.now()}`;
                 return `Queued NPC generation for: ${name}`;
@@ -6000,7 +6063,7 @@ function SANE(hook, text) {
             // Join args to get the full name if multiple words
             const fullName = args.length > 0 ? args.join(' ') : undefined;
             // Use the registered tool
-            const result = processTool('gw_location', fullName ? [fullName] : []);
+            const result = processTool('gw_location', { name: fullName });
             if (result === 'executed') {
                 const name = fullName || `Location_${Date.now()}`;
                 return `Queued location generation for: ${name}`;
@@ -6012,7 +6075,7 @@ function SANE(hook, text) {
             // Join args to get the full name if multiple words
             const fullName = args.length > 0 ? args.join(' ') : undefined;
             // Use the registered tool
-            const result = processTool('gw_quest', fullName ? [fullName] : []);
+            const result = processTool('gw_quest', { name: fullName });
             if (result === 'executed') {
                 const name = fullName || `Quest_${Date.now()}`;
                 return `Queued quest generation for: ${name}`;

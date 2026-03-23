@@ -1863,7 +1863,7 @@ const Utilities = (function() {
                 
                 const match = trimmed.match(/^([^:]+):\s*(.+)$/);
                 if (match) {
-                    const key = match[1].trim();
+                    const key = match[1].trim().toLowerCase().replace(/[\s-]+/g, '_');
                     let value = match[2].trim();
                     
                     if (parseValues) {
